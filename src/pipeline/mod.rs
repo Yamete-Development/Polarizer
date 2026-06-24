@@ -11,10 +11,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use redis::AsyncCommands;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::config::AppConfig;
 use crate::error::{PipelineError, PipelineResult};
+use crate::eventbus::{self, EventBus};
 
 /// The fully-assembled processing pipeline.
 ///
@@ -24,6 +25,7 @@ pub struct Pipeline {
     pub hasher: PerceptualHasher,
     pub inference: OnnxInference,
     pub redis: redis::aio::ConnectionManager,
+    pub eventbus: Arc<dyn EventBus>,
     pub config: AppConfig,
 }
 
@@ -59,13 +61,18 @@ impl Pipeline {
         let downloader = ImageDownloader::new(config.max_download_bytes);
         let hasher = PerceptualHasher::new();
 
-        info!(model = %config.model_path, "pipeline initialized");
+        let eventbus = Arc::new(eventbus::RedisEventBus::new(
+            redis.clone(),
+            config.events_stream_key.clone(),
+            config.events_stream_maxlen,
+        ));
 
         Ok(Self {
             downloader,
             hasher,
             inference,
             redis,
+            eventbus,
             config: config.clone(),
         })
     }

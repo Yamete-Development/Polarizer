@@ -1,5 +1,6 @@
 mod config;
 mod error;
+mod eventbus;
 mod health;
 mod pipeline;
 mod redis_stream;

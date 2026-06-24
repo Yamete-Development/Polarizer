@@ -220,6 +220,21 @@ async fn publish_result(
 
     let _: () = pipe.query_async(&mut conn).await?;
 
+    // Also publish as CloudEvent on the inter-service event bus.
+    let event_data = serde_json::json!({
+        "url": output.url,
+        "safe": output.label != "nsfw",
+        "labels": [&output.label],
+    });
+    if let Err(e) = pipeline.eventbus.publish(
+        "fun.interchat.polarizer.result.ready",
+        event_data,
+    )
+    .await
+    {
+        warn!(error = %e, url = %output.url, "failed to publish CloudEvent");
+    }
+
     info!(
         result_key,
         url = %output.url,

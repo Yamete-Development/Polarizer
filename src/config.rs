@@ -50,6 +50,12 @@ pub struct AppConfig {
     /// Redis stream key to push results into.
     pub result_stream_key: String,
 
+    /// Redis stream key for CloudEvents (inter-service event bus).
+    pub events_stream_key: String,
+
+    /// Approximate MAXLEN for the events stream.
+    pub events_stream_maxlen: usize,
+
     // ── Model / Inference ───────────────────────────────────────────────
     /// ONNX input tensor name (must match the model's expected input).
     pub model_input_name: String,
@@ -122,6 +128,10 @@ impl AppConfig {
                     .context("PHASH_CACHE_TTL_SECS must be a valid u64")?,
             ),
             result_stream_key: optional("RESULT_STREAM_KEY", "polarizer:results"),
+            events_stream_key: optional("EVENTS_STREAM_KEY", "events:polarizer"),
+            events_stream_maxlen: optional("EVENTS_STREAM_MAXLEN", "100000")
+                .parse()
+                .context("EVENTS_STREAM_MAXLEN must be a valid usize")?,
 
             // Model / inference knobs
             model_input_name: optional("MODEL_INPUT_NAME", "pixel_values"),
