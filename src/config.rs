@@ -97,7 +97,7 @@ impl AppConfig {
             model_path: optional("MODEL_PATH", "./quantized_model.onnx"),
 
             // Optional with defaults
-            stream_key: optional("STREAM_KEY", "polarizer:jobs"),
+            stream_key: optional("STREAM_KEY", "polarizer.jobs"),
             consumer_group: optional("CONSUMER_GROUP", "polarizer-workers"),
             consumer_name: optional(
                 "CONSUMER_NAME",
@@ -127,8 +127,8 @@ impl AppConfig {
                     .parse()
                     .context("PHASH_CACHE_TTL_SECS must be a valid u64")?,
             ),
-            result_stream_key: optional("RESULT_STREAM_KEY", "polarizer:results"),
-            events_stream_key: optional("EVENTS_STREAM_KEY", "events:polarizer"),
+            result_stream_key: optional("RESULT_STREAM_KEY", "polarizer.results"),
+            events_stream_key: optional("EVENTS_STREAM_KEY", "events.polarizer"),
             events_stream_maxlen: optional("EVENTS_STREAM_MAXLEN", "100000")
                 .parse()
                 .context("EVENTS_STREAM_MAXLEN must be a valid usize")?,
