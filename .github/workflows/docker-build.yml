@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - main
+      - staging
 
 permissions:
   contents: read
@@ -27,4 +28,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/yamete-development/polarizer:latest
+          tags: ghcr.io/yamete-development/polarizer:${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
