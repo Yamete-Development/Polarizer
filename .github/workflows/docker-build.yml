@@ -31,9 +31,11 @@ jobs:
           if [[ "${{ github.event_name }}" == "release" ]]; then
             echo "environment=prod" >> $GITHUB_OUTPUT
             echo "float_tag=latest" >> $GITHUB_OUTPUT
+            echo "version_tag=ghcr.io/yamete-development/polarizer:${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
             echo "environment=staging" >> $GITHUB_OUTPUT
             echo "float_tag=staging" >> $GITHUB_OUTPUT
+            echo "version_tag=" >> $GITHUB_OUTPUT
           fi
           echo "sha_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
 
@@ -45,6 +47,7 @@ jobs:
           tags: |
             ghcr.io/yamete-development/polarizer:${{ steps.vars.outputs.sha_tag }}
             ghcr.io/yamete-development/polarizer:${{ steps.vars.outputs.float_tag }}
+            ${{ steps.vars.outputs.version_tag }}
           secrets: |
             "hf_token=${{ secrets.HF_TOKEN }}"
 

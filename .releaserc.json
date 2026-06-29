@@ -1,0 +1,16 @@
+{
+  "branches": ["main"],
+  "tagFormat": "v${version}",
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["semantic-release-replace-plugin", {
+      "replacements": [{"files": ["Cargo.toml"], "from": "version = \".*\"", "to": "version = \"${nextRelease.version}\""}]
+    }],
+    ["@semantic-release/git", {
+      "assets": ["Cargo.toml"],
+      "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+    }],
+    "@semantic-release/github"
+  ]
+}
