@@ -6,6 +6,17 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deploy environment (staging/prod)"
+        required: false
+        type: string
+        default: ""
+      version_tag:
+        description: "Version tag (e.g. v1.0.0)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -32,6 +43,10 @@ jobs:
             echo "environment=prod" >> $GITHUB_OUTPUT
             echo "float_tag=latest" >> $GITHUB_OUTPUT
             echo "version_tag=ghcr.io/yamete-development/polarizer:${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.version_tag }}" != "" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "float_tag=latest" >> $GITHUB_OUTPUT
+            echo "version_tag=ghcr.io/yamete-development/polarizer:${{ github.event.inputs.version_tag }}" >> $GITHUB_OUTPUT
           else
             echo "environment=staging" >> $GITHUB_OUTPUT
             echo "float_tag=staging" >> $GITHUB_OUTPUT
