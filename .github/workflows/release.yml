@@ -36,7 +36,7 @@ jobs:
         uses: cycjimmy/semantic-release-action@v6
         id: semantic
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITOPS_PAT }}
         with:
           dry_run: ${{ inputs.dryRun }}
           extra_plugins: |
