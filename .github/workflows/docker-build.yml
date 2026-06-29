@@ -4,6 +4,8 @@ on:
     branches:
       - main
       - staging
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -24,11 +26,49 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine tags and environment
+        id: vars
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+            echo "float_tag=latest" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "float_tag=staging" >> $GITHUB_OUTPUT
+          fi
+          echo "sha_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/yamete-development/polarizer:${{ github.ref_name == 'main' && 'latest' || github.ref_name }}
+          tags: |
+            ghcr.io/yamete-development/polarizer:${{ steps.vars.outputs.sha_tag }}
+            ghcr.io/yamete-development/polarizer:${{ steps.vars.outputs.float_tag }}
           secrets: |
             "hf_token=${{ secrets.HF_TOKEN }}"
+
+      - name: Update GitOps repo
+        env:
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+        run: |
+          APP_DIR="polarizer"
+          ENV="${{ steps.vars.outputs.environment }}"
+          SHA="${{ steps.vars.outputs.sha_tag }}"
+
+          git clone --depth 1 \
+            "https://x-access-token:${GITOPS_PAT}@github.com/yamete-development/interchat-kube-talos.git" \
+            /tmp/gitops
+
+          cd /tmp/gitops
+
+          KUSTOMIZATION="kubernetes/apps/${APP_DIR}/overlays/${ENV}/kustomization.yaml"
+
+          sed -i "s/newTag:.*/newTag: ${SHA}/" "$KUSTOMIZATION"
+
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@interchat.fun"
+          git add "$KUSTOMIZATION"
+          git commit -m "deploy(${APP_DIR}-${ENV}): ${SHA}" || echo "No changes to commit"
+          git push origin main
