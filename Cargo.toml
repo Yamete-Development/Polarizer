@@ -1,22 +1,22 @@
 [package]
 name = "polarizer"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "High-performance image analysis microservice with ONNX inference and perceptual hashing"
 license = "Proprietary"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.0.0"] }
 
 # Redis client with async support
-redis = { version = "0.29", features = ["tokio-comp", "streams", "connection-manager"] }
+redis = { version = "1.0.0"] }
 
 # HTTP client for image downloads
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "1.0.0"] }
 
 # Image processing & perceptual hashing
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+image = { version = "1.0.0"] }
 image_hasher = "2"
 
 # ONNX Runtime inference
@@ -27,12 +27,12 @@ ndarray = "0.17"
 dotenvy = "0.15"
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.0"] }
 serde_json = "1"
 
 # Logging & tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "1.0.0"] }
 
 # Error handling
 thiserror = "2"
@@ -42,7 +42,7 @@ anyhow = "1"
 hostname = "0.4"
 
 # UUID generation for event bus IDs
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1.0.0"] }
 
 # Async trait support
 async-trait = "0.1"
@@ -51,8 +51,8 @@ async-trait = "0.1"
 axum = "0.8"
 
 # Graceful shutdown
-tokio-util = { version = "0.7", features = ["rt"] }
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+tokio-util = { version = "1.0.0"] }
+xxhash-rust = { version = "1.0.0"] }
 rdkafka = "0.39.0"
 
 [profile.release]
