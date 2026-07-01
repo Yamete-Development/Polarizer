@@ -4,13 +4,19 @@
   "plugins": [
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
-    ["semantic-release-replace-plugin", {
-      "replacements": [{"files": ["Cargo.toml"], "from": "version = \".*\"", "to": "version = \"${nextRelease.version}\""}]
-    }],
-    ["@semantic-release/git", {
-      "assets": ["Cargo.toml"],
-      "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
-    }],
+    [
+      "@semantic-release/exec",
+      {
+        "prepareCmd": "cargo install cargo-edit --locked --quiet || true && cargo set-version ${nextRelease.version}"
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["Cargo.toml", "Cargo.lock"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
     "@semantic-release/github"
   ]
 }
