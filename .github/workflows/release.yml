@@ -45,7 +45,7 @@ jobs:
             @semantic-release/release-notes-generator
             @semantic-release/github
             @semantic-release/git
-            semantic-release-replace-plugin
+            @semantic-release/exec
 
       - name: Trigger Docker Build for Release
         if: steps.semantic.outputs.new_release_published == 'true'
