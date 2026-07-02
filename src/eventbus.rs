@@ -75,51 +75,42 @@ pub trait EventBus: Send + Sync {
     fn system_name(&self) -> &'static str;
 }
 
-/// Redis Streams implementation of the `EventBus` trait.
-pub struct RedisEventBus {
-    conn: redis::aio::ConnectionManager,
-    stream: String,
-    maxlen: usize,
+
+
+/// Kafka implementation of the `EventBus` trait.
+pub struct KafkaEventBus {
+    producer: rdkafka::producer::FutureProducer,
+    topic: String,
 }
 
-impl RedisEventBus {
-    pub fn new(
-        conn: redis::aio::ConnectionManager,
-        stream: String,
-        maxlen: usize,
-    ) -> Self {
-        Self {
-            conn,
-            stream,
-            maxlen,
-        }
+impl KafkaEventBus {
+    pub fn new(brokers: &str, topic: String) -> anyhow::Result<Self> {
+        let producer: rdkafka::producer::FutureProducer = rdkafka::ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("message.timeout.ms", "5000")
+            .create()?;
+        Ok(Self { producer, topic })
     }
 }
 
 #[async_trait::async_trait]
-impl EventBus for RedisEventBus {
+impl EventBus for KafkaEventBus {
     async fn publish(&self, event_type: &str, data: serde_json::Value) -> anyhow::Result<()> {
         let event = build_envelope(event_type, data);
         let payload = serde_json::to_string(&event)?;
 
-        let mut conn = self.conn.clone();
+        let record = rdkafka::producer::FutureRecord::to(&self.topic)
+            .key("")
+            .payload(&payload);
 
-        redis::cmd("XADD")
-            .arg(&self.stream)
-            .arg("MAXLEN")
-            .arg("~")
-            .arg(self.maxlen.to_string())
-            .arg("*")
-            .arg("payload")
-            .arg(&payload)
-            .query_async::<()>(&mut conn)
-            .await?;
+        let _ = self.producer.send(record, std::time::Duration::from_secs(0)).await
+            .map_err(|(e, _)| anyhow::anyhow!("failed to publish event: {}", e))?;
 
         Ok(())
     }
 
-    #[allow(dead_code)] // Reserved for future OpenTelemetry messaging.system attribute
-    fn system_name(&self) -> &'static str { "redis" }
+    #[allow(dead_code)]
+    fn system_name(&self) -> &'static str { "kafka" }
 }
 
 #[cfg(test)]

@@ -61,11 +61,14 @@ impl Pipeline {
         let downloader = ImageDownloader::new(config.max_download_bytes);
         let hasher = PerceptualHasher::new();
 
-        let eventbus = Arc::new(eventbus::RedisEventBus::new(
-            redis.clone(),
-            config.events_stream_key.clone(),
-            config.events_stream_maxlen,
-        ));
+        let eventbus = Arc::new(eventbus::KafkaEventBus::new(
+            &config.kafka_brokers,
+            config.kafka_eventbus_topic.clone(),
+        ).map_err(|e| PipelineError::Redis(redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "failed to create Kafka producer",
+            e.to_string(),
+        ))))?);
 
         Ok(Self {
             downloader,

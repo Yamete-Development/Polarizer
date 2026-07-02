@@ -3,7 +3,7 @@ mod error;
 mod eventbus;
 mod health;
 mod pipeline;
-mod redis_stream;
+mod kafka_consumer;
 mod telemetry;
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use tracing::{error, info};
 use crate::config::AppConfig;
 use crate::health::HealthState;
 use crate::pipeline::Pipeline;
-use crate::redis_stream::StreamConsumer;
+use crate::kafka_consumer::StreamConsumer;
 use crate::telemetry::init_tracing;
 
 #[cfg(not(target_env = "msvc"))]

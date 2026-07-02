@@ -10,20 +10,14 @@ pub struct AppConfig {
     /// Redis connection URI (e.g. `redis://127.0.0.1:6379`).
     pub redis_uri: String,
 
-    /// Name of the Redis stream to consume from.
-    pub stream_key: String,
-
-    /// Consumer group name.
-    pub consumer_group: String,
+    // ── Kafka ───────────────────────────────────────────────────────────
+    pub kafka_brokers: String,
+    pub kafka_group_id: String,
+    pub kafka_jobs_topic: String,
+    pub kafka_eventbus_topic: String,
 
     /// Unique consumer name within the group (defaults to hostname).
     pub consumer_name: String,
-
-    /// How many messages to pull per `XREADGROUP` call.
-    pub batch_size: usize,
-
-    /// Block timeout for `XREADGROUP`.
-    pub block_timeout: Duration,
 
     // ── Pipeline ────────────────────────────────────────────────────────
     /// Path to the ONNX model file.
@@ -47,14 +41,6 @@ pub struct AppConfig {
     /// TTL for cached pHash → score mappings.
     pub phash_cache_ttl: Duration,
 
-    /// Redis stream key to push results into.
-    pub result_stream_key: String,
-
-    /// Redis stream key for CloudEvents (inter-service event bus).
-    pub events_stream_key: String,
-
-    /// Approximate MAXLEN for the events stream.
-    pub events_stream_maxlen: usize,
 
     // ── Model / Inference ───────────────────────────────────────────────
     /// ONNX input tensor name (must match the model's expected input).
@@ -97,21 +83,16 @@ impl AppConfig {
             model_path: optional("MODEL_PATH", "./quantized_model.onnx"),
 
             // Optional with defaults
-            stream_key: optional("STREAM_KEY", "polarizer.jobs"),
-            consumer_group: optional("CONSUMER_GROUP", "polarizer-workers"),
+            kafka_brokers: optional("KAFKA_BROKERS", "localhost:9092"),
+            kafka_group_id: optional("KAFKA_GROUP_ID", "polarizer-workers"),
+            kafka_jobs_topic: optional("KAFKA_JOBS_TOPIC", "polarizer.jobs"),
+            kafka_eventbus_topic: optional("KAFKA_EVENTBUS_TOPIC", "fun.interchat.events"),
+
             consumer_name: optional(
                 "CONSUMER_NAME",
                 &hostname::get()
                     .map(|h| h.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| "worker-0".into()),
-            ),
-            batch_size: optional("BATCH_SIZE", "10")
-                .parse()
-                .context("BATCH_SIZE must be a valid usize")?,
-            block_timeout: Duration::from_millis(
-                optional("BLOCK_TIMEOUT_MS", "5000")
-                    .parse()
-                    .context("BLOCK_TIMEOUT_MS must be a valid u64")?,
             ),
             worker_count: optional("WORKER_COUNT", "4")
                 .parse()
@@ -127,11 +108,7 @@ impl AppConfig {
                     .parse()
                     .context("PHASH_CACHE_TTL_SECS must be a valid u64")?,
             ),
-            result_stream_key: optional("RESULT_STREAM_KEY", "polarizer.results"),
-            events_stream_key: optional("EVENTS_STREAM_KEY", "events.polarizer"),
-            events_stream_maxlen: optional("EVENTS_STREAM_MAXLEN", "100000")
-                .parse()
-                .context("EVENTS_STREAM_MAXLEN must be a valid usize")?,
+
 
             // Model / inference knobs
             model_input_name: optional("MODEL_INPUT_NAME", "pixel_values"),
