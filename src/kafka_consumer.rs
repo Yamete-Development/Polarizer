@@ -41,6 +41,7 @@ impl StreamConsumer {
             .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest")
             .set("client.id", &self.config.consumer_name)
+            .set("partition.assignment.strategy", "cooperative-sticky")
             .create()
             .map_err(|e| anyhow::anyhow!("failed to create kafka consumer: {e}"))?;
 
