@@ -18,6 +18,13 @@ use crate::pipeline::Pipeline;
 use crate::redis_stream::StreamConsumer;
 use crate::telemetry::init_tracing;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Load .env file if present (non-fatal if missing).
