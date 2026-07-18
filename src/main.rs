@@ -1,110 +1,157 @@
-mod config;
-mod error;
-mod eventbus;
-mod health;
-mod pipeline;
-mod kafka_consumer;
-mod telemetry;
+use std::{net::SocketAddr, sync::Arc};
 
-use std::sync::Arc;
-
-use anyhow::Context as _;
+use anyhow::Context;
+use polarizer::{
+    auth::Authorizer,
+    command::CommandRepository,
+    config::{AppConfig, MigrationConfig},
+    db,
+    eventbus::{self, ActionConsumer, DeliveryCallbackConsumer, OutboxRelay},
+    grpc,
+    health::{self, HealthState},
+    moderation::ModerationRepository,
+    policy::{
+        engine::PolicyEngine,
+        features::production_registry,
+        ir::PolicyIrRuntime,
+        luau::LuauRuntime,
+        repository::{PolicyRepository, PostgresPolicyRepository},
+    },
+    telemetry::init_tracing,
+};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::config::AppConfig;
-use crate::health::HealthState;
-use crate::pipeline::Pipeline;
-use crate::kafka_consumer::StreamConsumer;
-use crate::telemetry::init_tracing;
-
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load .env file if present (non-fatal if missing).
     let _ = dotenvy::dotenv();
 
-    let config = AppConfig::from_env().context("failed to load configuration")?;
-    init_tracing(&config.log_level);
-
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        workers = config.worker_count,
-        "polarizer starting"
-    );
-
-    // ── Shared resources ────────────────────────────────────────────────
-    let cancel = CancellationToken::new();
-    let health = Arc::new(HealthState::new());
-
-    // Build the processing pipeline (loads ONNX model, connects to Redis).
-    let pipeline = Arc::new(
-        Pipeline::new(&config)
-            .await
-            .context("failed to initialize pipeline")?,
-    );
-
-    // ── Health / readiness HTTP server ──────────────────────────────────
-    let health_handle = tokio::spawn(health::serve(
-        config.health_port,
-        Arc::clone(&health),
-        cancel.clone(),
-    ));
-
-    // ── Consumer workers ────────────────────────────────────────────────
-    let consumer = StreamConsumer::new(
-        Arc::clone(&pipeline),
-        config.clone(),
-        Arc::clone(&health),
-        cancel.clone(),
-    );
-
-    // Mark service as ready once all components are initialized.
-    health.set_ready(true);
-    info!(port = config.health_port, "service ready");
-
-    // ── Graceful shutdown wiring ────────────────────────────────────────
-    let cancel_on_signal = cancel.clone();
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        info!("shutdown signal received — draining workers");
-        cancel_on_signal.cancel();
-    });
-
-    // Run the consumer loop until cancellation.
-    if let Err(e) = consumer.run().await {
-        error!(error = %e, "consumer loop exited with error");
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        let migration = MigrationConfig::from_env().context("invalid migration configuration")?;
+        init_tracing(&std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info,sqlx=warn".to_owned()));
+        let db = db::init_pool(&migration.database_url, migration.database_max_connections).await?;
+        db::run_migrations(&db, migration.timeout).await?;
+        return Ok(());
     }
 
-    // Wait for the health server to wind down.
-    let _ = health_handle.await;
+    let config = AppConfig::from_env().context("invalid Polarizer configuration")?;
+    init_tracing(&config.log_level);
+    let db = db::init_pool(&config.database_url, config.database_max_connections).await?;
 
-    info!("polarizer shut down cleanly");
+    if config.auto_migrate {
+        db::run_migrations(&db, config.migration_timeout)
+            .await
+            .context("automatic Polarizer migration failed; refusing to start")?;
+    } else {
+        info!("automatic migrations disabled; expecting a completed pre-deployment migration job");
+    }
+
+    let repository = Arc::new(PostgresPolicyRepository::new(db.clone(), &config)?);
+    let moderation = Arc::new(ModerationRepository::new(db.clone()));
+    let commands = Arc::new(CommandRepository::new(
+        db.clone(),
+        config.command_result_topic.clone(),
+    ));
+    let authorizer = Arc::new(Authorizer::connect(&config).await?);
+    let features = Arc::new(production_registry(db.clone(), &config)?);
+
+    let repository_trait: Arc<dyn PolicyRepository> = repository.clone();
+    let mut engine = PolicyEngine::new(
+        repository_trait,
+        features,
+        config.clean_allow_trace_sample_rate,
+    );
+    engine.register_runtime(Arc::new(PolicyIrRuntime));
+    engine.register_runtime(Arc::new(LuauRuntime::new(
+        config.policy_worker_bin.clone(),
+        config.policy_worker_count,
+        config.luau_source_limit,
+        config.luau_heap_limit,
+        config.luau_instruction_limit,
+        config.luau_wall_timeout,
+        config.luau_output_limit,
+    )));
+    let engine = Arc::new(engine);
+
+    let cancel = CancellationToken::new();
+    let health_state = Arc::new(HealthState::new());
+    let mut tasks = JoinSet::new();
+
+    let health_address = SocketAddr::new(config.http_host, config.http_port);
+    tasks.spawn(health::serve(
+        health_address,
+        health_state.clone(),
+        cancel.clone(),
+    ));
+    tasks.spawn({
+        let config = config.clone();
+        let engine = engine.clone();
+        let repository = repository.clone();
+        let authorizer = authorizer.clone();
+        let moderation = moderation.clone();
+        let commands = commands.clone();
+        let cancel = cancel.clone();
+        async move {
+            grpc::serve(
+                &config, engine, repository, authorizer, moderation, commands, cancel,
+            )
+            .await
+        }
+    });
+    tasks.spawn(
+        ActionConsumer::new(
+            &config,
+            engine.clone(),
+            health_state.clone(),
+            cancel.clone(),
+        )?
+        .run(),
+    );
+    tasks.spawn(DeliveryCallbackConsumer::new(&config, repository.clone(), cancel.clone())?.run());
+    tasks.spawn(OutboxRelay::new(db.clone(), &config, cancel.clone())?.run());
+    tasks.spawn(eventbus::policy_activation_worker(
+        repository.clone(),
+        engine,
+        cancel.clone(),
+    ));
+    tasks.spawn(eventbus::expiry_worker(repository, cancel.clone()));
+
+    health_state.set_ready(true);
+    info!(http = %health_address, grpc_port = config.grpc_port, "Polarizer v2 ready");
+    tokio::select! {
+        _ = shutdown_signal() => info!("shutdown signal received"),
+        task = tasks.join_next() => {
+            match task {
+                Some(Ok(Ok(()))) => error!("a supervised service exited unexpectedly"),
+                Some(Ok(Err(error))) => error!(error = %error, "a supervised service failed"),
+                Some(Err(error)) => error!(error = %error, "a supervised service panicked"),
+                None => error!("all supervised services exited"),
+            }
+        }
+    }
+    health_state.set_ready(false);
+    cancel.cancel();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            error!(error = %error, "service join failed during shutdown");
+        }
+    }
+    info!("Polarizer shut down cleanly");
     Ok(())
 }
 
-/// Waits for SIGINT or SIGTERM (unix) / Ctrl-C (all platforms).
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
-
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = sigterm.recv() => {}
-        }
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler");
+        tokio::select! { _ = ctrl_c => {}, _ = terminate.recv() => {} }
     }
-
     #[cfg(not(unix))]
     {
-        ctrl_c.await.ok();
+        let _ = ctrl_c.await;
     }
 }

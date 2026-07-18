@@ -1,164 +1,339 @@
-use std::env;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    net::IpAddr,
+    path::PathBuf,
+    time::Duration,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
-/// Application configuration sourced entirely from environment variables.
 #[derive(Debug, Clone)]
-pub struct AppConfig {
-    // ── Redis ───────────────────────────────────────────────────────────
-    /// Redis connection URI (e.g. `redis://127.0.0.1:6379`).
-    pub redis_uri: String,
-
-    // ── Kafka ───────────────────────────────────────────────────────────
-    pub kafka_brokers: String,
-    pub kafka_group_id: String,
-    pub kafka_jobs_topic: String,
-    pub kafka_eventbus_topic: String,
-
-    /// Unique consumer name within the group (defaults to hostname).
-    pub consumer_name: String,
-
-    // ── Pipeline ────────────────────────────────────────────────────────
-    /// Path to the ONNX model file.
-    pub model_path: String,
-
-    /// Number of concurrent worker tasks.
-    pub worker_count: usize,
-
-    /// Maximum allowed download size in bytes (defense against oversized payloads).
-    pub max_download_bytes: u64,
-
-    /// Redis key prefix for pHash cache entries.
-    pub phash_prefix: String,
-
-    /// Redis key prefix for URL cache entries.
-    pub url_prefix: String,
-
-    /// Redis key prefix for XXH3 byte hash cache entries.
-    pub xxh3_prefix: String,
-
-    /// TTL for cached pHash → score mappings.
-    pub phash_cache_ttl: Duration,
-
-
-    // ── Model / Inference ───────────────────────────────────────────────
-    /// ONNX input tensor name (must match the model's expected input).
-    pub model_input_name: String,
-
-    /// Image size the model expects (both width and height — models use square inputs).
-    pub model_image_size: u32,
-
-    /// Per-channel mean for image normalization, comma-separated (e.g. "0.5,0.5,0.5").
-    pub model_image_mean: [f32; 3],
-
-    /// Per-channel std for image normalization, comma-separated (e.g. "0.5,0.5,0.5").
-    pub model_image_std: [f32; 3],
-
-    /// Comma-separated label names matching the model's output indices.
-    /// Used for human-readable output (e.g. "nsfw,normal").
-    pub model_labels: Vec<String>,
-
-    /// Number of ONNX Runtime intra-op threads (parallelism within a single operator).
-    pub model_intra_threads: usize,
-
-    // ── Health ──────────────────────────────────────────────────────────
-    /// Port for the health / readiness HTTP server.
-    pub health_port: u16,
-
-    // ── Logging ─────────────────────────────────────────────────────────
-    /// `tracing` env-filter directive (e.g. `info`, `polarizer=debug`).
-    pub log_level: String,
+pub struct MigrationConfig {
+    pub database_url: String,
+    pub database_max_connections: u32,
+    pub timeout: Duration,
 }
 
-impl AppConfig {
-    /// Build config from environment variables, applying sensible defaults.
-    ///
-    /// Defaults are tuned for [`Falconsai/nsfw_image_detection_26`](https://huggingface.co/Falconsai/nsfw_image_detection_26)
-    /// with the `quantized_model.onnx` variant.
+impl MigrationConfig {
     pub fn from_env() -> Result<Self> {
+        let timeout_seconds = parse("POLARIZER_MIGRATION_TIMEOUT_SECONDS", "120")?;
+        if timeout_seconds == 0 {
+            bail!("POLARIZER_MIGRATION_TIMEOUT_SECONDS must be greater than zero");
+        }
         Ok(Self {
-            // Required
-            redis_uri: required("REDIS_URI")?,
-            model_path: optional("MODEL_PATH", "./quantized_model.onnx"),
-
-            // Optional with defaults
-            kafka_brokers: optional("KAFKA_BROKERS", "localhost:9092"),
-            kafka_group_id: optional("KAFKA_GROUP_ID", "polarizer-workers"),
-            kafka_jobs_topic: optional("KAFKA_JOBS_TOPIC", "polarizer.jobs"),
-            kafka_eventbus_topic: optional("KAFKA_EVENTBUS_TOPIC", "fun.interchat.events"),
-
-            consumer_name: optional(
-                "CONSUMER_NAME",
-                &hostname::get()
-                    .map(|h| h.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| "worker-0".into()),
-            ),
-            worker_count: optional("WORKER_COUNT", "4")
-                .parse()
-                .context("WORKER_COUNT must be a valid usize")?,
-            max_download_bytes: optional("MAX_DOWNLOAD_BYTES", "20971520") // 20 MiB
-                .parse()
-                .context("MAX_DOWNLOAD_BYTES must be a valid u64")?,
-            phash_prefix: optional("PHASH_PREFIX", "phash:"),
-            url_prefix: optional("URL_PREFIX", "url:"),
-            xxh3_prefix: optional("XXH3_PREFIX", "xxh3:"),
-            phash_cache_ttl: Duration::from_secs(
-                optional("PHASH_CACHE_TTL_SECS", "604800") // 7 days
-                    .parse()
-                    .context("PHASH_CACHE_TTL_SECS must be a valid u64")?,
-            ),
-
-
-            // Model / inference knobs
-            model_input_name: optional("MODEL_INPUT_NAME", "pixel_values"),
-            model_image_size: optional("MODEL_IMAGE_SIZE", "224")
-                .parse()
-                .context("MODEL_IMAGE_SIZE must be a valid u32")?,
-            model_image_mean: parse_f32_triple(&optional("MODEL_IMAGE_MEAN", "0.5,0.5,0.5"))
-                .context(
-                    "MODEL_IMAGE_MEAN must be three comma-separated floats (e.g. 0.5,0.5,0.5)",
-                )?,
-            model_image_std: parse_f32_triple(&optional("MODEL_IMAGE_STD", "0.5,0.5,0.5"))
-                .context(
-                    "MODEL_IMAGE_STD must be three comma-separated floats (e.g. 0.5,0.5,0.5)",
-                )?,
-            model_labels: optional("MODEL_LABELS", "nsfw,normal")
-                .split(',')
-                .map(|s| s.trim().to_owned())
-                .collect(),
-            model_intra_threads: optional("MODEL_INTRA_THREADS", "4")
-                .parse()
-                .context("MODEL_INTRA_THREADS must be a valid usize")?,
-
-            health_port: optional("HEALTH_PORT", "9090")
-                .parse()
-                .context("HEALTH_PORT must be a valid u16")?,
-            log_level: optional("LOG_LEVEL", "info,ort=warn"),
+            database_url: required("DATABASE_URL")?,
+            database_max_connections: parse("DATABASE_MAX_CONNECTIONS", "20")?,
+            timeout: Duration::from_secs(timeout_seconds),
         })
     }
 }
 
-fn required(key: &str) -> Result<String> {
-    env::var(key).with_context(|| format!("missing required environment variable: {key}"))
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub database_url: String,
+    pub database_max_connections: u32,
+    pub auto_migrate: bool,
+    pub migration_timeout: Duration,
+    pub kafka_brokers: String,
+    pub action_topic: String,
+    pub decision_topic: String,
+    pub command_topic: String,
+    pub command_result_topic: String,
+    pub policy_invalidation_topic: String,
+    pub prism_topic: String,
+    pub delivery_callback_topic: String,
+    pub dlq_topic: String,
+    pub delivery_dlq_topic: String,
+    pub kafka_group_id: String,
+    pub http_host: IpAddr,
+    pub http_port: u16,
+    pub grpc_host: IpAddr,
+    pub grpc_port: u16,
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+    pub tls_client_ca_path: Option<PathBuf>,
+    pub iris_endpoint: String,
+    pub iris_tls_domain: String,
+    pub iris_tls_ca_path: Option<PathBuf>,
+    pub iris_tls_cert_path: Option<PathBuf>,
+    pub iris_tls_key_path: Option<PathBuf>,
+    pub iris_timeout: Duration,
+    pub service_principal_allowlist: BTreeMap<String, BTreeSet<String>>,
+    pub service_principal_cert_sha256: BTreeMap<String, BTreeSet<String>>,
+    pub encryption_key_id: String,
+    pub encryption_key: Option<Vec<u8>>,
+    pub policy_worker_bin: PathBuf,
+    pub policy_worker_count: usize,
+    pub luau_source_limit: usize,
+    pub luau_heap_limit: usize,
+    pub luau_instruction_limit: u64,
+    pub luau_wall_timeout: Duration,
+    pub luau_output_limit: usize,
+    pub clean_allow_trace_sample_rate: f64,
+    pub openai_api_key: Option<String>,
+    pub openai_model: String,
+    pub openai_connect_timeout: Duration,
+    pub openai_request_timeout: Duration,
+    pub openai_concurrency: usize,
+    pub openai_external_images: bool,
+    pub attachment_allowed_hosts: Vec<String>,
+    pub attachment_max_bytes: u64,
+    pub attachment_max_pixels: u64,
+    pub nsfw_model_path: Option<PathBuf>,
+    pub nsfw_model_input_name: String,
+    pub nsfw_model_image_size: u32,
+    pub nsfw_model_mean: [f32; 3],
+    pub nsfw_model_std: [f32; 3],
+    pub nsfw_model_labels: Vec<String>,
+    pub nsfw_model_threads: usize,
+    pub log_level: String,
 }
 
-fn optional(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_owned())
+impl AppConfig {
+    pub fn from_env() -> Result<Self> {
+        let migration = MigrationConfig::from_env()?;
+        let worker_bin = env::var_os("POLARIZER_POLICY_WORKER_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("polarizer-policy-worker"));
+        let sample_rate = parse("CLEAN_ALLOW_TRACE_SAMPLE_RATE", "0.01")?;
+        if !(0.0..=1.0).contains(&sample_rate) {
+            bail!("CLEAN_ALLOW_TRACE_SAMPLE_RATE must be between 0 and 1");
+        }
+
+        let encryption_key = env::var("ACTION_ENCRYPTION_KEY_HEX")
+            .ok()
+            .map(|raw| hex::decode(raw).context("ACTION_ENCRYPTION_KEY_HEX must be hexadecimal"))
+            .transpose()?;
+        if let Some(key) = &encryption_key
+            && key.len() != 32
+        {
+            bail!("ACTION_ENCRYPTION_KEY_HEX must decode to exactly 32 bytes");
+        }
+
+        let service_principal_allowlist: BTreeMap<String, BTreeSet<String>> =
+            serde_json::from_str(&required("SERVICE_PRINCIPAL_ALLOWLIST_JSON")?)
+                .context("SERVICE_PRINCIPAL_ALLOWLIST_JSON must map principals to method names")?;
+        let mut service_principal_cert_sha256: BTreeMap<String, BTreeSet<String>> =
+            serde_json::from_str(&required("SERVICE_PRINCIPAL_CERT_SHA256_JSON")?).context(
+                "SERVICE_PRINCIPAL_CERT_SHA256_JSON must map principals to certificate fingerprints",
+            )?;
+        validate_service_principals(
+            &service_principal_allowlist,
+            &mut service_principal_cert_sha256,
+        )?;
+
+        Ok(Self {
+            database_url: migration.database_url,
+            database_max_connections: migration.database_max_connections,
+            auto_migrate: parse("POLARIZER_AUTO_MIGRATE", "true")?,
+            migration_timeout: migration.timeout,
+            kafka_brokers: optional("KAFKA_BROKERS", "localhost:9092"),
+            action_topic: optional(
+                "KAFKA_ACTION_TOPIC",
+                "events.trust-safety.action.requested.v2",
+            ),
+            decision_topic: optional("KAFKA_DECISION_TOPIC", "events.trust-safety.decision.v2"),
+            command_topic: optional("KAFKA_COMMAND_TOPIC", "events.trust-safety.commands.v2"),
+            command_result_topic: optional(
+                "KAFKA_COMMAND_RESULT_TOPIC",
+                "events.trust-safety.command-results.v2",
+            ),
+            policy_invalidation_topic: optional(
+                "KAFKA_POLICY_INVALIDATION_TOPIC",
+                "events.trust-safety.policy.invalidated.v2",
+            ),
+            prism_topic: optional("KAFKA_PRISM_TOPIC", "prism.stream.jobs"),
+            delivery_callback_topic: optional(
+                "KAFKA_PRISM_DELIVERY_TOPIC",
+                "events.prism.delivery.v2",
+            ),
+            dlq_topic: optional(
+                "KAFKA_DLQ_TOPIC",
+                "events.trust-safety.action.requested.v2.dlq",
+            ),
+            delivery_dlq_topic: optional(
+                "KAFKA_PRISM_DELIVERY_DLQ_TOPIC",
+                "events.prism.delivery.v2.dlq",
+            ),
+            kafka_group_id: optional("KAFKA_GROUP_ID", "polarizer-v2"),
+            http_host: parse("HTTP_HOST", "0.0.0.0")?,
+            http_port: parse("HTTP_PORT", "9090")?,
+            grpc_host: parse("GRPC_HOST", "0.0.0.0")?,
+            grpc_port: parse("GRPC_PORT", "50051")?,
+            tls_cert_path: path("GRPC_TLS_CERT"),
+            tls_key_path: path("GRPC_TLS_KEY"),
+            tls_client_ca_path: path("GRPC_TLS_CLIENT_CA"),
+            iris_endpoint: required("IRIS_ENDPOINT")?,
+            iris_tls_domain: required("IRIS_TLS_DOMAIN")?,
+            iris_tls_ca_path: path("IRIS_TLS_CA"),
+            iris_tls_cert_path: path("IRIS_TLS_CERT"),
+            iris_tls_key_path: path("IRIS_TLS_KEY"),
+            iris_timeout: Duration::from_millis(parse("IRIS_TIMEOUT_MS", "2000")?),
+            service_principal_allowlist,
+            service_principal_cert_sha256,
+            encryption_key_id: optional("ACTION_ENCRYPTION_KEY_ID", "local-development"),
+            encryption_key,
+            policy_worker_bin: worker_bin,
+            policy_worker_count: parse("POLICY_WORKER_COUNT", "4")?,
+            luau_source_limit: parse("LUAU_SOURCE_LIMIT_BYTES", "65536")?,
+            luau_heap_limit: parse("LUAU_HEAP_LIMIT_BYTES", "4194304")?,
+            luau_instruction_limit: parse("LUAU_INSTRUCTION_LIMIT", "100000")?,
+            luau_wall_timeout: Duration::from_millis(parse("LUAU_WALL_TIMEOUT_MS", "25")?),
+            luau_output_limit: parse("LUAU_OUTPUT_LIMIT_BYTES", "262144")?,
+            clean_allow_trace_sample_rate: sample_rate,
+            openai_api_key: env::var("OPENAI_API_KEY").ok(),
+            openai_model: optional("OPENAI_MODERATION_MODEL", "omni-moderation-2024-09-26"),
+            openai_connect_timeout: Duration::from_millis(parse(
+                "OPENAI_CONNECT_TIMEOUT_MS",
+                "1000",
+            )?),
+            openai_request_timeout: Duration::from_millis(parse(
+                "OPENAI_REQUEST_TIMEOUT_MS",
+                "5000",
+            )?),
+            openai_concurrency: parse("OPENAI_MAX_CONCURRENCY", "16")?,
+            openai_external_images: parse("OPENAI_EXTERNAL_IMAGES", "false")?,
+            attachment_allowed_hosts: optional(
+                "ATTACHMENT_ALLOWED_HOSTS",
+                "cdn.discordapp.com,media.discordapp.net",
+            )
+            .split(',')
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect(),
+            attachment_max_bytes: parse("ATTACHMENT_MAX_BYTES", "20971520")?,
+            attachment_max_pixels: parse("ATTACHMENT_MAX_PIXELS", "40000000")?,
+            nsfw_model_path: path("NSFW_MODEL_PATH"),
+            nsfw_model_input_name: optional("NSFW_MODEL_INPUT_NAME", "pixel_values"),
+            nsfw_model_image_size: parse("NSFW_MODEL_IMAGE_SIZE", "224")?,
+            nsfw_model_mean: parse_triple("NSFW_MODEL_MEAN", "0.5,0.5,0.5")?,
+            nsfw_model_std: parse_triple("NSFW_MODEL_STD", "0.5,0.5,0.5")?,
+            nsfw_model_labels: optional("NSFW_MODEL_LABELS", "nsfw,normal")
+                .split(',')
+                .map(str::trim)
+                .map(str::to_owned)
+                .collect(),
+            nsfw_model_threads: parse("NSFW_MODEL_THREADS", "4")?,
+            log_level: optional("LOG_LEVEL", "info,sqlx=warn,rdkafka=warn"),
+        })
+    }
+
+    pub fn tls_is_complete(&self) -> bool {
+        self.tls_cert_path.is_some()
+            && self.tls_key_path.is_some()
+            && self.tls_client_ca_path.is_some()
+    }
+
+    pub fn iris_tls_is_complete(&self) -> bool {
+        self.iris_tls_ca_path.is_some()
+            && self.iris_tls_cert_path.is_some()
+            && self.iris_tls_key_path.is_some()
+    }
 }
 
-/// Parse a comma-separated triple of floats (e.g. "0.5,0.5,0.5") into `[f32; 3]`.
-fn parse_f32_triple(s: &str) -> Result<[f32; 3]> {
-    let parts: Vec<f32> = s
+fn required(name: &str) -> Result<String> {
+    env::var(name).with_context(|| format!("{name} is required"))
+}
+
+fn optional(name: &str, default: &str) -> String {
+    env::var(name).unwrap_or_else(|_| default.to_owned())
+}
+
+fn parse<T>(name: &str, default: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    optional(name, default)
+        .parse()
+        .with_context(|| format!("{name} has an invalid value"))
+}
+
+fn path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_triple(name: &str, default: &str) -> Result<[f32; 3]> {
+    let values = optional(name, default)
         .split(',')
-        .map(|p| p.trim().parse::<f32>())
-        .collect::<Result<Vec<_>, _>>()
-        .context("each value must be a valid float")?;
+        .map(str::trim)
+        .map(str::parse::<f32>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("{name} must contain three comma-separated numbers"))?;
+    values
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{name} must contain exactly three numbers"))
+}
 
-    anyhow::ensure!(
-        parts.len() == 3,
-        "expected exactly 3 values, got {}",
-        parts.len()
-    );
-    Ok([parts[0], parts[1], parts[2]])
+fn validate_service_principals(
+    allowlist: &BTreeMap<String, BTreeSet<String>>,
+    certificate_fingerprints: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<()> {
+    for (principal, methods) in allowlist {
+        if methods.is_empty() {
+            bail!("service principal {principal} has no allowed methods");
+        }
+        if methods.contains("*") {
+            bail!("service principal {principal} must use an explicit method allowlist");
+        }
+        if !certificate_fingerprints.contains_key(principal) {
+            bail!("service principal {principal} has no certificate fingerprints");
+        }
+    }
+    for (principal, fingerprints) in certificate_fingerprints {
+        if !allowlist.contains_key(principal) {
+            bail!("certificate principal {principal} has no method allowlist");
+        }
+        if fingerprints.is_empty() {
+            bail!("certificate principal {principal} has no fingerprints");
+        }
+        let normalized = fingerprints
+            .iter()
+            .map(|fingerprint| fingerprint.trim().to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+        for fingerprint in &normalized {
+            if fingerprint.len() != 64 || hex::decode(fingerprint).is_err() {
+                bail!("certificate fingerprint for {principal} must be 64 hexadecimal characters");
+            }
+        }
+        *fingerprints = normalized;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fingerprint() -> String {
+        "ab".repeat(32)
+    }
+
+    #[test]
+    fn service_principals_require_explicit_methods_and_certificates() {
+        let allowlist = BTreeMap::from([(
+            "winter".to_owned(),
+            BTreeSet::from(["ListPolicyVersions".to_owned()]),
+        )]);
+        let mut certificates = BTreeMap::from([(
+            "winter".to_owned(),
+            BTreeSet::from([fingerprint().to_uppercase()]),
+        )]);
+
+        validate_service_principals(&allowlist, &mut certificates).expect("valid mapping");
+        assert!(certificates["winter"].contains(&fingerprint()));
+    }
+
+    #[test]
+    fn wildcard_service_principal_is_rejected() {
+        let allowlist = BTreeMap::from([("winter".to_owned(), BTreeSet::from(["*".to_owned()]))]);
+        let mut certificates =
+            BTreeMap::from([("winter".to_owned(), BTreeSet::from([fingerprint()]))]);
+
+        assert!(validate_service_principals(&allowlist, &mut certificates).is_err());
+    }
 }

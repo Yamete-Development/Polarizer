@@ -17,27 +17,17 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 
-# Cache dependency compilation by copying manifests first.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src
-
-# Build the actual binary.
+# Build from committed generated Protobuf code. The embedded SQLx migrator
+# requires the migrations directory to be present at compile time.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY migrations/ migrations/
 COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+RUN cargo build --release --bins
 
 # ort v2.0 dynamically links libonnxruntime.so and downloads it to the global cache.
 # We need to find it and move it to a predictable location.
 RUN mkdir -p /app/out-libs && \
     find /root/.cache/ort.pyke.io target/ -name "libonnxruntime.so*" -exec cp {} /app/out-libs/ \;
-
-# Download the ONNX model so it can be baked into the final image
-ARG MODEL_URL="https://huggingface.co/Falconsai/nsfw_image_detection_26/resolve/main/quantized_onnx/quantized_model.onnx"
-RUN --mount=type=secret,id=hf_token \
-    if [ ! -f /run/secrets/hf_token ]; then \
-        echo "ERROR: hf_token secret not found. Please pass it using --secret id=hf_token,src=... or --secret id=hf_token,env=HF_TOKEN" && exit 1; \
-    fi && \
-    curl -f -sLo /app/quantized_model.onnx -H "Authorization: Bearer $(cat /run/secrets/hf_token)" "${MODEL_URL}"
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 FROM ubuntu:24.04
@@ -45,25 +35,32 @@ FROM ubuntu:24.04
 # Create a non-root user
 RUN groupadd -r nonroot && useradd -r -g nonroot nonroot
 
-# Install required certificates for HTTPS requests if needed (reqwest rustls)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# Install required certificates for outbound HTTPS and curl for the container
+# readiness probe. A partially started Polarizer must not be considered healthy.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy the compiled binary
+# Copy the API service and the isolated Luau worker. Both are required for a
+# ready Polarizer instance.
 COPY --from=builder /app/target/release/polarizer /app/polarizer
+COPY --from=builder /app/target/release/polarizer-policy-worker /app/polarizer-policy-worker
 
 # Copy the ONNX Runtime dynamic libraries
 COPY --from=builder /app/out-libs/ /usr/lib/
 
 # Set the library path so the OS can find libonnxruntime.so
 ENV LD_LIBRARY_PATH=/usr/lib
+ENV POLARIZER_POLICY_WORKER_BIN=/app/polarizer-policy-worker
 
-# Copy the downloaded model into the image
-COPY --from=builder /app/quantized_model.onnx /app/quantized_model.onnx
+# Local NSFW classification is an optional check. Deployments that enable it
+# mount an approved model read-only and set NSFW_MODEL_PATH explicitly.
 
 USER nonroot
 
-EXPOSE 9090
+EXPOSE 50051 9090
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=40s --retries=6 \
+    CMD ["curl", "--fail", "--silent", "--show-error", "--max-time", "2", "http://127.0.0.1:9090/ready"]
 
 ENTRYPOINT ["/app/polarizer"]

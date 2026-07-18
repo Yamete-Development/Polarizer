@@ -1,288 +1,653 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{sync::Arc, time::Duration};
 
-use serde::Serialize;
-use uuid::Uuid;
+use prost::Message as ProstMessage;
+use rdkafka::{
+    ClientConfig, Message,
+    consumer::{CommitMode, Consumer, StreamConsumer},
+    message::{Header, Headers, OwnedHeaders},
+    producer::{FutureProducer, FutureRecord},
+};
+use sqlx::{PgPool, Row};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
-/// CloudEvents v1.0 envelope for inter-service events.
-#[derive(Debug, Serialize)]
-pub struct CloudEvent {
-    pub specversion: &'static str,
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub source: &'static str,
-    pub id: String,
-    pub time: String,
-    pub datacontenttype: &'static str,
-    pub data: serde_json::Value,
+use crate::{
+    config::AppConfig,
+    contract::v2::{self, ActionRequested, PrismDeliveryCallback},
+    grpc::action_from_proto,
+    health::HealthState,
+    policy::{engine::PolicyEngine, repository::PostgresPolicyRepository},
+};
+
+pub struct ActionConsumer {
+    consumer: StreamConsumer,
+    dlq_producer: FutureProducer,
+    action_topic: String,
+    dlq_topic: String,
+    engine: Arc<PolicyEngine>,
+    health: Arc<HealthState>,
+    cancel: CancellationToken,
 }
 
-const SOURCE: &str = "/polarizer";
-
-fn generate_id() -> String {
-    format!("evt_{}", Uuid::new_v4().simple())
-}
-
-fn format_utc_rfc3339() -> String {
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let total_secs = dur.as_secs();
-
-    let secs = total_secs % 86_400;
-    let days = total_secs / 86_400;
-
-    let hour = secs / 3600;
-    let min = (secs % 3600) / 60;
-    let sec = secs % 60;
-
-    let (year, month, day) = civil_from_days(days as i64);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
-}
-
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-pub fn build_envelope(event_type: &str, data: serde_json::Value) -> CloudEvent {
-    CloudEvent {
-        specversion: "1.0",
-        event_type: event_type.to_string(),
-        source: SOURCE,
-        id: generate_id(),
-        time: format_utc_rfc3339(),
-        datacontenttype: "application/json",
-        data,
-    }
-}
-
-/// Async trait for publishing CloudEvents to the inter-service event bus.
-#[async_trait::async_trait]
-pub trait EventBus: Send + Sync {
-    /// Build a CloudEvent envelope and publish it to the configured stream/topic.
-    async fn publish(&self, event_type: &str, data: serde_json::Value) -> anyhow::Result<()>;
-    /// Returns the transport backend name for OpenTelemetry messaging.system attribute.
-    #[allow(dead_code)]
-    fn system_name(&self) -> &'static str;
-}
-
-
-
-/// Kafka implementation of the `EventBus` trait.
-pub struct KafkaEventBus {
-    producer: rdkafka::producer::FutureProducer,
+pub struct DeliveryCallbackConsumer {
+    consumer: StreamConsumer,
+    dlq_producer: FutureProducer,
     topic: String,
+    dlq_topic: String,
+    repository: Arc<PostgresPolicyRepository>,
+    cancel: CancellationToken,
 }
 
-impl KafkaEventBus {
-    pub fn new(brokers: &str, topic: String) -> anyhow::Result<Self> {
-        let producer: rdkafka::producer::FutureProducer = rdkafka::ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("message.timeout.ms", "5000")
+impl DeliveryCallbackConsumer {
+    pub fn new(
+        config: &AppConfig,
+        repository: Arc<PostgresPolicyRepository>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set(
+                "group.id",
+                format!("{}-prism-delivery", config.kafka_group_id),
+            )
+            .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("isolation.level", "read_committed")
             .create()?;
-        Ok(Self { producer, topic })
+        consumer.subscribe(&[&config.delivery_callback_topic])?;
+        let dlq_producer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("message.timeout.ms", "10000")
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .create()?;
+        Ok(Self {
+            consumer,
+            dlq_producer,
+            topic: config.delivery_callback_topic.clone(),
+            dlq_topic: config.delivery_dlq_topic.clone(),
+            repository,
+            cancel,
+        })
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        info!(topic = %self.topic, "Prism delivery callback consumer started");
+        loop {
+            let message = tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                message = self.consumer.recv() => match message {
+                    Ok(message) => message,
+                    Err(error) => { warn!(error = %error, "delivery callback receive failed"); continue; }
+                },
+            };
+            let payload = message.payload().unwrap_or_default();
+            let key = message.key().unwrap_or_default();
+            if let Err(reason) =
+                validate_cloud_event_headers(message.headers(), "interchat.prism.delivery.v2")
+            {
+                warn!(reason, "invalid delivery callback CloudEvents headers");
+                publish_dlq(&self.dlq_producer, &self.dlq_topic, payload, key, reason).await?;
+                self.consumer.commit_message(&message, CommitMode::Sync)?;
+                continue;
+            }
+            let callback = match PrismDeliveryCallback::decode(payload) {
+                Ok(callback) => callback,
+                Err(error) => {
+                    warn!(error = %error, "invalid delivery callback Protobuf");
+                    publish_dlq(
+                        &self.dlq_producer,
+                        &self.dlq_topic,
+                        payload,
+                        key,
+                        "PROTOBUF_DECODE_FAILED",
+                    )
+                    .await?;
+                    self.consumer.commit_message(&message, CommitMode::Sync)?;
+                    continue;
+                }
+            };
+            let action_id = match uuid::Uuid::parse_str(&callback.action_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    publish_dlq(
+                        &self.dlq_producer,
+                        &self.dlq_topic,
+                        payload,
+                        key,
+                        "ACTION_ID_INVALID",
+                    )
+                    .await?;
+                    self.consumer.commit_message(&message, CommitMode::Sync)?;
+                    continue;
+                }
+            };
+            let state = match v2::MessageState::try_from(callback.state).unwrap_or_default() {
+                v2::MessageState::Active => "ACTIVE",
+                v2::MessageState::DeliveryFailed => "DELIVERY_FAILED",
+                _ => {
+                    publish_dlq(
+                        &self.dlq_producer,
+                        &self.dlq_topic,
+                        payload,
+                        key,
+                        "STATE_INVALID",
+                    )
+                    .await?;
+                    self.consumer.commit_message(&message, CommitMode::Sync)?;
+                    continue;
+                }
+            };
+            let applied = self
+                .repository
+                .apply_delivery_callback(
+                    action_id,
+                    state,
+                    (!callback.failure_code.is_empty()).then_some(callback.failure_code.as_str()),
+                )
+                .await?;
+            if !applied {
+                warn!(%action_id, state, "delivery callback did not match a pending action");
+            }
+            self.consumer.commit_message(&message, CommitMode::Sync)?;
+        }
+        info!("Prism delivery callback consumer stopped");
+        Ok(())
     }
 }
 
-#[async_trait::async_trait]
-impl EventBus for KafkaEventBus {
-    async fn publish(&self, event_type: &str, data: serde_json::Value) -> anyhow::Result<()> {
-        let event = build_envelope(event_type, data);
-        let payload = serde_json::to_string(&event)?;
+impl ActionConsumer {
+    pub fn new(
+        config: &AppConfig,
+        engine: Arc<PolicyEngine>,
+        health: Arc<HealthState>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("group.id", &config.kafka_group_id)
+            .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("isolation.level", "read_committed")
+            .set("max.poll.interval.ms", "300000")
+            .create()?;
+        consumer.subscribe(&[&config.action_topic])?;
+        let dlq_producer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("message.timeout.ms", "10000")
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .create()?;
+        Ok(Self {
+            consumer,
+            dlq_producer,
+            action_topic: config.action_topic.clone(),
+            dlq_topic: config.dlq_topic.clone(),
+            engine,
+            health,
+            cancel,
+        })
+    }
 
-        let record = rdkafka::producer::FutureRecord::to(&self.topic)
-            .key("")
-            .payload(&payload);
+    pub async fn run(self) -> anyhow::Result<()> {
+        info!(topic = %self.action_topic, "binary Protobuf action consumer started");
+        loop {
+            let message = tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                message = self.consumer.recv() => match message {
+                    Ok(message) => message,
+                    Err(error) => { warn!(error = %error, "Kafka receive failed"); continue; }
+                },
+            };
+            let payload = message.payload().unwrap_or_default();
+            let partition_key = message.key().unwrap_or_default();
+            if let Err(reason) = validate_cloud_event_headers(
+                message.headers(),
+                "interchat.trust-safety.action.requested.v2",
+            ) {
+                warn!(reason, "invalid action CloudEvents headers; routing to DLQ");
+                self.publish_dlq(payload, partition_key, reason).await?;
+                self.consumer.commit_message(&message, CommitMode::Sync)?;
+                self.health.record_evaluation(false);
+                continue;
+            }
+            let requested = match ActionRequested::decode(payload) {
+                Ok(requested) => requested,
+                Err(error) => {
+                    warn!(error = %error, partition = message.partition(), offset = message.offset(), "invalid action Protobuf; routing to DLQ");
+                    self.publish_dlq(payload, partition_key, "PROTOBUF_DECODE_FAILED")
+                        .await?;
+                    self.consumer.commit_message(&message, CommitMode::Sync)?;
+                    self.health.record_evaluation(false);
+                    continue;
+                }
+            };
+            let Some(action_proto) = requested.action else {
+                self.publish_dlq(payload, partition_key, "ACTION_MISSING")
+                    .await?;
+                self.consumer.commit_message(&message, CommitMode::Sync)?;
+                self.health.record_evaluation(false);
+                continue;
+            };
+            let mut action = match action_from_proto(action_proto) {
+                Ok(action) => action,
+                Err(status) => {
+                    self.publish_dlq(
+                        payload,
+                        partition_key,
+                        &format!("ACTION_INVALID_{}", status.code() as i32),
+                    )
+                    .await?;
+                    self.consumer.commit_message(&message, CommitMode::Sync)?;
+                    self.health.record_evaluation(false);
+                    continue;
+                }
+            };
+            action.prism_payload = requested
+                .prism_payload
+                .map(|payload| payload.encode_to_vec());
 
-        let _ = self.producer.send(record, std::time::Duration::from_secs(0)).await
-            .map_err(|(e, _)| anyhow::anyhow!("failed to publish event: {}", e))?;
-
+            let mut processed = false;
+            for attempt in 1..=3u32 {
+                match self.engine.evaluate_with_shadow(&action).await {
+                    Ok(_) => {
+                        processed = true;
+                        break;
+                    }
+                    Err(error) => {
+                        error!(error = %error, action_id = %action.id, attempt, "action evaluation failed");
+                        if attempt < 3 {
+                            tokio::time::sleep(Duration::from_millis(100 * (1 << (attempt - 1))))
+                                .await;
+                        }
+                    }
+                }
+            }
+            if !processed {
+                self.publish_dlq(payload, partition_key, "EVALUATION_FAILED")
+                    .await?;
+                self.health.record_evaluation(false);
+            } else {
+                self.health.record_evaluation(true);
+            }
+            self.consumer.commit_message(&message, CommitMode::Sync)?;
+        }
+        info!("action consumer stopped");
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn system_name(&self) -> &'static str { "kafka" }
+    async fn publish_dlq(
+        &self,
+        payload: &[u8],
+        key: &[u8],
+        error_code: &str,
+    ) -> anyhow::Result<()> {
+        publish_dlq(
+            &self.dlq_producer,
+            &self.dlq_topic,
+            payload,
+            key,
+            error_code,
+        )
+        .await
+    }
+}
+
+fn validate_cloud_event_headers<H: Headers>(
+    headers: Option<&H>,
+    expected_type: &str,
+) -> Result<(), &'static str> {
+    let Some(headers) = headers else {
+        return Err("CLOUDEVENT_HEADERS_MISSING");
+    };
+    if header_value(headers, "ce_specversion") != Some(b"1.0".as_slice()) {
+        return Err("CLOUDEVENT_SPECVERSION_INVALID");
+    }
+    if header_value(headers, "ce_type") != Some(expected_type.as_bytes()) {
+        return Err("CLOUDEVENT_TYPE_INVALID");
+    }
+    if header_value(headers, "ce_datacontenttype") != Some(b"application/protobuf".as_slice()) {
+        return Err("CLOUDEVENT_CONTENT_TYPE_INVALID");
+    }
+    for required in ["ce_id", "ce_source", "ce_time"] {
+        if header_value(headers, required).is_none_or(|value| value.is_empty()) {
+            return Err("CLOUDEVENT_REQUIRED_HEADER_MISSING");
+        }
+    }
+    Ok(())
+}
+
+fn header_value<'a, H: Headers>(headers: &'a H, name: &str) -> Option<&'a [u8]> {
+    (0..headers.count()).find_map(|index| {
+        let header = headers.get(index);
+        (header.key == name).then_some(header.value).flatten()
+    })
+}
+
+pub struct OutboxRelay {
+    db: PgPool,
+    producer: FutureProducer,
+    cancel: CancellationToken,
+}
+
+impl OutboxRelay {
+    pub fn new(db: PgPool, config: &AppConfig, cancel: CancellationToken) -> anyhow::Result<Self> {
+        let producer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .set("message.timeout.ms", "10000")
+            .create()?;
+        Ok(Self {
+            db,
+            producer,
+            cancel,
+        })
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                _ = self.cancel.cancelled() => break,
+                result = self.relay_batch() => {
+                    match result {
+                        Ok(0) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        Ok(_) => {},
+                        Err(error) => { error!(error = %error, "outbox relay batch failed"); tokio::time::sleep(Duration::from_secs(1)).await; }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn relay_batch(&self) -> anyhow::Result<usize> {
+        let lease_token = uuid::Uuid::now_v7();
+        let rows = sqlx::query(
+            "WITH candidates AS ( \
+                 SELECT id FROM trust_safety.outbox \
+                 WHERE (status IN ('PENDING', 'FAILED') AND available_at <= clock_timestamp()) \
+                    OR (status = 'CLAIMED' AND lease_expires_at <= clock_timestamp()) \
+                 ORDER BY created_at LIMIT 25 FOR UPDATE SKIP LOCKED \
+             ) \
+             UPDATE trust_safety.outbox AS outbox \
+             SET status = 'CLAIMED', lease_token = $1, \
+                 lease_expires_at = clock_timestamp() + INTERVAL '5 minutes' \
+             FROM candidates WHERE outbox.id = candidates.id \
+             RETURNING outbox.id, outbox.topic, outbox.partition_key, outbox.headers, outbox.payload",
+        )
+        .bind(lease_token)
+        .fetch_all(&self.db)
+        .await?;
+        let count = rows.len();
+        for row in rows {
+            let id: uuid::Uuid = row.try_get("id")?;
+            let topic: String = row.try_get("topic")?;
+            let key: String = row.try_get("partition_key")?;
+            let payload: Vec<u8> = row.try_get("payload")?;
+            let header_json: serde_json::Value = row.try_get("headers")?;
+            let mut headers = OwnedHeaders::new();
+            if let Some(values) = header_json.as_object() {
+                for (name, value) in values {
+                    if let Some(value) = value.as_str() {
+                        headers = headers.insert(Header {
+                            key: name,
+                            value: Some(value),
+                        });
+                    }
+                }
+            }
+            let result = self
+                .producer
+                .send(
+                    FutureRecord::to(&topic)
+                        .payload(&payload)
+                        .key(&key)
+                        .headers(headers),
+                    Duration::from_secs(10),
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    sqlx::query("UPDATE trust_safety.outbox SET status = 'PUBLISHED', published_at = clock_timestamp(), attempts = attempts + 1, last_error_code = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND status = 'CLAIMED' AND lease_token = $2")
+                        .bind(id).bind(lease_token).execute(&self.db).await?;
+                }
+                Err((error, _)) => {
+                    warn!(error = %error, outbox_id = %id, "outbox publish failed");
+                    sqlx::query("UPDATE trust_safety.outbox SET status = 'FAILED', attempts = attempts + 1, available_at = clock_timestamp() + make_interval(secs => LEAST(60, power(2, LEAST(attempts, 6))::int)), last_error_code = $2, lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND status = 'CLAIMED' AND lease_token = $3")
+                        .bind(id).bind(error.rdkafka_error_code().map(|code| format!("{code:?}")).unwrap_or_else(|| "KAFKA_ERROR".into())).bind(lease_token).execute(&self.db).await?;
+                }
+            }
+        }
+        Ok(count)
+    }
+}
+
+async fn publish_dlq(
+    producer: &FutureProducer,
+    topic: &str,
+    payload: &[u8],
+    key: &[u8],
+    error_code: &str,
+) -> anyhow::Result<()> {
+    let headers = dlq_headers(error_code);
+    producer
+        .send(
+            FutureRecord::to(topic)
+                .payload(payload)
+                .key(key)
+                .headers(headers),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|(error, _)| anyhow::anyhow!("DLQ publish failed: {error}"))?;
+    Ok(())
+}
+
+fn dlq_headers(error_code: &str) -> OwnedHeaders {
+    let event_id = uuid::Uuid::now_v7().to_string();
+    let event_time = chrono::Utc::now().to_rfc3339();
+    OwnedHeaders::new()
+        .insert(Header {
+            key: "ce_specversion",
+            value: Some("1.0"),
+        })
+        .insert(Header {
+            key: "ce_type",
+            value: Some("interchat.trust-safety.dlq.v2"),
+        })
+        .insert(Header {
+            key: "ce_source",
+            value: Some("/polarizer"),
+        })
+        .insert(Header {
+            key: "ce_id",
+            value: Some(event_id.as_str()),
+        })
+        .insert(Header {
+            key: "ce_time",
+            value: Some(event_time.as_str()),
+        })
+        .insert(Header {
+            key: "ce_datacontenttype",
+            value: Some("application/protobuf"),
+        })
+        .insert(Header {
+            key: "content-type",
+            value: Some("application/protobuf"),
+        })
+        .insert(Header {
+            key: "polarizer-error-code",
+            value: Some(error_code),
+        })
+}
+
+pub async fn policy_activation_worker(
+    repository: Arc<PostgresPolicyRepository>,
+    engine: Arc<PolicyEngine>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                for activation in repository.due_activations().await? {
+                    let version = match repository.get_version(activation.policy_version_id).await {
+                        Ok(version) => version,
+                        Err(error) => {
+                            warn!(error = %error, activation_id = %activation.id, "scheduled policy version is unavailable");
+                            repository.finish_scheduled_activation(activation.id, Some("POLICY_VERSION_UNAVAILABLE")).await?;
+                            continue;
+                        }
+                    };
+                    let issues = engine.provider_activation_issues(&version).await;
+                    if !issues.is_empty() {
+                        warn!(activation_id = %activation.id, issues = ?issues, "scheduled activation provider check failed");
+                        repository.finish_scheduled_activation(activation.id, Some("REQUIRED_PROVIDER_UNHEALTHY")).await?;
+                        continue;
+                    }
+                    let context = v2::RequestContext {
+                        request_id: activation.id.to_string(),
+                        actor_id: activation.requested_by.clone(),
+                        actor_type: v2::ActorType::Human as i32,
+                        service_principal: "polarizer-activation-worker".to_owned(),
+                        idempotency_key: activation.id.to_string(),
+                        trace_id: String::new(),
+                    };
+                    match repository.activate(
+                        activation.bundle_id,
+                        activation.policy_version_id,
+                        &context,
+                        activation.expected_bundle_version,
+                        &activation.activation_type,
+                    ).await {
+                        Ok(_) => repository.finish_scheduled_activation(activation.id, None).await?,
+                        Err(error) => {
+                            warn!(error = %error, activation_id = %activation.id, "scheduled policy activation failed");
+                            repository.finish_scheduled_activation(activation.id, Some("ACTIVATION_FAILED")).await?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn expiry_worker(
+    repository: Arc<PostgresPolicyRepository>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let db = repository.pool().clone();
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                let mut tx = db.begin().await?;
+                sqlx::query("UPDATE trust_safety.restriction SET status = 'EXPIRED', version = version + 1, updated_at = clock_timestamp() WHERE status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at <= clock_timestamp()")
+                    .execute(&mut *tx).await?;
+                sqlx::query("UPDATE trust_safety.infraction SET status = 'EXPIRED', version = version + 1, updated_at = clock_timestamp() WHERE status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at <= clock_timestamp()")
+                    .execute(&mut *tx).await?;
+                sqlx::query("DELETE FROM trust_safety.policy_counter WHERE window_end <= clock_timestamp() - INTERVAL '1 day'")
+                    .execute(&mut *tx).await?;
+                tx.commit().await?;
+                repository.expire_due_held_actions(500).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
+mod cloud_event_tests {
+    use super::{dlq_headers, header_value, validate_cloud_event_headers};
+    use rdkafka::message::{Header, Headers, OwnedHeaders};
 
-    struct MockEventBus {
-        calls: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    fn valid_headers(event_type: &str) -> OwnedHeaders {
+        OwnedHeaders::new()
+            .insert(Header {
+                key: "ce_specversion",
+                value: Some("1.0"),
+            })
+            .insert(Header {
+                key: "ce_type",
+                value: Some(event_type),
+            })
+            .insert(Header {
+                key: "ce_source",
+                value: Some("/bot"),
+            })
+            .insert(Header {
+                key: "ce_id",
+                value: Some("event-1"),
+            })
+            .insert(Header {
+                key: "ce_time",
+                value: Some("2026-07-17T00:00:00Z"),
+            })
+            .insert(Header {
+                key: "ce_datacontenttype",
+                value: Some("application/protobuf"),
+            })
     }
 
-    impl MockEventBus {
-        fn new() -> Self {
-            Self {
-                calls: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-
-        fn calls(&self) -> Arc<Mutex<Vec<(String, serde_json::Value)>>> {
-            self.calls.clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl EventBus for MockEventBus {
-        async fn publish(
-            &self,
-            event_type: &str,
-            data: serde_json::Value,
-        ) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((event_type.to_string(), data));
+    #[test]
+    fn accepts_complete_binary_cloud_event_headers() {
+        let headers = valid_headers("interchat.trust-safety.action.requested.v2");
+        assert_eq!(
+            validate_cloud_event_headers(
+                Some(&headers),
+                "interchat.trust-safety.action.requested.v2"
+            ),
             Ok(())
-        }
-
-        fn system_name(&self) -> &'static str {
-            "mock"
-        }
+        );
     }
 
     #[test]
-    fn test_build_envelope_produces_valid_cloud_event() {
-        let data = serde_json::json!({"key": "value"});
-        let event = build_envelope("fun.interchat.test", data.clone());
+    fn rejects_missing_or_wrong_contract_headers() {
+        assert_eq!(
+            validate_cloud_event_headers::<OwnedHeaders>(
+                None,
+                "interchat.trust-safety.action.requested.v2"
+            ),
+            Err("CLOUDEVENT_HEADERS_MISSING")
+        );
+        let headers = valid_headers("interchat.prism.delivery.v2");
+        assert_eq!(
+            validate_cloud_event_headers(
+                Some(&headers),
+                "interchat.trust-safety.action.requested.v2"
+            ),
+            Err("CLOUDEVENT_TYPE_INVALID")
+        );
+    }
 
-        assert_eq!(event.specversion, "1.0");
-        assert_eq!(event.source, "/polarizer");
-        assert_eq!(event.event_type, "fun.interchat.test");
-        assert_eq!(event.datacontenttype, "application/json");
-        assert_eq!(event.data, data);
-
-        assert!(
-            event.id.starts_with("evt_"),
-            "Event ID should start with 'evt_', got: {}",
-            event.id
+    #[test]
+    fn dlq_headers_are_complete_binary_cloud_events() {
+        let headers = dlq_headers("ACTION_INVALID");
+        assert_eq!(
+            header_value(&headers, "ce_specversion"),
+            Some(b"1.0".as_slice())
         );
         assert_eq!(
-            event.id.len(),
-            36,
-            "Event ID should be 36 chars (evt_ + 32 hex), got {} chars: {}",
-            event.id.len(),
-            event.id
-        );
-
-        assert!(
-            event.time.ends_with('Z'),
-            "Time should end with 'Z', got: {}",
-            event.time
+            header_value(&headers, "ce_type"),
+            Some(b"interchat.trust-safety.dlq.v2".as_slice())
         );
         assert_eq!(
-            event.time.len(),
-            20,
-            "Time should be 20 chars (YYYY-MM-DDTHH:MM:SSZ), got: {}",
-            event.time
+            header_value(&headers, "ce_datacontenttype"),
+            Some(b"application/protobuf".as_slice())
         );
-    }
-
-    #[test]
-    fn test_generate_id_format() {
-        let id1 = generate_id();
-        let id2 = generate_id();
-
-        assert!(id1.starts_with("evt_"));
-        assert_eq!(id1.len(), 36);
-        assert_eq!(id2.len(), 36);
-
-        assert_ne!(id1, id2, "Generated IDs should be unique");
-
-        let hex_part = &id1[4..];
-        assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()),
-            "Hex part should only contain hex digits, got: {}", hex_part);
-    }
-
-    #[test]
-    fn test_format_utc_rfc3339_format() {
-        let ts = format_utc_rfc3339();
-
-        assert_eq!(ts.len(), 20, "Expected 20 chars, got: '{}'", ts);
-        assert!(ts.ends_with('Z'), "Should end with Z, got: '{}'", ts);
-
-        let parts: Vec<&str> = ts.trim_end_matches('Z').splitn(2, 'T').collect();
-        assert_eq!(parts.len(), 2);
-
-        let date_parts: Vec<&str> = parts[0].splitn(3, '-').collect();
-        assert_eq!(date_parts.len(), 3);
-        assert!(date_parts[0].parse::<u32>().is_ok(), "Year should be numeric");
-        assert!(date_parts[1].parse::<u32>().is_ok(), "Month should be numeric");
-        assert!(date_parts[2].parse::<u32>().is_ok(), "Day should be numeric");
-
-        let time_parts: Vec<&str> = parts[1].splitn(3, ':').collect();
-        assert_eq!(time_parts.len(), 3);
-        let hour: u32 = time_parts[0].parse().unwrap();
-        let min: u32 = time_parts[1].parse().unwrap();
-        let sec: u32 = time_parts[2].parse().unwrap();
-        assert!(hour < 24, "Hour out of range: {}", hour);
-        assert!(min < 60, "Minute out of range: {}", min);
-        assert!(sec < 60, "Second out of range: {}", sec);
-    }
-
-    #[test]
-    fn test_build_envelope_json_serializable() {
-        let data = serde_json::json!({"key": "value"});
-        let event = build_envelope("fun.interchat.test", data);
-
-        let serialized = serde_json::to_string(&event).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(parsed["specversion"], "1.0");
-        assert_eq!(parsed["source"], "/polarizer");
-        assert_eq!(parsed["type"], "fun.interchat.test");
-        assert_eq!(parsed["datacontenttype"], "application/json");
-        assert!(parsed["id"].is_string());
-        assert!(parsed["time"].is_string());
-    }
-
-    #[test]
-    fn test_build_envelope_id_uniqueness() {
-        let mut ids = Vec::new();
-        for _ in 0..100 {
-            let event = build_envelope("fun.interchat.test", serde_json::json!({}));
-            ids.push(event.id);
+        assert_eq!(
+            header_value(&headers, "polarizer-error-code"),
+            Some(b"ACTION_INVALID".as_slice())
+        );
+        for required in ["ce_id", "ce_source", "ce_time"] {
+            assert!(header_value(&headers, required).is_some_and(|value| !value.is_empty()));
         }
-        let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len(), "All 100 IDs should be unique");
-    }
-
-    #[tokio::test]
-    async fn test_mock_event_bus_publish() {
-        let bus = MockEventBus::new();
-        let calls = bus.calls();
-
-        let data = serde_json::json!({"event": "test"});
-        bus.publish("fun.interchat.test", data.clone()).await.unwrap();
-
-        let recorded = calls.lock().unwrap();
-        assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0].0, "fun.interchat.test");
-        assert_eq!(recorded[0].1, data);
-    }
-
-    #[test]
-    fn test_civil_from_days_known_date() {
-        let (y, m, d) = civil_from_days(0);
-        assert_eq!(y, 1970);
-        assert_eq!(m, 1);
-        assert_eq!(d, 1);
-
-        let (y, m, d) = civil_from_days(7305);
-        assert_eq!(y, 1990);
-        assert_eq!(m, 1);
-        assert_eq!(d, 1);
+        assert!(headers.count() >= 8);
     }
 }

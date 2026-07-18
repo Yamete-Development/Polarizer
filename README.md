@@ -1,123 +1,139 @@
 # Polarizer
 
-High-performance image analysis microservice built in Rust. Processes images through an ONNX inference pipeline with perceptual hashing and Redis-backed caching.
+Polarizer is InterChat's authoritative trust-and-safety service and dynamic policy engine. Hub and Lobby actions are evaluated here before user content can reach Prism.
 
 ## Architecture
 
+```text
+Bot action (binary Protobuf)
+        │
+        ▼
+Kafka action inbox ──► feature dependency plan ──► policy-ir-v1 / luau-v1
+        │                                                │
+        │                                                ▼
+        │                                      typed effects + trace
+        │                                                │
+        └──────── PostgreSQL transaction ◄───────────────┘
+                         │
+                         ├── decision event
+                         ├── durable command ledger + bot commands
+                         └── approved Prism job
 ```
-Redis Stream ──▶ Consumer ──▶ Download ──▶ Decode ──▶ pHash ──▶ Cache Check
-                                                                    │
-                                                          ┌─────────┴─────────┐
-                                                          ▼                   ▼
-                                                     Cache Hit           Cache Miss
-                                                          │                   │
-                                                          │            ONNX Inference
-                                                          │                   │
-                                                          │            Cache Write
-                                                          │                   │
-                                                          └─────────┬─────────┘
-                                                                    ▼
-                                                           Results Stream
-```
 
-## Quick Start
+PostgreSQL 18 is authoritative for policies, decisions, restrictions, infractions, counters, safety assessments, review items, inbox state, and outbox state. Redis is not an authority. Kafka payloads are binary Protobuf; CloudEvents metadata is carried in Kafka headers.
 
-### Prerequisites
+## Safety properties
 
-- Rust 1.80+ (stable)
-- Redis 7+
-- An ONNX model file
+- Content is `PENDING_MODERATION` until Polarizer commits a decision.
+- Blocked or held content is never published to Prism.
+- Held actions have a bounded deadline and can be approved, rejected, or expired through an audited, version-checked adjudication transaction. Approval alone releases the encrypted Prism payload.
+- Approved content remains `APPROVED_PENDING_DELIVERY` until a Prism callback marks it active.
+- Global mandatory policy cannot be weakened by product, Hub, Lobby, or overlay policy.
+- Policy scripts return typed effects and cannot access databases, networks, files, processes, secrets, or environment variables.
+- Luau executes in isolated worker processes with instruction, heap, wall-time, source, and output limits.
+- Luau receives only frozen action/features and typed constructors for allow, block, hold, censor, flag, notify, infraction, restriction, review, label, counter, delete, and kick effects. Returned effects are validated again in Polarizer.
+- OpenAI moderation is an optional typed feature provider. Policies choose categories, thresholds, and explicit outage behavior.
+- External images reach OpenAI only when both the deployment and the individual policy invocation opt in; local image classification is the default.
+- Attachment downloads require an approved HTTPS host on every redirect, pinned public DNS answers, no proxy re-resolution, bounded streaming, matching MIME/decoded formats, and byte, pixel, and decoder-allocation limits.
+- Mutations require an authenticated human actor, an allowlisted service principal, and an idempotency key.
+- gRPC and Iris connections require mutual TLS.
+- Full Prism payloads are encrypted at rest in the action inbox and are never logged.
+- Feature invocations are isolated by provider configuration, deadline, and data-handling class. Runtime values remain available to policy evaluation while providers control the redacted representation persisted in traces.
+- Bot side effects are registered transactionally in PostgreSQL before publication. Claim/complete leases make retry-safe commands recoverable and route ambiguous non-retry-safe outcomes to manual recovery.
 
-### Setup
+## Contracts
+
+The canonical schemas live in [`../proto/trust_and_safety/v2`](../proto/trust_and_safety/v2) and [`../proto/prism/prism_jobs.proto`](../proto/prism/prism_jobs.proto). Generated Rust code is committed under `src/generated`; production builds do not depend on sibling repositories or a locally installed Protobuf compiler.
+
+See [CONTRACT.md](CONTRACT.md) for the topic, header, authentication, state, and API contract.
+
+## Running locally
+
+Requirements:
+
+- PostgreSQL 18
+- Kafka
+- a Polarizer server certificate and trusted client CA
+- an Iris client certificate and trusted Iris CA
+- the `polarizer-policy-worker` binary on `PATH` or configured explicitly
 
 ```bash
-# Clone and enter the project
-cd polarizer
-
-# Copy environment template
 cp .env.example .env
-# Edit .env with your Redis URI and model path
-
-# Build and run
-cargo run --release
+# Fill all required credentials and endpoints.
+cargo run -- migrate
+cargo run --bin polarizer
 ```
 
-### Environment Variables
+The service exposes:
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `REDIS_URI` | ✅ | — | Redis connection string |
-| `STREAM_KEY` | | `polarizer:jobs` | Input Redis stream |
-| `CONSUMER_GROUP` | | `polarizer-workers` | Consumer group name |
-| `CONSUMER_NAME` | | hostname | Unique consumer identifier |
-| `WORKER_COUNT` | | `4` | Concurrent processing tasks |
-| `BATCH_SIZE` | | `10` | Messages per XREADGROUP call |
-| `BLOCK_TIMEOUT_MS` | | `5000` | XREADGROUP block timeout |
-| `MAX_DOWNLOAD_BYTES` | | `20971520` | Max download size (20 MiB) |
-| `PHASH_PREFIX` | | `phash:` | Redis key prefix for hash cache |
-| `PHASH_CACHE_TTL_SECS` | | `604800` | Cache TTL (7 days) |
-| `RESULT_STREAM_KEY` | | `polarizer:results` | Output Redis stream |
-| `HEALTH_PORT` | | `9090` | Health server port |
-| `LOG_LEVEL` | | `info` | Tracing filter directive |
-| `LOG_FORMAT` | | `pretty` | Set to `json` for structured output |
+| Address | Purpose |
+|---|---|
+| `:50051` | mutually authenticated gRPC |
+| `:9090/live` | liveness |
+| `:9090/ready` | readiness |
+| `:9090/metrics` | Prometheus text metrics |
 
-#### Model / Inference
+`POLARIZER_AUTO_MIGRATE=true` is the safe default for a simple deployment: migrations finish before any health server, gRPC server, or Kafka consumer starts. SQLx uses a PostgreSQL advisory lock, and `POLARIZER_MIGRATION_TIMEOUT_SECONDS` bounds lock acquisition plus execution. Any migration error terminates the process before readiness.
 
-These defaults are tuned for [`Falconsai/nsfw_image_detection_26`](https://huggingface.co/Falconsai/nsfw_image_detection_26) (`quantized_model.onnx`).
+For replicated deployments, prefer a one-shot `polarizer migrate` init/pre-deployment job and set `POLARIZER_AUTO_MIGRATE=false` on service replicas. The migration-only command needs only `DATABASE_URL`, `DATABASE_MAX_CONNECTIONS`, `POLARIZER_MIGRATION_TIMEOUT_SECONDS`, and optional `LOG_LEVEL`; it does not require runtime TLS, Kafka, Iris, or policy-worker configuration.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `MODEL_PATH` | `./quantized_model.onnx` | Path to the ONNX model file |
-| `MODEL_INPUT_NAME` | `pixel_values` | Input tensor name expected by the model |
-| `MODEL_IMAGE_SIZE` | `224` | Square image dimension the model expects |
-| `MODEL_IMAGE_MEAN` | `0.5,0.5,0.5` | Per-channel normalization mean |
-| `MODEL_IMAGE_STD` | `0.5,0.5,0.5` | Per-channel normalization std |
-| `MODEL_TARGET_LABEL_INDEX` | `0` | Output logit index for the target label |
-| `MODEL_LABELS` | `nsfw,normal` | Comma-separated label names |
-| `MODEL_INTRA_THREADS` | `4` | ONNX Runtime intra-op parallelism |
+## Policy runtimes and features
 
-### Health Endpoints
+Initial runtimes:
 
-| Endpoint | Purpose | Healthy Status |
-|----------|---------|----------------|
-| `GET /healthz` | Liveness probe | `200 OK` always |
-| `GET /readyz` | Readiness probe | `200` when ready, `503` during init |
+- `policy-ir-v1`: typed declarative rule trees used by built-in policy and visual editors.
+- `luau-v1`: isolated advanced scripting for custom control flow.
 
-## Integration Contract
+Registered feature providers include normalized text, deterministic automod matching, restrictions, durable counters, safety assessments, entity labels, local NSFW classification, and OpenAI moderation. The compiler resolves dependencies so providers only run when an applicable rule requests them.
 
-Polarizer communicates purely over Redis Streams using JSON payloads.
-For the complete schema detailing how to enqueue tasks and consume callbacks, see [CONTRACT.md](CONTRACT.md).
+Classifier-style providers live in the `policy::features::checks` catalog. OpenAI moderation is one optional external check beside deterministic automod and local NSFW classification; the policy engine has no OpenAI-specific branch. Every provider implements the same read-only lifecycle (`resolve`, deadline enforcement, health, trace redaction) and publishes typed category, cache, and external-I/O metadata. Adding another local model or external classifier consists of implementing `FeatureProvider` and adding its factory to `checks::configured`; it does not change `main.rs`, policy runtimes, or effect enforcement. Duplicate provider names fail startup instead of silently replacing an existing check.
 
-## Docker
+Each distinct provider invocation is keyed by its configuration, deadline, and maximum data-handling class. This prevents two policies that request the same provider with different controls from sharing a result accidentally. Trace snapshots use provider-owned redaction; normalized message content, credentials, and submitted external-provider inputs are not persisted as trace values.
+
+## Integration status
+
+| Capability | Status |
+|---|---|
+| `GetRestriction` / `UpdateRestriction` with field masks and optimistic versions | Implemented in Polarizer and wired into the bot moderation UI |
+| Held-action lookup/adjudication and automatic expiry | Implemented in Polarizer; bot client exists, reviewer UI wiring is in progress |
+| Durable command claim/complete ledger | Implemented in Polarizer and wired into the bot command consumer |
+| Policy authoring, fixtures, approval, shadow, activation, and rollback APIs | Implemented server-side; broader Winter control-plane UI remains in progress |
+
+## Verification
 
 ```bash
-# Build (requires HuggingFace token since the model repository is gated)
-HF_TOKEN=hf_your_token_here docker build --secret id=hf_token,env=HF_TOKEN -t polarizer .
-
-# Run
-docker run -d \
-  -e REDIS_URI=redis://host.docker.internal:6379 \
-  -p 9090:9090 \
-  polarizer
+cargo fmt --all -- --check
+cargo check --offline
+cargo test --offline --all-targets
 ```
 
-## Project Structure
+## Source layout
 
-```
+```text
 src/
-├── main.rs              # Entrypoint: wiring, shutdown signals
-├── config.rs            # Typed config from env vars
-├── error.rs             # Domain error types (PipelineError)
-├── telemetry.rs         # Tracing / logging initialization
-├── health.rs            # Axum health server (/healthz, /readyz)
-├── redis_stream.rs      # Redis Streams consumer (XREADGROUP)
-└── pipeline/
-    ├── mod.rs           # Pipeline orchestrator
-    ├── download.rs      # Async image downloader with size limits
-    ├── hasher.rs        # Perceptual hashing (DCT-based pHash)
-    └── inference.rs     # ONNX model loading & tensor preprocessing
+├── auth.rs                    # Iris authorization and service allowlists
+├── eventbus.rs                # Kafka inbox, outbox, decisions, commands, callbacks
+├── command.rs                 # durable command claim/complete leases and recovery
+├── grpc/                      # v2 control-plane and moderation API
+├── moderation/                # authoritative resources and transactional mutations
+├── policy/
+│   ├── engine.rs              # dependency planning and evaluation
+│   ├── merge.rs               # scope precedence and effect merge
+│   ├── ir.rs                  # policy-ir-v1 runtime
+│   ├── luau.rs                # isolated luau-v1 runtime client
+│   ├── worker_protocol.rs     # bounded worker protocol
+│   └── features/              # registered read-only providers
+│       └── checks/            # declarative classifier catalog (OpenAI is one check)
+├── bin/polarizer-policy-worker.rs
+└── generated/                 # committed Protobuf output
 ```
 
-## License
+The clean PostgreSQL 18 baseline is [`migrations/20260714000001_trust_safety_v2_baseline.sql`](migrations/20260714000001_trust_safety_v2_baseline.sql).
 
-This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See the [LICENSE](LICENSE) file for details.
+The production Docker image builds and packages both `polarizer` and `polarizer-policy-worker`, sets `POLARIZER_POLICY_WORKER_BIN` to the packaged worker, and runs the service as a non-root user. A deployment is not ready without the worker binary.
+
+The image does not download or bake in a third-party NSFW model. To enable the
+local media check, mount an approved ONNX model read-only and set
+`NSFW_MODEL_PATH` to that container path. Without it, the check is simply not
+registered and policies requiring it follow their declared provider-failure
+behavior.
