@@ -464,6 +464,97 @@ impl ModerationRepository {
         self.get_infraction(id).await
     }
 
+    pub async fn revoke_infractions_by_type(
+        &self,
+        context: &v2::RequestContext,
+        scope: &v2::Scope,
+        subject: &v2::Subject,
+        infraction_type: &str,
+        reason: &str,
+    ) -> anyhow::Result<(Vec<v2::Infraction>, Vec<v2::Restriction>)> {
+        anyhow::ensure!(!reason.trim().is_empty(), "revocation reason is required");
+        let (subject_type, subject_id) = primary_subject(subject, true)?;
+        let scope_type = scope_name(scope.r#type)?;
+        let mut tx = self.db.begin().await?;
+        let infraction_rows = sqlx::query(
+            "UPDATE trust_safety.infraction SET status = 'REVOKED', revoked_by = $2, revoked_reason = $3, \
+             version = version + 1, updated_at = clock_timestamp() \
+             WHERE subject_type = $4 AND subject_id = $5 \
+               AND scope_type = $6::trust_safety.scope_type AND scope_id = $7 \
+               AND infraction_type = $8 AND status = 'ACTIVE' \
+             RETURNING id",
+        )
+        .bind(&context.actor_id)
+        .bind(reason.trim())
+        .bind(subject_type)
+        .bind(subject_id)
+        .bind(scope_type)
+        .bind(&scope.id)
+        .bind(infraction_type)
+        .fetch_all(&mut *tx)
+        .await?;
+        let infraction_ids: Vec<Uuid> = infraction_rows
+            .iter()
+            .map(|r| r.try_get("id"))
+            .collect::<Result<_, _>>()?;
+        let mut revoked_restrictions = Vec::new();
+        for infraction_id in &infraction_ids {
+            insert_audit(
+                &mut tx,
+                context,
+                "REVOKE_INFRACTION",
+                "INFRACTION",
+                *infraction_id,
+            )
+            .await?;
+        }
+        let restriction_rows = sqlx::query(
+            "UPDATE trust_safety.restriction SET status = 'REVOKED', revoked_by = $2, revoked_reason = $3, \
+             version = version + 1, updated_at = clock_timestamp() \
+             WHERE subject_type = $4 AND subject_id = $5 \
+               AND scope_type = $6::trust_safety.scope_type AND scope_id = $7 \
+               AND restriction_type = $8 AND status = 'ACTIVE' \
+               AND id NOT IN (SELECT enforcement_restriction_id FROM trust_safety.infraction \
+                              WHERE enforcement_restriction_id IS NOT NULL \
+                                AND subject_type = $4 AND subject_id = $5 \
+                                AND scope_type = $6::trust_safety.scope_type AND scope_id = $7 \
+                                AND infraction_type = $8 AND status = 'REVOKED') \
+             RETURNING id",
+        )
+        .bind(&context.actor_id)
+        .bind(reason.trim())
+        .bind(subject_type)
+        .bind(subject_id)
+        .bind(scope_type)
+        .bind(&scope.id)
+        .bind(infraction_type)
+        .fetch_all(&mut *tx)
+        .await?;
+        let restriction_ids: Vec<Uuid> = restriction_rows
+            .iter()
+            .map(|r| r.try_get("id"))
+            .collect::<Result<_, _>>()?;
+        for restriction_id in &restriction_ids {
+            insert_audit(
+                &mut tx,
+                context,
+                "REVOKE_RESTRICTION",
+                "RESTRICTION",
+                *restriction_id,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        let mut revoked_infractions = Vec::new();
+        for id in &infraction_ids {
+            revoked_infractions.push(self.get_infraction(*id).await?);
+        }
+        for id in &restriction_ids {
+            revoked_restrictions.push(self.get_restriction(*id).await?);
+        }
+        Ok((revoked_infractions, revoked_restrictions))
+    }
+
     pub async fn list_infractions(
         &self,
         scope: &v2::Scope,
@@ -574,19 +665,38 @@ impl ModerationRepository {
         status: Option<&str>,
         cursor: Option<Uuid>,
         limit: i64,
+        query: Option<&str>,
+        reporter_id: Option<&str>,
+        reported_user_id: Option<&str>,
+        reported_server_id: Option<&str>,
+        report_type: Option<&str>,
     ) -> anyhow::Result<Page<v2::Report>> {
+        let query_pattern = query.map(|q| format!("%{}%", q));
         let rows = sqlx::query(
             "SELECT id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
              description, status::text, context, created_at, resolved_by, resolved_at, version \
              FROM trust_safety.report WHERE ($1::text IS NULL OR scope_type = $1::trust_safety.scope_type) \
                AND ($2::text IS NULL OR scope_id = $2) \
                AND ($3::text IS NULL OR status = $3::trust_safety.resource_status) \
-               AND ($4::uuid IS NULL OR id < $4) ORDER BY id DESC LIMIT $5",
+               AND ($4::uuid IS NULL OR id < $4) \
+               AND ($5::text IS NULL OR (description ILIKE $5 OR reporter_id ILIKE $5 \
+                    OR (context->>'reported_user_id') ILIKE $5 \
+                    OR (context->>'reported_server_id') ILIKE $5)) \
+               AND ($6::text IS NULL OR reporter_id = $6) \
+               AND ($7::text IS NULL OR (context->>'reported_user_id') = $7) \
+               AND ($8::text IS NULL OR (context->>'reported_server_id') = $8) \
+               AND ($9::text IS NULL OR report_type = $9) \
+               ORDER BY id DESC LIMIT $10",
         )
         .bind(scope.map(|scope| scope_name(scope.r#type)).transpose()?)
         .bind(scope.map(|scope| scope.id.as_str()))
         .bind(status)
         .bind(cursor)
+        .bind(query_pattern.as_deref())
+        .bind(reporter_id)
+        .bind(reported_user_id)
+        .bind(reported_server_id)
+        .bind(report_type)
         .bind(limit.clamp(1, 100))
         .fetch_all(&self.db)
         .await?;
@@ -1502,6 +1612,9 @@ async fn insert_audit(
 }
 
 fn restriction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Restriction> {
+    let status: &str = row.try_get("status")?;
+    let expires: Option<DateTime<Utc>> = row.try_get("expires_at")?;
+    let is_active = status == "ACTIVE" && expires.map_or(true, |e| e > Utc::now());
     Ok(v2::Restriction {
         id: row.try_get::<Uuid, _>("id")?.to_string(),
         subject: Some(subject_from_parts(
@@ -1513,18 +1626,20 @@ fn restriction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Restr
             row.try_get("scope_id")?,
         )?),
         r#type: restriction_type_proto(row.try_get("restriction_type")?) as i32,
-        status: status_proto(row.try_get("status")?) as i32,
+        status: status_proto(status) as i32,
         reason: row.try_get("reason")?,
         created_by: row.try_get("created_by")?,
         created_at: Some(timestamp(row.try_get("created_at")?)),
-        expires_at: row
-            .try_get::<Option<DateTime<Utc>>, _>("expires_at")?
-            .map(timestamp),
+        expires_at: expires.map(timestamp),
         version: row.try_get::<i64, _>("version")? as u64,
+        is_active,
     })
 }
 
 fn infraction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Infraction> {
+    let status: &str = row.try_get("status")?;
+    let expires: Option<DateTime<Utc>> = row.try_get("expires_at")?;
+    let is_active = status == "ACTIVE" && expires.map_or(true, |e| e > Utc::now());
     Ok(v2::Infraction {
         id: row.try_get::<Uuid, _>("id")?.to_string(),
         subject: Some(subject_from_parts(
@@ -1536,18 +1651,17 @@ fn infraction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Infrac
             row.try_get("scope_id")?,
         )?),
         r#type: infraction_type_proto(row.try_get("infraction_type")?) as i32,
-        status: status_proto(row.try_get("status")?) as i32,
+        status: status_proto(status) as i32,
         reason: row.try_get("reason")?,
         created_by: row.try_get("created_by")?,
         created_at: Some(timestamp(row.try_get("created_at")?)),
-        expires_at: row
-            .try_get::<Option<DateTime<Utc>>, _>("expires_at")?
-            .map(timestamp),
+        expires_at: expires.map(timestamp),
         version: row.try_get::<i64, _>("version")? as u64,
         enforcement_restriction_id: row
             .try_get::<Option<Uuid>, _>("enforcement_restriction_id")?
             .map(|id| id.to_string())
             .unwrap_or_default(),
+        is_active,
     })
 }
 
@@ -1746,8 +1860,8 @@ fn infraction_type_proto(value: String) -> v2::InfractionType {
     }
 }
 
-fn status_proto(value: String) -> v2::ResourceStatus {
-    match value.as_str() {
+fn status_proto(value: &str) -> v2::ResourceStatus {
+    match value {
         "ACTIVE" => v2::ResourceStatus::Active,
         "REVOKED" => v2::ResourceStatus::Revoked,
         "EXPIRED" => v2::ResourceStatus::Expired,

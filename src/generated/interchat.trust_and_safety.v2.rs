@@ -310,6 +310,8 @@ pub struct Restriction {
     pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(uint64, tag = "10")]
     pub version: u64,
+    #[prost(bool, tag = "11")]
+    pub is_active: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Infraction {
@@ -335,6 +337,8 @@ pub struct Infraction {
     pub version: u64,
     #[prost(string, tag = "11")]
     pub enforcement_restriction_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "12")]
+    pub is_active: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NsfwOverride {
@@ -955,6 +959,25 @@ pub struct PolicyCacheInvalidated {
     pub bundle_version: u64,
     #[prost(message, optional, tag = "4")]
     pub occurred_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportCreated {
+    #[prost(string, tag = "1")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub scope: ::core::option::Option<Scope>,
+    #[prost(message, optional, tag = "3")]
+    pub subject: ::core::option::Option<Subject>,
+    #[prost(string, tag = "4")]
+    pub reporter_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub report_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub description: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "7")]
+    pub context: ::core::option::Option<::prost_types::Struct>,
+    #[prost(message, optional, tag = "8")]
+    pub created_at: ::core::option::Option<::prost_types::Timestamp>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -1844,6 +1867,26 @@ pub struct RevokeInfractionRequest {
     pub expected_version: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RevokeInfractionsByTypeRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(message, optional, tag = "2")]
+    pub scope: ::core::option::Option<Scope>,
+    #[prost(message, optional, tag = "3")]
+    pub subject: ::core::option::Option<Subject>,
+    #[prost(enumeration = "InfractionType", tag = "4")]
+    pub r#type: i32,
+    #[prost(string, tag = "5")]
+    pub reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RevokeInfractionsByTypeResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub revoked_infractions: ::prost::alloc::vec::Vec<Infraction>,
+    #[prost(message, repeated, tag = "2")]
+    pub revoked_restrictions: ::prost::alloc::vec::Vec<Restriction>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListInfractionsRequest {
     #[prost(message, optional, tag = "1")]
     pub context: ::core::option::Option<RequestContext>,
@@ -1904,6 +1947,20 @@ pub struct ListReportsRequest {
     pub status: i32,
     #[prost(message, optional, tag = "4")]
     pub page: ::core::option::Option<CursorPage>,
+    #[prost(string, tag = "5")]
+    pub query: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub reporter_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub reported_user_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub reported_server_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub report_type: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "10")]
+    pub created_after: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "11")]
+    pub created_before: ::core::option::Option<::prost_types::Timestamp>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListReportsResponse {
@@ -3962,6 +4019,13 @@ pub mod trust_and_safety_service_server {
             &self,
             request: tonic::Request<super::RevokeInfractionRequest>,
         ) -> std::result::Result<tonic::Response<super::Infraction>, tonic::Status>;
+        async fn revoke_infractions_by_type(
+            &self,
+            request: tonic::Request<super::RevokeInfractionsByTypeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RevokeInfractionsByTypeResponse>,
+            tonic::Status,
+        >;
         async fn list_infractions(
             &self,
             request: tonic::Request<super::ListInfractionsRequest>,

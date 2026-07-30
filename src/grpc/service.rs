@@ -1675,6 +1675,42 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .await?;
         Ok(Response::new(result))
     }
+    async fn revoke_infractions_by_type(
+        &self,
+        request: Request<v2::RevokeInfractionsByTypeRequest>,
+    ) -> Result<Response<v2::RevokeInfractionsByTypeResponse>, Status> {
+        authenticate_request!(self, request, context, true);
+        let scope = request
+            .scope
+            .ok_or_else(|| Status::invalid_argument("scope is required"))?;
+        let subject = request
+            .subject
+            .ok_or_else(|| Status::invalid_argument("subject is required"))?;
+        self.authorize_scope(
+            context,
+            "RevokeInfractionsByType",
+            &scope,
+            Permission::ModerateHubMessages,
+            Permission::HandleLobbyReports,
+            Permission::Administrator,
+        )
+        .await?;
+        let (revoked_infractions, revoked_restrictions) = self
+            .moderation
+            .revoke_infractions_by_type(
+                context,
+                &scope,
+                &subject,
+                &infraction_type_name(request.r#type)?,
+                &request.reason,
+            )
+            .await
+            .map_err(resource_error)?;
+        Ok(Response::new(v2::RevokeInfractionsByTypeResponse {
+            revoked_infractions,
+            revoked_restrictions,
+        }))
+    }
     async fn list_infractions(
         &self,
         request: Request<v2::ListInfractionsRequest>,
@@ -1831,6 +1867,11 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 resource_status_filter(request.status)?,
                 optional_uuid_cursor(&page.cursor)?,
                 i64::from(page.page_size.max(1)),
+                if request.query.is_empty() { None } else { Some(request.query.as_str()) },
+                if request.reporter_id.is_empty() { None } else { Some(request.reporter_id.as_str()) },
+                if request.reported_user_id.is_empty() { None } else { Some(request.reported_user_id.as_str()) },
+                if request.reported_server_id.is_empty() { None } else { Some(request.reported_server_id.as_str()) },
+                if request.report_type.is_empty() { None } else { Some(request.report_type.as_str()) },
             )
             .await
             .map_err(resource_error)?;
