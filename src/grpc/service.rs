@@ -1867,11 +1867,31 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 resource_status_filter(request.status)?,
                 optional_uuid_cursor(&page.cursor)?,
                 i64::from(page.page_size.max(1)),
-                if request.query.is_empty() { None } else { Some(request.query.as_str()) },
-                if request.reporter_id.is_empty() { None } else { Some(request.reporter_id.as_str()) },
-                if request.reported_user_id.is_empty() { None } else { Some(request.reported_user_id.as_str()) },
-                if request.reported_server_id.is_empty() { None } else { Some(request.reported_server_id.as_str()) },
-                if request.report_type.is_empty() { None } else { Some(request.report_type.as_str()) },
+                if request.query.is_empty() {
+                    None
+                } else {
+                    Some(request.query.as_str())
+                },
+                if request.reporter_id.is_empty() {
+                    None
+                } else {
+                    Some(request.reporter_id.as_str())
+                },
+                if request.reported_user_id.is_empty() {
+                    None
+                } else {
+                    Some(request.reported_user_id.as_str())
+                },
+                if request.reported_server_id.is_empty() {
+                    None
+                } else {
+                    Some(request.reported_server_id.as_str())
+                },
+                if request.report_type.is_empty() {
+                    None
+                } else {
+                    Some(request.report_type.as_str())
+                },
             )
             .await
             .map_err(resource_error)?;
