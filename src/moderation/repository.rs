@@ -659,6 +659,7 @@ impl ModerationRepository {
         Ok(Page { items, next_cursor })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_reports(
         &self,
         scope: Option<&v2::Scope>,
@@ -671,7 +672,7 @@ impl ModerationRepository {
         reported_server_id: Option<&str>,
         report_type: Option<&str>,
     ) -> anyhow::Result<Page<v2::Report>> {
-        let query_pattern = query.map(|q| format!("%{}%", q));
+        let query_pattern = query.map(|q| format!("%{q}%"));
         let rows = sqlx::query(
             "SELECT id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
              description, status::text, context, created_at, resolved_by, resolved_at, version \
@@ -1614,7 +1615,7 @@ async fn insert_audit(
 fn restriction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Restriction> {
     let status: &str = row.try_get("status")?;
     let expires: Option<DateTime<Utc>> = row.try_get("expires_at")?;
-    let is_active = status == "ACTIVE" && expires.map_or(true, |e| e > Utc::now());
+    let is_active = status == "ACTIVE" && expires.is_none_or(|e| e > Utc::now());
     Ok(v2::Restriction {
         id: row.try_get::<Uuid, _>("id")?.to_string(),
         subject: Some(subject_from_parts(
@@ -1639,7 +1640,7 @@ fn restriction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Restr
 fn infraction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Infraction> {
     let status: &str = row.try_get("status")?;
     let expires: Option<DateTime<Utc>> = row.try_get("expires_at")?;
-    let is_active = status == "ACTIVE" && expires.map_or(true, |e| e > Utc::now());
+    let is_active = status == "ACTIVE" && expires.is_none_or(|e| e > Utc::now());
     Ok(v2::Infraction {
         id: row.try_get::<Uuid, _>("id")?.to_string(),
         subject: Some(subject_from_parts(
