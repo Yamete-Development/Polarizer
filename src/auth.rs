@@ -17,6 +17,10 @@ use crate::{
     config::AppConfig,
     contract::{
         authz::v1::{CheckPermissionRequest, auth_z_service_client::AuthZServiceClient},
+        authz::v2::{
+            AuthorizationDecision, AuthorizeStaffOperationRequest, RequestMetadata, StaffOperation,
+            staff_authorization_service_client::StaffAuthorizationServiceClient,
+        },
         v2,
     },
 };
@@ -37,6 +41,7 @@ pub enum Permission {
 #[derive(Clone)]
 pub struct Authorizer {
     iris: AuthZServiceClient<Channel>,
+    staff_iris: StaffAuthorizationServiceClient<Channel>,
     timeout: Duration,
     service_principals: Arc<BTreeMap<String, BTreeSet<String>>>,
     certificate_principals: Arc<BTreeMap<String, String>>,
@@ -73,11 +78,62 @@ impl Authorizer {
             }
         }
         Ok(Self {
-            iris: AuthZServiceClient::new(channel),
+            iris: AuthZServiceClient::new(channel.clone()),
+            staff_iris: StaffAuthorizationServiceClient::new(channel),
             timeout: config.iris_timeout,
             service_principals: Arc::new(config.service_principal_allowlist.clone()),
             certificate_principals: Arc::new(certificate_principals),
         })
+    }
+
+    pub async fn authorize_staff_operation(
+        &self,
+        context: &v2::RequestContext,
+        operation: StaffOperation,
+        target_staff_id: Option<&str>,
+        duration_seconds: Option<u64>,
+        permanent: bool,
+    ) -> Result<AuthorizationDecision, Status> {
+        let actor_type = v2::ActorType::try_from(context.actor_type)
+            .map_err(|_| Status::unauthenticated("invalid actor type"))?;
+        if actor_type != v2::ActorType::Human {
+            return Err(Status::permission_denied(
+                "staff operations require an authenticated human actor",
+            ));
+        }
+        let mut client = self.staff_iris.clone();
+        let response = tokio::time::timeout(
+            self.timeout,
+            client.authorize_staff_operation(tonic::Request::new(AuthorizeStaffOperationRequest {
+                metadata: Some(RequestMetadata {
+                    request_id: context.request_id.clone(),
+                    // Iris authenticates this request with Polarizer's client
+                    // certificate. Preserve the human actor separately, but do
+                    // not forward the caller's service identity as our own.
+                    service_principal: "polarizer".to_string(),
+                    actor_id: context.actor_id.clone(),
+                    idempotency_key: context.idempotency_key.clone(),
+                    trace_id: context.trace_id.clone(),
+                }),
+                user_id: context.actor_id.clone(),
+                operation: operation as i32,
+                target_staff_id: target_staff_id.unwrap_or_default().to_owned(),
+                duration_seconds,
+                permanent,
+            })),
+        )
+        .await
+        .map_err(|_| Status::unavailable("Iris staff authorization timed out"))?
+        .map_err(|status| {
+            if status.code() == Code::PermissionDenied {
+                Status::permission_denied("staff authorization denied")
+            } else {
+                Status::unavailable("Iris staff authorization is unavailable")
+            }
+        })?
+        .into_inner();
+        AuthorizationDecision::try_from(response.decision)
+            .map_err(|_| Status::unavailable("Iris returned an invalid staff decision"))
     }
 
     pub fn authenticate_peer<T>(&self, request: &Request<T>) -> Result<String, Status> {

@@ -6,7 +6,10 @@ use polarizer::{
     command::CommandRepository,
     config::{AppConfig, MigrationConfig},
     db,
-    eventbus::{self, ActionConsumer, DeliveryCallbackConsumer, OutboxRelay},
+    eventbus::{
+        self, ActionConsumer, DeliveryCallbackConsumer, OutboxRelay,
+        StaffAuthorizationChangeConsumer,
+    },
     grpc,
     health::{self, HealthState},
     moderation::ModerationRepository,
@@ -109,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         .run(),
     );
     tasks.spawn(DeliveryCallbackConsumer::new(&config, repository.clone(), cancel.clone())?.run());
+    tasks.spawn(StaffAuthorizationChangeConsumer::new(&config, db.clone(), cancel.clone())?.run());
     tasks.spawn(OutboxRelay::new(db.clone(), &config, cancel.clone())?.run());
     tasks.spawn(eventbus::policy_activation_worker(
         repository.clone(),

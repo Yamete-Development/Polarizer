@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
@@ -15,6 +16,7 @@ use crate::{
         ClaimState, CommandCompletion, CommandOutcome, CommandRepository, CommandRepositoryError,
     },
     contract::{
+        authz::v2::{AuthorizationDecision as StaffDecision, StaffOperation},
         effect_to_proto as contract_fixture_effect_to_proto,
         emitted_effect_to_proto as contract_effect_to_proto,
         scope_to_proto as contract_scope_to_proto, subject_to_proto as contract_subject_to_proto,
@@ -47,6 +49,9 @@ pub struct TrustAndSafetyService {
     moderation: Arc<ModerationRepository>,
     commands: Arc<CommandRepository>,
     nsfw_overrides: Arc<NsfwOverrideRepository>,
+    staff_authorization_mode: crate::config::StaffAuthorizationMode,
+    staff_case_claim_lease_seconds: i64,
+    staff_case_transfer_cooldown_seconds: i64,
 }
 
 macro_rules! authenticate_request {
@@ -68,6 +73,7 @@ impl TrustAndSafetyService {
         authorizer: Arc<Authorizer>,
         moderation: Arc<ModerationRepository>,
         commands: Arc<CommandRepository>,
+        config: &crate::config::AppConfig,
     ) -> Self {
         let nsfw_overrides = Arc::new(NsfwOverrideRepository::new(repository.pool().clone()));
         Self {
@@ -77,6 +83,10 @@ impl TrustAndSafetyService {
             moderation,
             commands,
             nsfw_overrides,
+            staff_authorization_mode: config.staff_authorization_mode,
+            staff_case_claim_lease_seconds: config.staff_case_claim_lease.as_secs() as i64,
+            staff_case_transfer_cooldown_seconds: config.staff_case_transfer_cooldown.as_secs()
+                as i64,
         }
     }
 
@@ -106,6 +116,72 @@ impl TrustAndSafetyService {
             ScopeType::Platform | ScopeType::Product | ScopeType::IncidentOverlay => {
                 self.authorizer
                     .authorize(context, method, None, Some(Permission::Administrator))
+                    .await
+            }
+        }
+    }
+
+    async fn authorize_staff(
+        &self,
+        context: &v2::RequestContext,
+        operation: StaffOperation,
+        legacy_permission: Permission,
+        target_staff_id: Option<&str>,
+        duration_seconds: Option<u64>,
+        permanent: bool,
+    ) -> Result<StaffDecision, Status> {
+        use crate::config::StaffAuthorizationMode;
+        match self.staff_authorization_mode {
+            StaffAuthorizationMode::Legacy => {
+                self.authorizer
+                    .authorize(
+                        context,
+                        "AuthorizeStaffOperation",
+                        None,
+                        Some(legacy_permission),
+                    )
+                    .await?;
+                Ok(StaffDecision::Allow)
+            }
+            StaffAuthorizationMode::Shadow => {
+                self.authorizer
+                    .authorize(
+                        context,
+                        "AuthorizeStaffOperation",
+                        None,
+                        Some(legacy_permission),
+                    )
+                    .await?;
+                match self
+                    .authorizer
+                    .authorize_staff_operation(
+                        context,
+                        operation,
+                        target_staff_id,
+                        duration_seconds,
+                        permanent,
+                    )
+                    .await
+                {
+                    Ok(StaffDecision::Allow) => {}
+                    Ok(decision) => {
+                        warn!(operation=?operation, new_decision=?decision, "staff authorization shadow mismatch")
+                    }
+                    Err(error) => {
+                        warn!(operation=?operation, error=%error, "staff authorization shadow call failed")
+                    }
+                }
+                Ok(StaffDecision::Allow)
+            }
+            StaffAuthorizationMode::Enforce => {
+                self.authorizer
+                    .authorize_staff_operation(
+                        context,
+                        operation,
+                        target_staff_id,
+                        duration_seconds,
+                        permanent,
+                    )
                     .await
             }
         }
@@ -1415,15 +1491,54 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             Permission::ModerateHubMessages
         };
-        self.authorize_scope(
-            context,
-            "CreateRestriction",
-            scope,
-            hub_permission,
-            Permission::HandleLobbyReports,
-            Permission::ManageGlobalBlacklists,
-        )
-        .await?;
+        let staff_operation = if restriction.r#type == v2::RestrictionType::Ban as i32
+            && scope.r#type == v2::ScopeType::Product as i32
+            && scope.product == v2::Product::Lobby as i32
+            && scope.id.is_empty()
+        {
+            Some((
+                StaffOperation::CreateLobbyBan,
+                Permission::HandleLobbyReports,
+            ))
+        } else if restriction.r#type == v2::RestrictionType::Blacklist as i32
+            && scope.r#type == v2::ScopeType::Platform as i32
+        {
+            Some((
+                StaffOperation::CreateGlobalBlacklist,
+                Permission::ManageGlobalBlacklists,
+            ))
+        } else {
+            None
+        };
+        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+            || staff_operation.is_none()
+        {
+            self.authorize_scope(
+                context,
+                "CreateRestriction",
+                scope,
+                hub_permission,
+                Permission::HandleLobbyReports,
+                Permission::ManageGlobalBlacklists,
+            )
+            .await?;
+        }
+        if let Some((operation, legacy)) = staff_operation {
+            let expiry = restriction.expires_at.clone().map(datetime).transpose()?;
+            let duration = expiry.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
+            match self
+                .authorize_staff(context, operation, legacy, None, duration, expiry.is_none())
+                .await?
+            {
+                StaffDecision::Allow => {}
+                StaffDecision::RequireApproval => {
+                    return Err(Status::failed_precondition(
+                        "staff action requires approval",
+                    ));
+                }
+                _ => return Err(Status::permission_denied("staff authorization denied")),
+            }
+        }
         let result = self
             .moderation
             .create_restriction(context, restriction)
@@ -1441,18 +1556,34 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_restriction(parse_uuid(&request.restriction_id, "restriction_id")?)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "GetRestriction",
-            restriction
-                .scope
-                .as_ref()
-                .expect("stored restriction scope"),
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        let scope = restriction
+            .scope
+            .as_ref()
+            .expect("stored restriction scope");
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_scope(
+                context,
+                "GetRestriction",
+                scope,
+                Permission::ViewLogs,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationRecords,
+                Permission::ViewLogs,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
         Ok(Response::new(restriction))
     }
     async fn update_restriction(
@@ -1483,15 +1614,77 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             Permission::ModerateHubMessages
         };
-        self.authorize_scope(
-            context,
-            "UpdateRestriction",
-            scope,
-            hub_permission,
-            Permission::HandleLobbyReports,
-            Permission::ManageGlobalBlacklists,
-        )
-        .await?;
+        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+            || scope.r#type == v2::ScopeType::Hub as i32
+        {
+            self.authorize_scope(
+                context,
+                "UpdateRestriction",
+                scope,
+                hub_permission,
+                Permission::HandleLobbyReports,
+                Permission::ManageGlobalBlacklists,
+            )
+            .await?;
+        }
+        if matches!(
+            v2::ScopeType::try_from(scope.r#type).unwrap_or_default(),
+            v2::ScopeType::Product | v2::ScopeType::Platform
+        ) {
+            let legacy = if scope.r#type == v2::ScopeType::Platform as i32 {
+                Permission::ManageGlobalBlacklists
+            } else {
+                Permission::HandleLobbyReports
+            };
+            let operation = if existing.created_by == context.actor_id {
+                StaffOperation::EditOwnPunishment
+            } else {
+                StaffOperation::EditOthersPunishment
+            };
+            if self
+                .authorize_staff(
+                    context,
+                    operation,
+                    legacy,
+                    Some(&existing.created_by),
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
+            if update_expires_at {
+                let policy_operation = if scope.r#type == v2::ScopeType::Platform as i32 {
+                    StaffOperation::CreateGlobalBlacklist
+                } else {
+                    StaffOperation::CreateLobbyBan
+                };
+                let proposed_expiry = expires_at.flatten();
+                let duration =
+                    proposed_expiry.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
+                match self
+                    .authorize_staff(
+                        context,
+                        policy_operation,
+                        legacy,
+                        None,
+                        duration,
+                        proposed_expiry.is_none(),
+                    )
+                    .await?
+                {
+                    StaffDecision::Allow => {}
+                    StaffDecision::RequireApproval => {
+                        return Err(Status::failed_precondition(
+                            "punishment duration change requires approval",
+                        ));
+                    }
+                    _ => return Err(Status::permission_denied("staff authorization denied")),
+                }
+            }
+        }
         let result = self
             .moderation
             .update_restriction(
@@ -1522,15 +1715,48 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             Permission::ModerateHubMessages
         };
-        self.authorize_scope(
-            context,
-            "RevokeRestriction",
-            scope,
-            hub_permission,
-            Permission::HandleLobbyReports,
-            Permission::ManageGlobalBlacklists,
-        )
-        .await?;
+        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+            || scope.r#type == v2::ScopeType::Hub as i32
+        {
+            self.authorize_scope(
+                context,
+                "RevokeRestriction",
+                scope,
+                hub_permission,
+                Permission::HandleLobbyReports,
+                Permission::ManageGlobalBlacklists,
+            )
+            .await?;
+        }
+        if matches!(
+            v2::ScopeType::try_from(scope.r#type).unwrap_or_default(),
+            v2::ScopeType::Product | v2::ScopeType::Platform
+        ) {
+            let legacy = if scope.r#type == v2::ScopeType::Platform as i32 {
+                Permission::ManageGlobalBlacklists
+            } else {
+                Permission::HandleLobbyReports
+            };
+            let operation = if existing.created_by == context.actor_id {
+                StaffOperation::RemoveOwnPunishment
+            } else {
+                StaffOperation::RemoveOthersPunishment
+            };
+            if self
+                .authorize_staff(
+                    context,
+                    operation,
+                    legacy,
+                    Some(&existing.created_by),
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
+        }
         let result = self
             .moderation
             .revoke_restriction(
@@ -1551,15 +1777,31 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let scope = request
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
-        self.authorize_scope_or_service(
-            context,
-            "ListRestrictions",
-            &scope,
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_scope_or_service(
+                context,
+                "ListRestrictions",
+                &scope,
+                Permission::ViewLogs,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        } else if context.actor_type != v2::ActorType::Service as i32
+            && self
+                .authorize_staff(
+                    context,
+                    StaffOperation::ViewModerationRecords,
+                    Permission::ViewLogs,
+                    None,
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
         let page = request.page.unwrap_or(v2::CursorPage {
             page_size: 50,
             cursor: String::new(),
@@ -1602,15 +1844,62 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             } else {
                 Permission::Administrator
             };
-        self.authorize_scope_or_service(
-            context,
-            "CreateInfraction",
-            scope,
-            Permission::ModerateHubMessages,
-            Permission::HandleLobbyReports,
-            global_permission,
-        )
-        .await?;
+        let expires_at = infraction.expires_at.clone().map(datetime).transpose()?;
+        let duration = expires_at.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
+        let permanent = expires_at.is_none();
+        let staff_operation = if infraction.r#type == v2::InfractionType::Warning as i32
+            && !infraction.source_report_id.is_empty()
+        {
+            Some((StaffOperation::Warn, Permission::HandleLobbyReports))
+        } else if infraction.r#type == v2::InfractionType::Ban as i32
+            && scope.r#type == v2::ScopeType::Product as i32
+            && scope.product == v2::Product::Lobby as i32
+            && scope.id.is_empty()
+        {
+            Some((
+                StaffOperation::CreateLobbyBan,
+                Permission::HandleLobbyReports,
+            ))
+        } else if infraction.r#type == v2::InfractionType::Ban as i32
+            && scope.r#type == v2::ScopeType::Platform as i32
+            && request.enforcement.as_ref().is_some_and(|restriction| {
+                restriction.r#type == v2::RestrictionType::Blacklist as i32
+            })
+        {
+            Some((
+                StaffOperation::CreateGlobalBlacklist,
+                Permission::ManageGlobalBlacklists,
+            ))
+        } else {
+            None
+        };
+        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+            || staff_operation.is_none()
+        {
+            self.authorize_scope_or_service(
+                context,
+                "CreateInfraction",
+                scope,
+                Permission::ModerateHubMessages,
+                Permission::HandleLobbyReports,
+                global_permission,
+            )
+            .await?;
+        }
+        if let Some((operation, legacy)) = staff_operation {
+            match self
+                .authorize_staff(context, operation, legacy, None, duration, permanent)
+                .await?
+            {
+                StaffDecision::Allow => {}
+                StaffDecision::RequireApproval => {
+                    return Err(Status::failed_precondition(
+                        "staff action requires approval",
+                    ));
+                }
+                _ => return Err(Status::permission_denied("staff authorization denied")),
+            }
+        }
         let result = self
             .moderation
             .create_infraction(context, infraction, request.enforcement)
@@ -1630,15 +1919,31 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_infraction(parse_uuid(&request.infraction_id, "infraction_id")?)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "GetInfraction",
-            infraction.scope.as_ref().expect("stored infraction scope"),
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        let scope = infraction.scope.as_ref().expect("stored infraction scope");
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_scope(
+                context,
+                "GetInfraction",
+                scope,
+                Permission::ViewLogs,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationRecords,
+                Permission::ViewLogs,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
         Ok(Response::new(infraction))
     }
     async fn revoke_infraction(
@@ -1652,15 +1957,49 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_infraction(id)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "RevokeInfraction",
-            existing.scope.as_ref().expect("stored infraction scope"),
-            Permission::ModerateHubMessages,
-            Permission::HandleLobbyReports,
-            Permission::Administrator,
-        )
-        .await?;
+        let scope = existing.scope.as_ref().expect("stored infraction scope");
+        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+            || scope.r#type == v2::ScopeType::Hub as i32
+        {
+            self.authorize_scope(
+                context,
+                "RevokeInfraction",
+                scope,
+                Permission::ModerateHubMessages,
+                Permission::HandleLobbyReports,
+                Permission::Administrator,
+            )
+            .await?;
+        }
+        if matches!(
+            v2::ScopeType::try_from(scope.r#type).unwrap_or_default(),
+            v2::ScopeType::Product | v2::ScopeType::Platform
+        ) {
+            let legacy = if scope.r#type == v2::ScopeType::Platform as i32 {
+                Permission::ManageGlobalBlacklists
+            } else {
+                Permission::HandleLobbyReports
+            };
+            let operation = if existing.created_by == context.actor_id {
+                StaffOperation::RemoveOwnPunishment
+            } else {
+                StaffOperation::RemoveOthersPunishment
+            };
+            if self
+                .authorize_staff(
+                    context,
+                    operation,
+                    legacy,
+                    Some(&existing.created_by),
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
+        }
         let result = self
             .moderation
             .revoke_infraction(
@@ -1719,15 +2058,30 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let scope = request
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
-        self.authorize_scope(
-            context,
-            "ListInfractions",
-            &scope,
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_scope(
+                context,
+                "ListInfractions",
+                &scope,
+                Permission::ViewLogs,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationRecords,
+                Permission::ViewLogs,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
         let page = request.page.unwrap_or(v2::CursorPage {
             page_size: 50,
             cursor: String::new(),
@@ -1820,15 +2174,31 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_report(parse_uuid(&request.report_id, "report_id")?)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "GetReport",
-            report.scope.as_ref().expect("stored report scope"),
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        let scope = report.scope.as_ref().expect("stored report scope");
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_scope(
+                context,
+                "GetReport",
+                scope,
+                Permission::ViewLogs,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationCases,
+                Permission::HandleLobbyReports,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
         Ok(Response::new(report))
     }
     async fn list_reports(
@@ -1837,24 +2207,45 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
     ) -> Result<Response<v2::ListReportsResponse>, Status> {
         authenticate_request!(self, request, context, false);
         if let Some(scope) = request.scope.as_ref() {
-            self.authorize_scope(
-                context,
-                "ListReports",
-                scope,
-                Permission::ViewLogs,
-                Permission::HandleLobbyReports,
-                Permission::ViewLogs,
-            )
-            .await?;
-        } else {
-            self.authorizer
-                .authorize(
+            if scope.r#type == v2::ScopeType::Hub as i32 {
+                self.authorize_scope(
                     context,
                     "ListReports",
-                    None,
-                    Some(Permission::Administrator),
+                    scope,
+                    Permission::ViewLogs,
+                    Permission::HandleLobbyReports,
+                    Permission::ViewLogs,
                 )
                 .await?;
+            } else if self
+                .authorize_staff(
+                    context,
+                    StaffOperation::ViewModerationCases,
+                    Permission::HandleLobbyReports,
+                    None,
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
+        } else {
+            if self
+                .authorize_staff(
+                    context,
+                    StaffOperation::ViewModerationCases,
+                    Permission::Administrator,
+                    None,
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
         }
         let page = request.page.unwrap_or(v2::CursorPage {
             page_size: 50,
@@ -1913,15 +2304,41 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_report(id)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "ResolveReport",
-            existing.scope.as_ref().expect("stored report scope"),
-            Permission::ModerateHubMessages,
-            Permission::HandleLobbyReports,
-            Permission::Administrator,
-        )
-        .await?;
+        let scope = existing.scope.as_ref().expect("stored report scope");
+        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+            || scope.r#type == v2::ScopeType::Hub as i32
+        {
+            self.authorize_scope(
+                context,
+                "ResolveReport",
+                scope,
+                Permission::ModerateHubMessages,
+                Permission::HandleLobbyReports,
+                Permission::Administrator,
+            )
+            .await?;
+        }
+        if scope.r#type != v2::ScopeType::Hub as i32 {
+            let operation = if request.resolution == v2::ResourceStatus::Dismissed as i32 {
+                StaffOperation::DismissModerationCase
+            } else {
+                StaffOperation::CloseModerationCase
+            };
+            if self
+                .authorize_staff(
+                    context,
+                    operation,
+                    Permission::HandleLobbyReports,
+                    None,
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
+        }
         let result = self
             .moderation
             .resolve_report(
@@ -2321,6 +2738,438 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 .await
                 .map_err(resource_error)?,
         ))
+    }
+
+    async fn get_staff_action_request(
+        &self,
+        request: Request<v2::GetStaffActionRequestRequest>,
+    ) -> Result<Response<v2::StaffActionRequest>, Status> {
+        authenticate_request!(self, request, context, false);
+        self.authorizer
+            .authorize_user_submission(context, "GetStaffActionRequest")?;
+        let decision = self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationCases,
+                Permission::HandleLobbyReports,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        if decision != StaffDecision::Allow {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        Ok(Response::new(
+            self.moderation
+                .get_staff_action_request(parse_uuid(
+                    &request.action_request_id,
+                    "action_request_id",
+                )?)
+                .await
+                .map_err(not_found_or_internal)?,
+        ))
+    }
+
+    async fn list_staff_action_requests(
+        &self,
+        request: Request<v2::ListStaffActionRequestsRequest>,
+    ) -> Result<Response<v2::ListStaffActionRequestsResponse>, Status> {
+        authenticate_request!(self, request, context, false);
+        self.authorizer
+            .authorize_user_submission(context, "ListStaffActionRequests")?;
+        let decision = self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationCases,
+                Permission::HandleLobbyReports,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        if decision != StaffDecision::Allow {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        let status = v2::StaffActionRequestStatus::try_from(request.status)
+            .unwrap_or(v2::StaffActionRequestStatus::Unspecified);
+        let status = match status {
+            v2::StaffActionRequestStatus::Unspecified => None,
+            other => Some(
+                other
+                    .as_str_name()
+                    .trim_start_matches("STAFF_ACTION_REQUEST_STATUS_"),
+            ),
+        };
+        let requested_by =
+            (!request.requested_by.is_empty()).then_some(request.requested_by.as_str());
+        let items = self
+            .moderation
+            .list_staff_action_requests(status, requested_by, 100)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v2::ListStaffActionRequestsResponse {
+            requests: items,
+            page: Some(v2::CursorPageResult {
+                next_cursor: String::new(),
+            }),
+        }))
+    }
+
+    async fn claim_report(
+        &self,
+        request: Request<v2::ClaimReportRequest>,
+    ) -> Result<Response<v2::Report>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "ClaimReport")?;
+        let mut bypass = false;
+        let decision = self
+            .authorize_staff(
+                context,
+                StaffOperation::ClaimModerationCase,
+                Permission::HandleLobbyReports,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        if decision != StaffDecision::Allow {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        if !request.bypass_reason.trim().is_empty() {
+            bypass = self
+                .authorize_staff(
+                    context,
+                    StaffOperation::BypassClaimCooldown,
+                    Permission::Administrator,
+                    None,
+                    None,
+                    false,
+                )
+                .await?
+                == StaffDecision::Allow;
+        }
+        Ok(Response::new(
+            self.moderation
+                .claim_report(
+                    context,
+                    parse_uuid(&request.report_id, "report_id")?,
+                    request.expected_version as i64,
+                    self.staff_case_claim_lease_seconds,
+                    self.staff_case_transfer_cooldown_seconds,
+                    bypass,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+
+    async fn renew_report_claim(
+        &self,
+        request: Request<v2::RenewReportClaimRequest>,
+    ) -> Result<Response<v2::Report>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "RenewReportClaim")?;
+        for operation in [
+            StaffOperation::ViewModerationCases,
+            StaffOperation::HandleModerationCase,
+        ] {
+            if self
+                .authorize_staff(
+                    context,
+                    operation,
+                    Permission::HandleLobbyReports,
+                    None,
+                    None,
+                    false,
+                )
+                .await?
+                != StaffDecision::Allow
+            {
+                return Err(Status::permission_denied("staff authorization denied"));
+            }
+        }
+        Ok(Response::new(
+            self.moderation
+                .renew_report_claim(
+                    context,
+                    parse_uuid(&request.report_id, "report_id")?,
+                    request.expected_version as i64,
+                    self.staff_case_claim_lease_seconds,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+
+    async fn unclaim_report(
+        &self,
+        request: Request<v2::UnclaimReportRequest>,
+    ) -> Result<Response<v2::Report>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "UnclaimReport")?;
+        if self
+            .authorize_staff(
+                context,
+                StaffOperation::UnclaimModerationCase,
+                Permission::HandleLobbyReports,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        Ok(Response::new(
+            self.moderation
+                .unclaim_report(
+                    context,
+                    parse_uuid(&request.report_id, "report_id")?,
+                    request.expected_version as i64,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+
+    async fn assign_report(
+        &self,
+        request: Request<v2::AssignReportRequest>,
+    ) -> Result<Response<v2::Report>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "AssignReport")?;
+        if self
+            .authorize_staff(
+                context,
+                StaffOperation::AssignModerationCase,
+                Permission::Administrator,
+                Some(&request.assignee_id),
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        Ok(Response::new(
+            self.moderation
+                .transfer_report(
+                    context,
+                    parse_uuid(&request.report_id, "report_id")?,
+                    &request.assignee_id,
+                    request.expected_version as i64,
+                    self.staff_case_claim_lease_seconds,
+                    self.staff_case_transfer_cooldown_seconds,
+                    true,
+                    false,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+
+    async fn transfer_report(
+        &self,
+        request: Request<v2::TransferReportRequest>,
+    ) -> Result<Response<v2::Report>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "TransferReport")?;
+        if request.reason.trim().is_empty() {
+            return Err(Status::invalid_argument("transfer reason is required"));
+        }
+        if self
+            .authorize_staff(
+                context,
+                StaffOperation::TransferModerationCase,
+                Permission::Administrator,
+                Some(&request.assignee_id),
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        let bypass_cooldown = if request.bypass_reason.trim().is_empty() {
+            false
+        } else {
+            self.authorize_staff(
+                context,
+                StaffOperation::BypassClaimCooldown,
+                Permission::Administrator,
+                None,
+                None,
+                false,
+            )
+            .await?
+                == StaffDecision::Allow
+        };
+        Ok(Response::new(
+            self.moderation
+                .transfer_report(
+                    context,
+                    parse_uuid(&request.report_id, "report_id")?,
+                    &request.assignee_id,
+                    request.expected_version as i64,
+                    self.staff_case_claim_lease_seconds,
+                    self.staff_case_transfer_cooldown_seconds,
+                    false,
+                    bypass_cooldown,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+
+    async fn create_staff_action_request(
+        &self,
+        request: Request<v2::CreateStaffActionRequestRequest>,
+    ) -> Result<Response<v2::StaffActionRequest>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "CreateStaffActionRequest")?;
+        let action_type = v2::StaffActionType::try_from(request.action_type)
+            .map_err(|_| Status::invalid_argument("invalid action type"))?;
+        let subject = request
+            .subject
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("subject is required"))?;
+        let scope = request
+            .scope
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("scope is required"))?;
+        let (operation, legacy, name) = match action_type {
+            v2::StaffActionType::LobbyBan => (
+                StaffOperation::CreateLobbyBan,
+                Permission::HandleLobbyReports,
+                "LOBBY_BAN",
+            ),
+            v2::StaffActionType::GlobalBlacklist => (
+                StaffOperation::CreateGlobalBlacklist,
+                Permission::ManageGlobalBlacklists,
+                "GLOBAL_BLACKLIST",
+            ),
+            v2::StaffActionType::Unspecified => {
+                return Err(Status::invalid_argument("action type is required"));
+            }
+        };
+        let expiry = request
+            .requested_expires_at
+            .clone()
+            .map(datetime)
+            .transpose()?;
+        let duration = expiry.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
+        let permanent = expiry.is_none();
+        if self
+            .authorize_staff(context, operation, legacy, None, duration, permanent)
+            .await?
+            != StaffDecision::RequireApproval
+        {
+            return Err(Status::failed_precondition(
+                "this action does not require approval",
+            ));
+        }
+        let (subject_type, subject_id) = if !subject.user_id.is_empty() {
+            ("USER", subject.user_id.as_str())
+        } else if !subject.server_id.is_empty() {
+            ("SERVER", subject.server_id.as_str())
+        } else {
+            return Err(Status::invalid_argument(
+                "user or server subject is required",
+            ));
+        };
+        let report_id = if request.report_id.is_empty() {
+            None
+        } else {
+            Some(parse_uuid(&request.report_id, "report_id")?)
+        };
+        Ok(Response::new(
+            self.moderation
+                .create_staff_action_request(
+                    context,
+                    name,
+                    subject_type,
+                    subject_id,
+                    staff_scope_name(scope.r#type)?,
+                    &scope.id,
+                    report_id,
+                    request.reason.trim(),
+                    expiry,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+
+    async fn resolve_staff_action_request(
+        &self,
+        request: Request<v2::ResolveStaffActionRequestRequest>,
+    ) -> Result<Response<v2::StaffActionRequest>, Status> {
+        authenticate_request!(self, request, context, true);
+        self.authorizer
+            .authorize_user_submission(context, "ResolveStaffActionRequest")?;
+        let existing = self
+            .moderation
+            .get_staff_action_request(parse_uuid(&request.action_request_id, "action_request_id")?)
+            .await
+            .map_err(not_found_or_internal)?;
+        let operation = match v2::StaffActionType::try_from(existing.action_type)
+            .unwrap_or(v2::StaffActionType::Unspecified)
+        {
+            v2::StaffActionType::LobbyBan => StaffOperation::ApproveLobbyBan,
+            v2::StaffActionType::GlobalBlacklist => StaffOperation::ApproveGlobalBlacklist,
+            v2::StaffActionType::Unspecified => {
+                return Err(Status::invalid_argument("invalid stored action type"));
+            }
+        };
+        if self
+            .authorize_staff(
+                context,
+                operation,
+                Permission::Administrator,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        Ok(Response::new(
+            self.moderation
+                .resolve_staff_action_request(
+                    context,
+                    parse_uuid(&request.action_request_id, "action_request_id")?,
+                    request.approve,
+                    request.reason.trim(),
+                    request.expected_version as i64,
+                )
+                .await
+                .map_err(resource_error)?,
+        ))
+    }
+}
+
+fn staff_scope_name(value: i32) -> Result<&'static str, Status> {
+    match v2::ScopeType::try_from(value)
+        .map_err(|_| Status::invalid_argument("invalid scope type"))?
+    {
+        v2::ScopeType::Platform => Ok("PLATFORM"),
+        v2::ScopeType::Product => Ok("PRODUCT"),
+        v2::ScopeType::Hub => Ok("HUB"),
+        v2::ScopeType::Lobby => Ok("LOBBY"),
+        v2::ScopeType::IncidentOverlay => Ok("INCIDENT_OVERLAY"),
+        v2::ScopeType::Unspecified => Err(Status::invalid_argument("scope type is required")),
     }
 }
 

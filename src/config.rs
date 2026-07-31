@@ -15,6 +15,29 @@ pub struct MigrationConfig {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaffAuthorizationMode {
+    Legacy,
+    Shadow,
+    Enforce,
+}
+
+impl std::str::FromStr for StaffAuthorizationMode {
+    type Err = std::io::Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "shadow" => Ok(Self::Shadow),
+            "enforce" => Ok(Self::Enforce),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "STAFF_AUTHORIZATION_MODE must be legacy, shadow, or enforce",
+            )),
+        }
+    }
+}
+
 impl MigrationConfig {
     pub fn from_env() -> Result<Self> {
         let timeout_seconds = parse("POLARIZER_MIGRATION_TIMEOUT_SECONDS", "120")?;
@@ -41,6 +64,7 @@ pub struct AppConfig {
     pub command_topic: String,
     pub command_result_topic: String,
     pub policy_invalidation_topic: String,
+    pub staff_authorization_change_topic: String,
     pub prism_topic: String,
     pub delivery_callback_topic: String,
     pub dlq_topic: String,
@@ -59,6 +83,9 @@ pub struct AppConfig {
     pub iris_tls_cert_path: Option<PathBuf>,
     pub iris_tls_key_path: Option<PathBuf>,
     pub iris_timeout: Duration,
+    pub staff_authorization_mode: StaffAuthorizationMode,
+    pub staff_case_claim_lease: Duration,
+    pub staff_case_transfer_cooldown: Duration,
     pub service_principal_allowlist: BTreeMap<String, BTreeSet<String>>,
     pub service_principal_cert_sha256: BTreeMap<String, BTreeSet<String>>,
     pub encryption_key_id: String,
@@ -143,6 +170,10 @@ impl AppConfig {
                 "KAFKA_POLICY_INVALIDATION_TOPIC",
                 "events.trust-safety.policy.invalidated.v2",
             ),
+            staff_authorization_change_topic: optional(
+                "KAFKA_STAFF_AUTHZ_CHANGE_TOPIC",
+                "events.authz.staff.changed.v1",
+            ),
             prism_topic: optional("KAFKA_PRISM_TOPIC", "prism.stream.jobs"),
             delivery_callback_topic: optional(
                 "KAFKA_PRISM_DELIVERY_TOPIC",
@@ -170,6 +201,15 @@ impl AppConfig {
             iris_tls_cert_path: path("IRIS_TLS_CERT"),
             iris_tls_key_path: path("IRIS_TLS_KEY"),
             iris_timeout: Duration::from_millis(parse("IRIS_TIMEOUT_MS", "2000")?),
+            staff_authorization_mode: parse("STAFF_AUTHORIZATION_MODE", "legacy")?,
+            staff_case_claim_lease: Duration::from_secs(parse(
+                "STAFF_CASE_CLAIM_LEASE_SECONDS",
+                "1800",
+            )?),
+            staff_case_transfer_cooldown: Duration::from_secs(parse(
+                "STAFF_CASE_TRANSFER_COOLDOWN_SECONDS",
+                "300",
+            )?),
             service_principal_allowlist,
             service_principal_cert_sha256,
             encryption_key_id: optional("ACTION_ENCRYPTION_KEY_ID", "local-development"),

@@ -49,6 +49,7 @@ impl ModerationRepository {
         let scope_type = scope_name(scope.r#type)?;
         let restriction_type = restriction_type_name(restriction.r#type)?;
         anyhow::ensure!(!restriction.reason.trim().is_empty(), "reason is required");
+        let source_report_id = optional_uuid(&restriction.source_report_id, "source_report_id")?;
         let id = Uuid::now_v7();
         let mut tx = self.db.begin().await?;
         match claim_idempotency(&mut tx, context, "CREATE_RESTRICTION", id).await? {
@@ -60,8 +61,8 @@ impl ModerationRepository {
         }
         sqlx::query(
             "INSERT INTO trust_safety.restriction \
-             (id, subject_type, subject_id, scope_type, scope_id, restriction_type, reason, created_by, expires_at) \
-             VALUES ($1, $2, $3, $4::trust_safety.scope_type, $5, $6, $7, $8, $9)",
+             (id, subject_type, subject_id, scope_type, scope_id, restriction_type, reason, created_by, expires_at, source_report_id) \
+             VALUES ($1, $2, $3, $4::trust_safety.scope_type, $5, $6, $7, $8, $9, $10)",
         )
         .bind(id)
         .bind(subject_type)
@@ -72,6 +73,7 @@ impl ModerationRepository {
         .bind(restriction.reason.trim())
         .bind(&context.actor_id)
         .bind(restriction.expires_at.map(datetime).transpose()?)
+        .bind(source_report_id)
         .execute(&mut *tx)
         .await?;
         insert_audit(&mut tx, context, "CREATE_RESTRICTION", "RESTRICTION", id).await?;
@@ -179,7 +181,7 @@ impl ModerationRepository {
             .map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
         let rows = sqlx::query(
             "SELECT id, subject_type, subject_id, scope_type::text, scope_id, restriction_type, \
-             status::text, reason, created_by, created_at, expires_at, version \
+             status::text, reason, created_by, created_at, expires_at, version, source_report_id \
              FROM trust_safety.restriction WHERE scope_type = $1::trust_safety.scope_type AND scope_id = $2 \
              AND ($3::text IS NULL OR subject_type = $3) AND ($4::text IS NULL OR subject_id = $4) \
              AND ($5::text IS NULL OR status = $5::trust_safety.resource_status) \
@@ -282,6 +284,7 @@ impl ModerationRepository {
             (None, None) => None,
         };
         let id = Uuid::now_v7();
+        let source_report_id = optional_uuid(&infraction.source_report_id, "source_report_id")?;
         let mut tx = self.db.begin().await?;
         if let IdempotencyClaim::Existing(existing) =
             claim_idempotency(&mut tx, context, "CREATE_INFRACTION", id).await?
@@ -289,11 +292,28 @@ impl ModerationRepository {
             tx.rollback().await?;
             return self.get_infraction(existing).await;
         }
+        if let Some(report_id) = source_report_id {
+            let owns_live_claim = sqlx::query(
+                "SELECT id FROM trust_safety.report
+                 WHERE id=$1 AND status='PENDING'
+                   AND (scope_type='HUB' OR (claimed_by=$2 AND claim_expires_at > clock_timestamp()))
+                 FOR UPDATE",
+            )
+            .bind(report_id)
+            .bind(&context.actor_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            anyhow::ensure!(
+                owns_live_claim,
+                "case-bound action requires a live claim owned by the actor"
+            );
+        }
         if let Some(enforcement) = &enforcement {
             sqlx::query(
                 "INSERT INTO trust_safety.restriction \
-                 (id, subject_type, subject_id, scope_type, scope_id, restriction_type, reason, created_by, expires_at) \
-                 VALUES ($1, $2, $3, $4::trust_safety.scope_type, $5, $6, $7, $8, $9)",
+                 (id, subject_type, subject_id, scope_type, scope_id, restriction_type, reason, created_by, expires_at, source_report_id) \
+                 VALUES ($1, $2, $3, $4::trust_safety.scope_type, $5, $6, $7, $8, $9, $10)",
             )
             .bind(enforcement.id)
             .bind(enforcement.subject_type)
@@ -304,6 +324,7 @@ impl ModerationRepository {
             .bind(&enforcement.reason)
             .bind(&context.actor_id)
             .bind(enforcement.expires_at)
+            .bind(source_report_id)
             .execute(&mut *tx)
             .await?;
             insert_audit(
@@ -317,8 +338,8 @@ impl ModerationRepository {
         }
         sqlx::query(
             "INSERT INTO trust_safety.infraction \
-             (id, subject_type, subject_id, scope_type, scope_id, infraction_type, reason, created_by, expires_at, enforcement_restriction_id) \
-             VALUES ($1, $2, $3, $4::trust_safety.scope_type, $5, $6, $7, $8, $9, $10)",
+             (id, subject_type, subject_id, scope_type, scope_id, infraction_type, reason, created_by, expires_at, enforcement_restriction_id, source_report_id) \
+             VALUES ($1, $2, $3, $4::trust_safety.scope_type, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(id)
         .bind(subject_type)
@@ -330,6 +351,7 @@ impl ModerationRepository {
         .bind(&context.actor_id)
         .bind(expires_at)
         .bind(enforcement.as_ref().map(|item| item.id))
+        .bind(source_report_id)
         .execute(&mut *tx)
         .await?;
         let signal_value = match infraction_type {
@@ -569,7 +591,7 @@ impl ModerationRepository {
             .map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
         let rows = sqlx::query(
             "SELECT id, subject_type, subject_id, scope_type::text, scope_id, infraction_type, \
-             status::text, reason, created_by, created_at, expires_at, version, enforcement_restriction_id \
+             status::text, reason, created_by, created_at, expires_at, version, enforcement_restriction_id, source_report_id \
              FROM trust_safety.infraction WHERE scope_type = $1::trust_safety.scope_type AND scope_id = $2 \
              AND ($3::text IS NULL OR subject_type = $3) AND ($4::text IS NULL OR subject_id = $4) \
              AND ($5::text IS NULL OR status = $5::trust_safety.resource_status) \
@@ -601,7 +623,7 @@ impl ModerationRepository {
     ) -> anyhow::Result<Page<v2::Infraction>> {
         let rows = sqlx::query(
             "SELECT id, subject_type, subject_id, scope_type::text, scope_id, infraction_type, \
-             status::text, reason, created_by, created_at, expires_at, version, enforcement_restriction_id \
+             status::text, reason, created_by, created_at, expires_at, version, enforcement_restriction_id, source_report_id \
              FROM trust_safety.infraction WHERE subject_type = 'USER' AND subject_id = $1 \
              AND ($2::text IS NULL OR status = $2::trust_safety.resource_status) \
              AND ($3::uuid IS NULL OR id < $3) ORDER BY id DESC LIMIT $4",
@@ -675,7 +697,8 @@ impl ModerationRepository {
         let query_pattern = query.map(|q| format!("%{q}%"));
         let rows = sqlx::query(
             "SELECT id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
-             description, status::text, context, created_at, resolved_by, resolved_at, version \
+             description, status::text, context, created_at, resolved_by, resolved_at, version, \
+             claimed_by, claimed_at, claim_expires_at, last_claim_change_at \
              FROM trust_safety.report WHERE ($1::text IS NULL OR scope_type = $1::trust_safety.scope_type) \
                AND ($2::text IS NULL OR scope_id = $2) \
                AND ($3::text IS NULL OR status = $3::trust_safety.resource_status) \
@@ -814,6 +837,7 @@ impl ModerationRepository {
             "UPDATE trust_safety.report SET status = $2::trust_safety.resource_status, resolution = $2, \
              resolved_by = $3, resolved_at = clock_timestamp(), version = version + 1, updated_at = clock_timestamp() \
              WHERE id = $1 AND version = $4 AND status = 'PENDING' \
+               AND (scope_type='HUB' OR (claimed_by = $3 AND claim_expires_at > clock_timestamp())) \
              RETURNING subject_type, subject_id, scope_type::text, scope_id",
         ).bind(id).bind(resolution).bind(&context.actor_id).bind(expected_version).fetch_optional(&mut *tx).await?;
         let updated = updated.ok_or_else(|| anyhow::anyhow!("report version conflict"))?;
@@ -860,10 +884,242 @@ impl ModerationRepository {
     pub async fn get_report(&self, id: Uuid) -> anyhow::Result<v2::Report> {
         let row = sqlx::query(
             "SELECT id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
-             description, status::text, context, created_at, resolved_by, resolved_at, version \
+             description, status::text, context, created_at, resolved_by, resolved_at, version, \
+             claimed_by, claimed_at, claim_expires_at, last_claim_change_at \
              FROM trust_safety.report WHERE id = $1",
         ).bind(id).fetch_one(&self.db).await?;
         report_from_row(&row)
+    }
+
+    pub async fn claim_report(
+        &self,
+        context: &v2::RequestContext,
+        id: Uuid,
+        expected_version: i64,
+        lease_seconds: i64,
+        cooldown_seconds: i64,
+        bypass_cooldown: bool,
+    ) -> anyhow::Result<v2::Report> {
+        let mut tx = self.db.begin().await?;
+        let updated = sqlx::query("UPDATE trust_safety.report SET claimed_by=$2,claimed_at=clock_timestamp(),claim_expires_at=clock_timestamp()+make_interval(secs=>$3::double precision),last_claim_change_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1 WHERE id=$1 AND version=$4 AND status='PENDING' AND (claimed_by IS NULL OR claim_expires_at<=clock_timestamp()) AND ($5 OR last_claim_change_at IS NULL OR claim_expires_at<=clock_timestamp() OR last_claim_change_at<=clock_timestamp()-make_interval(secs=>$6::double precision)) RETURNING id")
+            .bind(id).bind(&context.actor_id).bind(lease_seconds).bind(expected_version).bind(bypass_cooldown).bind(cooldown_seconds).fetch_optional(&mut *tx).await?;
+        anyhow::ensure!(updated.is_some(), "report claim conflict");
+        insert_audit(&mut tx, context, "CLAIM_REPORT", "REPORT", id).await?;
+        tx.commit().await?;
+        self.get_report(id).await
+    }
+
+    pub async fn renew_report_claim(
+        &self,
+        context: &v2::RequestContext,
+        id: Uuid,
+        expected_version: i64,
+        lease_seconds: i64,
+    ) -> anyhow::Result<v2::Report> {
+        let mut tx = self.db.begin().await?;
+        let updated=sqlx::query("UPDATE trust_safety.report SET claim_expires_at=clock_timestamp()+make_interval(secs=>$3::double precision),updated_at=clock_timestamp(),version=version+1 WHERE id=$1 AND version=$2 AND claimed_by=$4 AND claim_expires_at>clock_timestamp() AND updated_at<=clock_timestamp()-interval '5 minutes' RETURNING id")
+            .bind(id).bind(expected_version).bind(lease_seconds).bind(&context.actor_id).fetch_optional(&mut *tx).await?;
+        anyhow::ensure!(
+            updated.is_some(),
+            "report renewal conflict or renewal is too frequent"
+        );
+        insert_audit(&mut tx, context, "RENEW_REPORT_CLAIM", "REPORT", id).await?;
+        tx.commit().await?;
+        self.get_report(id).await
+    }
+
+    pub async fn unclaim_report(
+        &self,
+        context: &v2::RequestContext,
+        id: Uuid,
+        expected_version: i64,
+    ) -> anyhow::Result<v2::Report> {
+        let mut tx = self.db.begin().await?;
+        let updated=sqlx::query("UPDATE trust_safety.report SET claimed_by=NULL,claimed_at=NULL,claim_expires_at=NULL,last_claim_change_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1 WHERE id=$1 AND version=$2 AND claimed_by=$3 AND claim_expires_at>clock_timestamp() RETURNING id").bind(id).bind(expected_version).bind(&context.actor_id).fetch_optional(&mut *tx).await?;
+        anyhow::ensure!(
+            updated.is_some(),
+            "report claim ownership or version conflict"
+        );
+        sqlx::query("UPDATE trust_safety.staff_action_request SET status='CANCELLED',decided_by=$2,decision_reason='case unclaimed',decided_at=clock_timestamp(),version=version+1 WHERE report_id=$1 AND status='PENDING'").bind(id).bind(&context.actor_id).execute(&mut *tx).await?;
+        insert_audit(&mut tx, context, "UNCLAIM_REPORT", "REPORT", id).await?;
+        tx.commit().await?;
+        self.get_report(id).await
+    }
+
+    pub async fn transfer_report(
+        &self,
+        context: &v2::RequestContext,
+        id: Uuid,
+        assignee: &str,
+        expected_version: i64,
+        lease_seconds: i64,
+        cooldown_seconds: i64,
+        require_unclaimed: bool,
+        bypass_cooldown: bool,
+    ) -> anyhow::Result<v2::Report> {
+        let mut tx = self.db.begin().await?;
+        let updated=sqlx::query("UPDATE trust_safety.report SET claimed_by=$2,claimed_at=clock_timestamp(),claim_expires_at=clock_timestamp()+make_interval(secs=>$3::double precision),last_claim_change_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1 WHERE id=$1 AND version=$4 AND status='PENDING' AND (NOT $5 OR claimed_by IS NULL OR claim_expires_at<=clock_timestamp()) AND ($6 OR last_claim_change_at IS NULL OR last_claim_change_at<=clock_timestamp()-make_interval(secs=>$7::double precision)) RETURNING id").bind(id).bind(assignee).bind(lease_seconds).bind(expected_version).bind(require_unclaimed).bind(bypass_cooldown).bind(cooldown_seconds).fetch_optional(&mut *tx).await?;
+        anyhow::ensure!(updated.is_some(), "report assignment or version conflict");
+        sqlx::query("UPDATE trust_safety.staff_action_request SET status='CANCELLED',decided_by=$2,decision_reason='case ownership changed',decided_at=clock_timestamp(),version=version+1 WHERE report_id=$1 AND status='PENDING' AND requested_by<>$3").bind(id).bind(&context.actor_id).bind(assignee).execute(&mut *tx).await?;
+        insert_audit(
+            &mut tx,
+            context,
+            if require_unclaimed {
+                "ASSIGN_REPORT"
+            } else {
+                "TRANSFER_REPORT"
+            },
+            "REPORT",
+            id,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_report(id).await
+    }
+
+    pub async fn get_staff_action_request(
+        &self,
+        id: Uuid,
+    ) -> anyhow::Result<v2::StaffActionRequest> {
+        let row=sqlx::query("SELECT id,action_type,subject_type,subject_id,scope_type::text,scope_id,report_id,requested_reason,requested_expires_at,requested_by,requested_at,status,decided_by,decision_reason,decided_at,executed_infraction_id,executed_restriction_id,expires_at,version FROM trust_safety.staff_action_request WHERE id=$1").bind(id).fetch_one(&self.db).await?;
+        staff_action_request_from_row(&row)
+    }
+    pub async fn list_staff_action_requests(
+        &self,
+        status: Option<&str>,
+        requested_by: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<v2::StaffActionRequest>> {
+        let rows=sqlx::query("SELECT id,action_type,subject_type,subject_id,scope_type::text,scope_id,report_id,requested_reason,requested_expires_at,requested_by,requested_at,status,decided_by,decision_reason,decided_at,executed_infraction_id,executed_restriction_id,expires_at,version FROM trust_safety.staff_action_request WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR requested_by=$2) ORDER BY requested_at DESC LIMIT $3").bind(status).bind(requested_by).bind(limit).fetch_all(&self.db).await?;
+        rows.iter().map(staff_action_request_from_row).collect()
+    }
+    pub async fn create_staff_action_request(
+        &self,
+        context: &v2::RequestContext,
+        action_type: &str,
+        subject_type: &str,
+        subject_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        report_id: Option<Uuid>,
+        reason: &str,
+        requested_expires_at: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<v2::StaffActionRequest> {
+        let id = Uuid::now_v7();
+        let mut tx = self.db.begin().await?;
+        if let IdempotencyClaim::Existing(existing) =
+            claim_idempotency(&mut tx, context, "CREATE_STAFF_ACTION_REQUEST", id).await?
+        {
+            tx.rollback().await?;
+            return self.get_staff_action_request(existing).await;
+        }
+        if let Some(report_id) = report_id {
+            let live_owner = sqlx::query(
+                "SELECT id FROM trust_safety.report
+                 WHERE id=$1 AND status='PENDING' AND claimed_by=$2
+                   AND claim_expires_at>clock_timestamp() FOR UPDATE",
+            )
+            .bind(report_id)
+            .bind(&context.actor_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            anyhow::ensure!(live_owner, "action request requires a live report claim");
+        }
+        sqlx::query("INSERT INTO trust_safety.staff_action_request(id,action_type,subject_type,subject_id,scope_type,scope_id,report_id,requested_reason,requested_expires_at,requested_by) VALUES($1,$2,$3,$4,$5::trust_safety.scope_type,$6,$7,$8,$9,$10)").bind(id).bind(action_type).bind(subject_type).bind(subject_id).bind(scope_type).bind(scope_id).bind(report_id).bind(reason).bind(requested_expires_at).bind(&context.actor_id).execute(&mut *tx).await?;
+        insert_audit(
+            &mut tx,
+            context,
+            "CREATE_STAFF_ACTION_REQUEST",
+            "STAFF_ACTION_REQUEST",
+            id,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_staff_action_request(id).await
+    }
+    pub async fn resolve_staff_action_request(
+        &self,
+        context: &v2::RequestContext,
+        id: Uuid,
+        approve: bool,
+        reason: &str,
+        expected_version: i64,
+    ) -> anyhow::Result<v2::StaffActionRequest> {
+        let mut tx = self.db.begin().await?;
+        let row=sqlx::query("SELECT requested_by,expires_at,action_type,subject_type,subject_id,scope_type::text,scope_id,report_id,requested_reason,requested_expires_at FROM trust_safety.staff_action_request WHERE id=$1 AND status='PENDING' AND version=$2 FOR UPDATE").bind(id).bind(expected_version).fetch_optional(&mut *tx).await?.ok_or_else(||anyhow::anyhow!("action request version conflict or no longer pending"))?;
+        let requester: String = row.try_get("requested_by")?;
+        let expires: DateTime<Utc> = row.try_get("expires_at")?;
+        anyhow::ensure!(
+            requester != context.actor_id,
+            "requester cannot approve their own action"
+        );
+        anyhow::ensure!(expires > Utc::now(), "action request expired");
+        let report_id: Option<Uuid> = row.try_get("report_id")?;
+        if let Some(report_id) = report_id {
+            let live_owner = sqlx::query(
+                "SELECT id FROM trust_safety.report WHERE id=$1 AND status='PENDING'
+                 AND claimed_by=$2 AND claim_expires_at>clock_timestamp() FOR UPDATE",
+            )
+            .bind(report_id)
+            .bind(&requester)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+            anyhow::ensure!(live_owner, "requester no longer owns a live report claim");
+        }
+        let mut executed_infraction_id = None;
+        let mut executed_restriction_id = None;
+        if approve {
+            let action_type: &str = row.try_get("action_type")?;
+            let subject_type: &str = row.try_get("subject_type")?;
+            let subject_id: &str = row.try_get("subject_id")?;
+            let scope_type: &str = row.try_get("scope_type")?;
+            let scope_id: &str = row.try_get("scope_id")?;
+            let requested_reason: &str = row.try_get("requested_reason")?;
+            let requested_expires_at: Option<DateTime<Utc>> =
+                row.try_get("requested_expires_at")?;
+            let restriction_id = Uuid::now_v7();
+            sqlx::query("INSERT INTO trust_safety.restriction(id,subject_type,subject_id,scope_type,scope_id,restriction_type,reason,created_by,expires_at,source_report_id) VALUES($1,$2,$3,$4::trust_safety.scope_type,$5,$6,$7,$8,$9,$10)")
+                .bind(restriction_id).bind(subject_type).bind(subject_id).bind(scope_type).bind(scope_id)
+                .bind(if action_type=="GLOBAL_BLACKLIST"{"BLACKLIST"}else{"BAN"}).bind(requested_reason).bind(&requester).bind(requested_expires_at).bind(report_id).execute(&mut *tx).await?;
+            let infraction_id = Uuid::now_v7();
+            sqlx::query("INSERT INTO trust_safety.infraction(id,subject_type,subject_id,scope_type,scope_id,infraction_type,reason,created_by,expires_at,enforcement_restriction_id,source_report_id) VALUES($1,$2,$3,$4::trust_safety.scope_type,$5,'BAN',$6,$7,$8,$9,$10)")
+                .bind(infraction_id).bind(subject_type).bind(subject_id).bind(scope_type).bind(scope_id).bind(requested_reason).bind(&requester).bind(requested_expires_at).bind(restriction_id).bind(report_id).execute(&mut *tx).await?;
+            insert_audit(
+                &mut tx,
+                context,
+                "CREATE_APPROVED_ENFORCEMENT_RESTRICTION",
+                "RESTRICTION",
+                restriction_id,
+            )
+            .await?;
+            insert_audit(
+                &mut tx,
+                context,
+                "CREATE_APPROVED_INFRACTION",
+                "INFRACTION",
+                infraction_id,
+            )
+            .await?;
+            executed_infraction_id = Some(infraction_id);
+            executed_restriction_id = Some(restriction_id);
+        }
+        sqlx::query("UPDATE trust_safety.staff_action_request SET status=$2,decided_by=$3,decision_reason=$4,decided_at=clock_timestamp(),executed_infraction_id=$5,executed_restriction_id=$6,version=version+1 WHERE id=$1").bind(id).bind(if approve{"EXECUTED"}else{"REJECTED"}).bind(&context.actor_id).bind(reason).bind(executed_infraction_id).bind(executed_restriction_id).execute(&mut *tx).await?;
+        insert_audit(
+            &mut tx,
+            context,
+            if approve {
+                "APPROVE_STAFF_ACTION_REQUEST"
+            } else {
+                "REJECT_STAFF_ACTION_REQUEST"
+            },
+            "STAFF_ACTION_REQUEST",
+            id,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_staff_action_request(id).await
     }
 
     pub async fn list_appeals(
@@ -1392,7 +1648,7 @@ impl ModerationRepository {
     pub async fn get_restriction(&self, id: Uuid) -> anyhow::Result<v2::Restriction> {
         let row = sqlx::query(
             "SELECT id, subject_type, subject_id, scope_type::text, scope_id, restriction_type, \
-             status::text, reason, created_by, created_at, expires_at, version \
+             status::text, reason, created_by, created_at, expires_at, version, source_report_id \
              FROM trust_safety.restriction WHERE id = $1",
         )
         .bind(id)
@@ -1404,7 +1660,7 @@ impl ModerationRepository {
     pub async fn get_infraction(&self, id: Uuid) -> anyhow::Result<v2::Infraction> {
         let row = sqlx::query(
             "SELECT id, subject_type, subject_id, scope_type::text, scope_id, infraction_type, \
-             status::text, reason, created_by, created_at, expires_at, version, enforcement_restriction_id \
+             status::text, reason, created_by, created_at, expires_at, version, enforcement_restriction_id, source_report_id \
              FROM trust_safety.infraction WHERE id = $1",
         )
         .bind(id)
@@ -1634,6 +1890,11 @@ fn restriction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Restr
         expires_at: expires.map(timestamp),
         version: row.try_get::<i64, _>("version")? as u64,
         is_active,
+        source_report_id: row
+            .try_get::<Option<Uuid>, _>("source_report_id")
+            .unwrap_or_default()
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
     })
 }
 
@@ -1663,6 +1924,11 @@ fn infraction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Infrac
             .map(|id| id.to_string())
             .unwrap_or_default(),
         is_active,
+        source_report_id: row
+            .try_get::<Option<Uuid>, _>("source_report_id")
+            .unwrap_or_default()
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
     })
 }
 
@@ -1689,6 +1955,91 @@ fn report_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Report> {
         resolved_at: row
             .try_get::<Option<DateTime<Utc>>, _>("resolved_at")?
             .map(timestamp),
+        version: row.try_get::<i64, _>("version")? as u64,
+        claimed_by: row
+            .try_get::<Option<String>, _>("claimed_by")
+            .unwrap_or_default()
+            .unwrap_or_default(),
+        claimed_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("claimed_at")
+            .unwrap_or_default()
+            .map(timestamp),
+        claim_expires_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("claim_expires_at")
+            .unwrap_or_default()
+            .map(timestamp),
+        last_claim_change_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("last_claim_change_at")
+            .unwrap_or_default()
+            .map(timestamp),
+    })
+}
+
+fn optional_uuid(value: &str, field: &str) -> anyhow::Result<Option<Uuid>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        Uuid::parse_str(value).map_err(|_| anyhow::anyhow!("{field} must be a UUID"))?,
+    ))
+}
+
+fn staff_action_request_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> anyhow::Result<v2::StaffActionRequest> {
+    let action_type: &str = row.try_get("action_type")?;
+    let status: &str = row.try_get("status")?;
+    Ok(v2::StaffActionRequest {
+        id: row.try_get::<Uuid, _>("id")?.to_string(),
+        action_type: match action_type {
+            "LOBBY_BAN" => v2::StaffActionType::LobbyBan,
+            "GLOBAL_BLACKLIST" => v2::StaffActionType::GlobalBlacklist,
+            _ => v2::StaffActionType::Unspecified,
+        } as i32,
+        subject: Some(subject_from_parts(
+            row.try_get("subject_type")?,
+            row.try_get("subject_id")?,
+        )),
+        scope: Some(scope_from_parts(
+            row.try_get("scope_type")?,
+            row.try_get("scope_id")?,
+        )?),
+        report_id: row
+            .try_get::<Option<Uuid>, _>("report_id")?
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        requested_reason: row.try_get("requested_reason")?,
+        requested_expires_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("requested_expires_at")?
+            .map(timestamp),
+        requested_by: row.try_get("requested_by")?,
+        requested_at: Some(timestamp(row.try_get("requested_at")?)),
+        status: match status {
+            "PENDING" => v2::StaffActionRequestStatus::Pending,
+            "REJECTED" => v2::StaffActionRequestStatus::Rejected,
+            "EXPIRED" => v2::StaffActionRequestStatus::Expired,
+            "EXECUTED" => v2::StaffActionRequestStatus::Executed,
+            "CANCELLED" => v2::StaffActionRequestStatus::Cancelled,
+            _ => v2::StaffActionRequestStatus::Unspecified,
+        } as i32,
+        decided_by: row
+            .try_get::<Option<String>, _>("decided_by")?
+            .unwrap_or_default(),
+        decision_reason: row
+            .try_get::<Option<String>, _>("decision_reason")?
+            .unwrap_or_default(),
+        decided_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("decided_at")?
+            .map(timestamp),
+        executed_infraction_id: row
+            .try_get::<Option<Uuid>, _>("executed_infraction_id")?
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        executed_restriction_id: row
+            .try_get::<Option<Uuid>, _>("executed_restriction_id")?
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+        expires_at: Some(timestamp(row.try_get("expires_at")?)),
         version: row.try_get::<i64, _>("version")? as u64,
     })
 }
