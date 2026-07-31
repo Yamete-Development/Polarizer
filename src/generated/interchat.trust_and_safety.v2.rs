@@ -1947,6 +1947,20 @@ pub struct ListRestrictionsRequest {
     pub status: i32,
     #[prost(message, optional, tag = "5")]
     pub page: ::core::option::Option<CursorPage>,
+    #[prost(enumeration = "RestrictionType", tag = "6")]
+    pub restriction_type: i32,
+    #[prost(string, tag = "7")]
+    pub subject_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub subject_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub created_by: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub query: ::prost::alloc::string::String,
+    #[prost(bool, tag = "11")]
+    pub include_total_count: bool,
+    #[prost(string, tag = "12")]
+    pub sort: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListRestrictionsResponse {
@@ -1954,6 +1968,8 @@ pub struct ListRestrictionsResponse {
     pub restrictions: ::prost::alloc::vec::Vec<Restriction>,
     #[prost(message, optional, tag = "2")]
     pub page: ::core::option::Option<CursorPageResult>,
+    #[prost(uint64, tag = "3")]
+    pub total_count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateInfractionRequest {

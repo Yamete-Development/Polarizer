@@ -1812,8 +1812,15 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 &scope,
                 request.subject.as_ref(),
                 resource_status_filter(request.status)?,
-                optional_uuid_cursor(&page.cursor)?,
+                restriction_type_filter(request.restriction_type)?,
+                optional_string_filter(&request.subject_type),
+                optional_string_filter(&request.subject_id),
+                optional_string_filter(&request.created_by),
+                optional_string_filter(&request.query),
+                &request.sort,
+                &page.cursor,
                 i64::from(page.page_size.max(1)),
+                request.include_total_count,
             )
             .await
             .map_err(resource_error)?;
@@ -1822,6 +1829,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             page: Some(v2::CursorPageResult {
                 next_cursor: result.next_cursor,
             }),
+            total_count: result.total_count,
         }))
     }
     async fn create_infraction(
@@ -4487,6 +4495,23 @@ fn optional_uuid_cursor(value: &str) -> Result<Option<Uuid>, Status> {
         parse_uuid(value, "cursor").map(Some)
     }
 }
+
+fn optional_string_filter(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn restriction_type_filter(value: i32) -> Result<Option<&'static str>, Status> {
+    Ok(match v2::RestrictionType::try_from(value)
+        .map_err(|_| Status::invalid_argument("invalid restriction type"))?
+    {
+        v2::RestrictionType::Mute => Some("MUTE"),
+        v2::RestrictionType::Ban => Some("BAN"),
+        v2::RestrictionType::Blacklist => Some("BLACKLIST"),
+        v2::RestrictionType::ContentQuarantine => Some("CONTENT_QUARANTINE"),
+        v2::RestrictionType::Unspecified => None,
+    })
+}
+
 fn resource_status_filter(value: i32) -> Result<Option<&'static str>, Status> {
     Ok(
         match v2::ResourceStatus::try_from(value)

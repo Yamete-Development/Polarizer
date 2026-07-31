@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{contract::v2, policy::model::ExecutionTrace};
@@ -9,6 +10,20 @@ use crate::{contract::v2, policy::model::ExecutionTrace};
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: String,
+}
+
+pub struct RestrictionPage {
+    pub items: Vec<v2::Restriction>,
+    pub next_cursor: String,
+    pub total_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RestrictionCursor {
+    sort: String,
+    created_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+    id: Uuid,
 }
 
 struct EnforcementInsert {
@@ -172,36 +187,93 @@ impl ModerationRepository {
         scope: &v2::Scope,
         subject: Option<&v2::Subject>,
         status: Option<&str>,
-        cursor: Option<Uuid>,
+        restriction_type: Option<&str>,
+        requested_subject_type: Option<&str>,
+        requested_subject_id: Option<&str>,
+        created_by: Option<&str>,
+        query: Option<&str>,
+        sort: &str,
+        cursor: &str,
         limit: i64,
-    ) -> anyhow::Result<Page<v2::Restriction>> {
+        include_total_count: bool,
+    ) -> anyhow::Result<RestrictionPage> {
         let (subject_type, subject_id) = subject
             .map(|subject| primary_subject(subject, false))
             .transpose()?
             .map_or((None, None), |(kind, id)| (Some(kind), Some(id)));
-        let rows = sqlx::query(
+        let page_size = limit.clamp(1, 100);
+        let scope_name = scope_name(scope.r#type)?;
+        let sort = normalize_restriction_sort(sort)?;
+        let parsed_cursor = parse_restriction_cursor(cursor, sort)?;
+        let requested_subject_type = requested_subject_type.or(subject_type);
+        let requested_subject_id = requested_subject_id.or(subject_id);
+        let query_pattern = query.map(like_pattern);
+
+        let total_count = if include_total_count {
+            let mut count_query = QueryBuilder::<Postgres>::new(
+                "SELECT COUNT(*) FROM trust_safety.restriction",
+            );
+            push_restriction_filters(
+                &mut count_query,
+                scope_name,
+                &scope.id,
+                status,
+                restriction_type,
+                requested_subject_type,
+                requested_subject_id,
+                created_by,
+                query_pattern.as_deref(),
+            );
+            count_query
+                .build_query_scalar::<i64>()
+                .fetch_one(&self.db)
+                .await? as u64
+        } else {
+            0
+        };
+
+        let mut rows_query = QueryBuilder::<Postgres>::new(
             "SELECT id, subject_type, subject_id, scope_type::text, scope_id, restriction_type, \
              status::text, reason, created_by, created_at, expires_at, version, source_report_id \
-             FROM trust_safety.restriction WHERE scope_type = $1::trust_safety.scope_type AND scope_id = $2 \
-             AND ($3::text IS NULL OR subject_type = $3) AND ($4::text IS NULL OR subject_id = $4) \
-             AND ($5::text IS NULL OR status = $5::trust_safety.resource_status) \
-             AND ($6::uuid IS NULL OR id < $6) ORDER BY id DESC LIMIT $7",
-        )
-        .bind(scope_name(scope.r#type)?)
-        .bind(&scope.id)
-        .bind(subject_type)
-        .bind(subject_id)
-        .bind(status)
-        .bind(cursor)
-        .bind(limit.clamp(1, 100))
-        .fetch_all(&self.db)
-        .await?;
-        let next_cursor = page_cursor(&rows, limit, "id")?;
+             FROM trust_safety.restriction",
+        );
+        push_restriction_filters(
+            &mut rows_query,
+            scope_name,
+            &scope.id,
+            status,
+            restriction_type,
+            requested_subject_type,
+            requested_subject_id,
+            created_by,
+            query_pattern.as_deref(),
+        );
+        push_restriction_cursor(&mut rows_query, sort, parsed_cursor.as_ref());
+        let fetch_size = (page_size + 1).min(100);
+        rows_query
+            .push(" ORDER BY ")
+            .push(restriction_sort_sql(sort))
+            .push(" LIMIT ")
+            .push_bind(fetch_size);
+        let mut rows = rows_query.build().fetch_all(&self.db).await?;
+        let has_more = rows.len() > page_size as usize;
+        if has_more {
+            rows.truncate(page_size as usize);
+        }
+        let next_cursor = if has_more {
+            restriction_page_cursor(&rows, sort)?
+        } else {
+            String::new()
+        };
         let items = rows
             .iter()
             .map(restriction_from_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Page { items, next_cursor })
+        Ok(RestrictionPage {
+            items,
+            next_cursor,
+            total_count,
+        })
     }
 
     pub async fn create_infraction(
@@ -2245,6 +2317,159 @@ fn timestamp(value: DateTime<Utc>) -> prost_types::Timestamp {
     }
 }
 
+fn push_restriction_filters<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    scope_type: &'args str,
+    scope_id: &'args str,
+    status: Option<&'args str>,
+    restriction_type: Option<&'args str>,
+    subject_type: Option<&'args str>,
+    subject_id: Option<&'args str>,
+    created_by: Option<&'args str>,
+    search: Option<&'args str>,
+) {
+    query
+        .push(" WHERE scope_type = ")
+        .push_bind(scope_type)
+        .push("::trust_safety.scope_type AND scope_id = ")
+        .push_bind(scope_id);
+    if let Some(subject_type) = subject_type {
+        query.push(" AND subject_type = ").push_bind(subject_type);
+    }
+    if let Some(subject_id) = subject_id {
+        query.push(" AND subject_id = ").push_bind(subject_id);
+    }
+    if let Some(status) = status {
+        query
+            .push(" AND status = ")
+            .push_bind(status)
+            .push("::trust_safety.resource_status");
+    }
+    if let Some(restriction_type) = restriction_type {
+        query.push(" AND restriction_type = ").push_bind(restriction_type);
+    }
+    if let Some(created_by) = created_by {
+        query.push(" AND created_by = ").push_bind(created_by);
+    }
+    if let Some(search) = search {
+        query
+            .push(" AND (subject_id ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!' OR reason ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!' OR created_by ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!')");
+    }
+}
+
+fn like_pattern(value: &str) -> String {
+    format!(
+        "%{}%",
+        value.replace('!', "!!").replace('%', "!%").replace('_', "!_")
+    )
+}
+
+fn normalize_restriction_sort(value: &str) -> anyhow::Result<&'static str> {
+    match value {
+        "" => Ok("id_desc"),
+        "created_at_desc" => Ok("created_at_desc"),
+        "created_at_asc" => Ok("created_at_asc"),
+        "expires_at_asc" => Ok("expires_at_asc"),
+        _ => anyhow::bail!("unsupported restriction sort: {value}"),
+    }
+}
+
+fn restriction_sort_sql(sort: &str) -> &'static str {
+    match sort {
+        "id_desc" => "id DESC",
+        "created_at_asc" => "created_at ASC, id ASC",
+        "expires_at_asc" => "(expires_at IS NULL) ASC, expires_at ASC NULLS LAST, id ASC",
+        _ => "created_at DESC, id DESC",
+    }
+}
+
+fn parse_restriction_cursor(value: &str, sort: &str) -> anyhow::Result<Option<RestrictionCursor>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if sort == "id_desc" {
+        return Ok(Some(RestrictionCursor {
+            sort: sort.to_owned(),
+            created_at: None,
+            expires_at: None,
+            id: Uuid::parse_str(value)?,
+        }));
+    }
+    let cursor: RestrictionCursor = serde_json::from_str(value)?;
+    anyhow::ensure!(cursor.sort == sort, "restriction cursor sort does not match request");
+    Ok(Some(cursor))
+}
+
+fn push_restriction_cursor(
+    query: &mut QueryBuilder<'_, Postgres>,
+    sort: &str,
+    cursor: Option<&RestrictionCursor>,
+) {
+    let Some(cursor) = cursor else {
+        return;
+    };
+    match sort {
+        "created_at_desc" => {
+            query
+                .push(" AND (created_at, id) < (")
+                .push_bind(cursor.created_at.clone())
+                .push(", ")
+                .push_bind(cursor.id)
+                .push(")");
+        }
+        "created_at_asc" => {
+            query
+                .push(" AND (created_at, id) > (")
+                .push_bind(cursor.created_at.clone())
+                .push(", ")
+                .push_bind(cursor.id)
+                .push(")");
+        }
+        "expires_at_asc" => {
+            if let Some(expires_at) = cursor.expires_at {
+                query
+                    .push(" AND ((expires_at IS NOT NULL AND (expires_at, id) > (")
+                    .push_bind(expires_at)
+                    .push(", ")
+                    .push_bind(cursor.id)
+                    .push(")) OR expires_at IS NULL)");
+            } else {
+                query
+                    .push(" AND expires_at IS NULL AND id > ")
+                    .push_bind(cursor.id);
+            }
+        }
+        _ => {
+            query.push(" AND id < ").push_bind(cursor.id);
+        }
+    }
+}
+
+fn restriction_page_cursor(
+    rows: &[sqlx::postgres::PgRow],
+    sort: &str,
+) -> anyhow::Result<String> {
+    let Some(row) = rows.last() else {
+        return Ok(String::new());
+    };
+    let id = row.try_get::<Uuid, _>("id")?;
+    if sort == "id_desc" {
+        return Ok(id.to_string());
+    }
+    Ok(serde_json::to_string(&RestrictionCursor {
+        sort: sort.to_owned(),
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        id,
+    })?)
+}
+
 fn page_cursor(
     rows: &[sqlx::postgres::PgRow],
     requested_limit: i64,
@@ -2263,7 +2488,9 @@ fn page_cursor(
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_safety_score;
+    use super::{
+        calculate_safety_score, like_pattern, normalize_restriction_sort, parse_restriction_cursor,
+    };
 
     #[test]
     fn safety_score_aggregates_repeated_signals_and_mitigation() {
@@ -2290,5 +2517,24 @@ mod tests {
 
         assert_eq!((high, high_tier), (100.0, "HIGH_RISK"));
         assert_eq!((low, low_tier), (0.0, "SAFE"));
+    }
+
+    #[test]
+    fn restriction_listing_accepts_only_supported_sorts() {
+        assert_eq!(normalize_restriction_sort("").unwrap(), "id_desc");
+        assert_eq!(normalize_restriction_sort("created_at_desc").unwrap(), "created_at_desc");
+        assert!(normalize_restriction_sort("random").is_err());
+    }
+
+    #[test]
+    fn legacy_id_cursor_is_still_accepted_for_unfiltered_callers() {
+        let id = uuid::Uuid::now_v7();
+        let cursor = parse_restriction_cursor(&id.to_string(), "id_desc").unwrap();
+        assert_eq!(cursor.expect("cursor").id, id);
+    }
+
+    #[test]
+    fn restriction_search_treats_like_metacharacters_literally() {
+        assert_eq!(like_pattern("100%_done!"), "%100!%!_done!!%");
     }
 }
