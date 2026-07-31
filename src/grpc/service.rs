@@ -4501,15 +4501,17 @@ fn optional_string_filter(value: &str) -> Option<&str> {
 }
 
 fn restriction_type_filter(value: i32) -> Result<Option<&'static str>, Status> {
-    Ok(match v2::RestrictionType::try_from(value)
-        .map_err(|_| Status::invalid_argument("invalid restriction type"))?
-    {
-        v2::RestrictionType::Mute => Some("MUTE"),
-        v2::RestrictionType::Ban => Some("BAN"),
-        v2::RestrictionType::Blacklist => Some("BLACKLIST"),
-        v2::RestrictionType::ContentQuarantine => Some("CONTENT_QUARANTINE"),
-        v2::RestrictionType::Unspecified => None,
-    })
+    Ok(
+        match v2::RestrictionType::try_from(value)
+            .map_err(|_| Status::invalid_argument("invalid restriction type"))?
+        {
+            v2::RestrictionType::Mute => Some("MUTE"),
+            v2::RestrictionType::Ban => Some("BAN"),
+            v2::RestrictionType::Blacklist => Some("BLACKLIST"),
+            v2::RestrictionType::ContentQuarantine => Some("CONTENT_QUARANTINE"),
+            v2::RestrictionType::Unspecified => None,
+        },
+    )
 }
 
 fn resource_status_filter(value: i32) -> Result<Option<&'static str>, Status> {

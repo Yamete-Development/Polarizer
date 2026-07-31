@@ -210,9 +210,8 @@ impl ModerationRepository {
         let query_pattern = query.map(like_pattern);
 
         let total_count = if include_total_count {
-            let mut count_query = QueryBuilder::<Postgres>::new(
-                "SELECT COUNT(*) FROM trust_safety.restriction",
-            );
+            let mut count_query =
+                QueryBuilder::<Postgres>::new("SELECT COUNT(*) FROM trust_safety.restriction");
             push_restriction_filters(
                 &mut count_query,
                 scope_name,
@@ -2346,7 +2345,9 @@ fn push_restriction_filters<'args>(
             .push("::trust_safety.resource_status");
     }
     if let Some(restriction_type) = restriction_type {
-        query.push(" AND restriction_type = ").push_bind(restriction_type);
+        query
+            .push(" AND restriction_type = ")
+            .push_bind(restriction_type);
     }
     if let Some(created_by) = created_by {
         query.push(" AND created_by = ").push_bind(created_by);
@@ -2366,7 +2367,10 @@ fn push_restriction_filters<'args>(
 fn like_pattern(value: &str) -> String {
     format!(
         "%{}%",
-        value.replace('!', "!!").replace('%', "!%").replace('_', "!_")
+        value
+            .replace('!', "!!")
+            .replace('%', "!%")
+            .replace('_', "!_")
     )
 }
 
@@ -2402,7 +2406,10 @@ fn parse_restriction_cursor(value: &str, sort: &str) -> anyhow::Result<Option<Re
         }));
     }
     let cursor: RestrictionCursor = serde_json::from_str(value)?;
-    anyhow::ensure!(cursor.sort == sort, "restriction cursor sort does not match request");
+    anyhow::ensure!(
+        cursor.sort == sort,
+        "restriction cursor sort does not match request"
+    );
     Ok(Some(cursor))
 }
 
@@ -2451,10 +2458,7 @@ fn push_restriction_cursor(
     }
 }
 
-fn restriction_page_cursor(
-    rows: &[sqlx::postgres::PgRow],
-    sort: &str,
-) -> anyhow::Result<String> {
+fn restriction_page_cursor(rows: &[sqlx::postgres::PgRow], sort: &str) -> anyhow::Result<String> {
     let Some(row) = rows.last() else {
         return Ok(String::new());
     };
@@ -2522,7 +2526,10 @@ mod tests {
     #[test]
     fn restriction_listing_accepts_only_supported_sorts() {
         assert_eq!(normalize_restriction_sort("").unwrap(), "id_desc");
-        assert_eq!(normalize_restriction_sort("created_at_desc").unwrap(), "created_at_desc");
+        assert_eq!(
+            normalize_restriction_sort("created_at_desc").unwrap(),
+            "created_at_desc"
+        );
         assert!(normalize_restriction_sort("random").is_err());
     }
 
