@@ -368,11 +368,14 @@ impl ModerationRepository {
             let owns_live_claim = sqlx::query(
                 "SELECT id FROM trust_safety.report
                  WHERE id=$1 AND status='PENDING'
+                   AND scope_type=$3::trust_safety.scope_type AND scope_id=$4
                    AND (scope_type='HUB' OR (claimed_by=$2 AND claim_expires_at > clock_timestamp()))
                  FOR UPDATE",
             )
             .bind(report_id)
             .bind(&context.actor_id)
+            .bind(scope_type)
+            .bind(&scope.id)
             .fetch_optional(&mut *tx)
             .await?
             .is_some();

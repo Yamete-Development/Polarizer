@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -241,6 +241,83 @@ impl TrustAndSafetyService {
             )
             .await
         }
+    }
+
+    async fn authorize_non_hub_staff_scope(
+        &self,
+        context: &v2::RequestContext,
+        scope: &v2::Scope,
+        operation: StaffOperation,
+        lobby_legacy_permission: Permission,
+        global_legacy_permission: Permission,
+    ) -> Result<(), Status> {
+        let legacy_permission = match v2::ScopeType::try_from(scope.r#type)
+            .map_err(|_| Status::invalid_argument("invalid scope type"))?
+        {
+            v2::ScopeType::Lobby => lobby_legacy_permission,
+            v2::ScopeType::Platform | v2::ScopeType::Product | v2::ScopeType::IncidentOverlay => {
+                global_legacy_permission
+            }
+            v2::ScopeType::Hub => {
+                return Err(Status::internal("hub scope must use hub authorization"));
+            }
+            v2::ScopeType::Unspecified => {
+                return Err(Status::invalid_argument("scope is required"));
+            }
+        };
+        if self
+            .authorize_staff(context, operation, legacy_permission, None, None, false)
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        Ok(())
+    }
+
+    async fn authorize_hub_or_staff(
+        &self,
+        context: &v2::RequestContext,
+        method: &str,
+        scope: &v2::Scope,
+        hub_permission: Permission,
+        staff_operation: StaffOperation,
+        legacy_staff_permission: Permission,
+        target_staff_id: Option<&str>,
+    ) -> Result<(), Status> {
+        if scope.r#type != v2::ScopeType::Hub as i32 {
+            return Err(Status::internal(
+                "hub-or-staff authorization requires hub scope",
+            ));
+        }
+        if v2::ActorType::try_from(context.actor_type).unwrap_or_default() == v2::ActorType::Service
+        {
+            return self.authorizer.authorize(context, method, None, None).await;
+        }
+        match self
+            .authorizer
+            .authorize(context, method, Some(&scope.id), Some(hub_permission))
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(status) if status.code() == Code::PermissionDenied => {}
+            Err(status) => return Err(status),
+        }
+        if self
+            .authorize_staff(
+                context,
+                staff_operation,
+                legacy_staff_permission,
+                target_staff_id,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        Ok(())
     }
 
     async fn evaluate_safety_assessment_update(
@@ -1561,13 +1638,14 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .as_ref()
             .expect("stored restriction scope");
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            self.authorize_scope(
+            self.authorize_hub_or_staff(
                 context,
                 "GetRestriction",
                 scope,
                 Permission::ViewLogs,
-                Permission::HandleLobbyReports,
+                StaffOperation::ViewModerationRecords,
                 Permission::ViewLogs,
+                None,
             )
             .await?;
         } else if self
@@ -1614,9 +1692,23 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             Permission::ModerateHubMessages
         };
-        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
-            || scope.r#type == v2::ScopeType::Hub as i32
-        {
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            let operation = if existing.created_by == context.actor_id {
+                StaffOperation::EditOwnPunishment
+            } else {
+                StaffOperation::EditOthersPunishment
+            };
+            self.authorize_hub_or_staff(
+                context,
+                "UpdateRestriction",
+                scope,
+                hub_permission,
+                operation,
+                Permission::HandleLobbyReports,
+                Some(&existing.created_by),
+            )
+            .await?;
+        } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
             self.authorize_scope(
                 context,
                 "UpdateRestriction",
@@ -1715,9 +1807,23 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             Permission::ModerateHubMessages
         };
-        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
-            || scope.r#type == v2::ScopeType::Hub as i32
-        {
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            let operation = if existing.created_by == context.actor_id {
+                StaffOperation::RemoveOwnPunishment
+            } else {
+                StaffOperation::RemoveOthersPunishment
+            };
+            self.authorize_hub_or_staff(
+                context,
+                "RevokeRestriction",
+                scope,
+                hub_permission,
+                operation,
+                Permission::HandleLobbyReports,
+                Some(&existing.created_by),
+            )
+            .await?;
+        } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
             self.authorize_scope(
                 context,
                 "RevokeRestriction",
@@ -1778,13 +1884,14 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            self.authorize_scope_or_service(
+            self.authorize_hub_or_staff(
                 context,
                 "ListRestrictions",
                 &scope,
                 Permission::ViewLogs,
-                Permission::HandleLobbyReports,
+                StaffOperation::ViewModerationRecords,
                 Permission::ViewLogs,
+                None,
             )
             .await?;
         } else if context.actor_type != v2::ActorType::Service as i32
@@ -1859,6 +1966,13 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             && !infraction.source_report_id.is_empty()
         {
             Some((StaffOperation::Warn, Permission::HandleLobbyReports))
+        } else if scope.r#type == v2::ScopeType::Hub as i32
+            && !infraction.source_report_id.is_empty()
+        {
+            Some((
+                StaffOperation::HandleModerationCase,
+                Permission::HandleLobbyReports,
+            ))
         } else if infraction.r#type == v2::InfractionType::Ban as i32
             && scope.r#type == v2::ScopeType::Product as i32
             && scope.product == v2::Product::Lobby as i32
@@ -1881,7 +1995,19 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             None
         };
-        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
+        if scope.r#type == v2::ScopeType::Hub as i32 && staff_operation.is_some() {
+            let (operation, legacy) = staff_operation.expect("checked above");
+            self.authorize_hub_or_staff(
+                context,
+                "CreateInfraction",
+                scope,
+                Permission::ModerateHubMessages,
+                operation,
+                legacy,
+                None,
+            )
+            .await?;
+        } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
             || staff_operation.is_none()
         {
             self.authorize_scope_or_service(
@@ -1894,7 +2020,9 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             )
             .await?;
         }
-        if let Some((operation, legacy)) = staff_operation {
+        if scope.r#type != v2::ScopeType::Hub as i32
+            && let Some((operation, legacy)) = staff_operation
+        {
             match self
                 .authorize_staff(context, operation, legacy, None, duration, permanent)
                 .await?
@@ -1929,13 +2057,14 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .map_err(not_found_or_internal)?;
         let scope = infraction.scope.as_ref().expect("stored infraction scope");
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            self.authorize_scope(
+            self.authorize_hub_or_staff(
                 context,
                 "GetInfraction",
                 scope,
                 Permission::ViewLogs,
-                Permission::HandleLobbyReports,
+                StaffOperation::ViewModerationRecords,
                 Permission::ViewLogs,
+                None,
             )
             .await?;
         } else if self
@@ -1966,9 +2095,23 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .await
             .map_err(not_found_or_internal)?;
         let scope = existing.scope.as_ref().expect("stored infraction scope");
-        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
-            || scope.r#type == v2::ScopeType::Hub as i32
-        {
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            let operation = if existing.created_by == context.actor_id {
+                StaffOperation::RemoveOwnPunishment
+            } else {
+                StaffOperation::RemoveOthersPunishment
+            };
+            self.authorize_hub_or_staff(
+                context,
+                "RevokeInfraction",
+                scope,
+                Permission::ModerateHubMessages,
+                operation,
+                Permission::HandleLobbyReports,
+                Some(&existing.created_by),
+            )
+            .await?;
+        } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
             self.authorize_scope(
                 context,
                 "RevokeInfraction",
@@ -2067,13 +2210,14 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            self.authorize_scope(
+            self.authorize_hub_or_staff(
                 context,
                 "ListInfractions",
                 &scope,
                 Permission::ViewLogs,
-                Permission::HandleLobbyReports,
+                StaffOperation::ViewModerationRecords,
                 Permission::ViewLogs,
+                None,
             )
             .await?;
         } else if self
@@ -2184,13 +2328,14 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .map_err(not_found_or_internal)?;
         let scope = report.scope.as_ref().expect("stored report scope");
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            self.authorize_scope(
+            self.authorize_hub_or_staff(
                 context,
                 "GetReport",
                 scope,
                 Permission::ViewLogs,
+                StaffOperation::ViewModerationCases,
                 Permission::HandleLobbyReports,
-                Permission::ViewLogs,
+                None,
             )
             .await?;
         } else if self
@@ -2216,13 +2361,14 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         authenticate_request!(self, request, context, false);
         if let Some(scope) = request.scope.as_ref() {
             if scope.r#type == v2::ScopeType::Hub as i32 {
-                self.authorize_scope(
+                self.authorize_hub_or_staff(
                     context,
                     "ListReports",
                     scope,
                     Permission::ViewLogs,
+                    StaffOperation::ViewModerationCases,
                     Permission::HandleLobbyReports,
-                    Permission::ViewLogs,
+                    None,
                 )
                 .await?;
             } else if self
@@ -2311,9 +2457,23 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .await
             .map_err(not_found_or_internal)?;
         let scope = existing.scope.as_ref().expect("stored report scope");
-        if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce
-            || scope.r#type == v2::ScopeType::Hub as i32
-        {
+        let operation = if request.resolution == v2::ResourceStatus::Dismissed as i32 {
+            StaffOperation::DismissModerationCase
+        } else {
+            StaffOperation::CloseModerationCase
+        };
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "ResolveReport",
+                scope,
+                Permission::ModerateHubMessages,
+                operation,
+                Permission::HandleLobbyReports,
+                None,
+            )
+            .await?;
+        } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
             self.authorize_scope(
                 context,
                 "ResolveReport",
@@ -2325,11 +2485,6 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .await?;
         }
         if scope.r#type != v2::ScopeType::Hub as i32 {
-            let operation = if request.resolution == v2::ResourceStatus::Dismissed as i32 {
-                StaffOperation::DismissModerationCase
-            } else {
-                StaffOperation::CloseModerationCase
-            };
             if self
                 .authorize_staff(
                     context,
@@ -2397,15 +2552,27 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .appeal_scope(id)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "GetAppeal",
-            &scope,
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "GetAppeal",
+                &scope,
+                Permission::ViewLogs,
+                StaffOperation::HandleAppeal,
+                Permission::HandleLobbyReports,
+                None,
+            )
+            .await?;
+        } else {
+            self.authorize_non_hub_staff_scope(
+                context,
+                &scope,
+                StaffOperation::HandleAppeal,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        }
         Ok(Response::new(appeal))
     }
     async fn list_appeals(
@@ -2416,15 +2583,27 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let scope = request
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
-        self.authorize_scope(
-            context,
-            "ListAppeals",
-            &scope,
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "ListAppeals",
+                &scope,
+                Permission::ViewLogs,
+                StaffOperation::HandleAppeal,
+                Permission::HandleLobbyReports,
+                None,
+            )
+            .await?;
+        } else {
+            self.authorize_non_hub_staff_scope(
+                context,
+                &scope,
+                StaffOperation::HandleAppeal,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        }
         let page = request.page.unwrap_or(v2::CursorPage {
             page_size: 50,
             cursor: String::new(),
@@ -2457,15 +2636,27 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .appeal_scope(id)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "ResolveAppeal",
-            &scope,
-            Permission::ModerateHubMessages,
-            Permission::HandleLobbyReports,
-            Permission::Administrator,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "ResolveAppeal",
+                &scope,
+                Permission::ModerateHubMessages,
+                StaffOperation::HandleAppeal,
+                Permission::HandleLobbyReports,
+                None,
+            )
+            .await?;
+        } else {
+            self.authorize_non_hub_staff_scope(
+                context,
+                &scope,
+                StaffOperation::HandleAppeal,
+                Permission::HandleLobbyReports,
+                Permission::Administrator,
+            )
+            .await?;
+        }
         let result = self
             .moderation
             .resolve_appeal(
@@ -2496,15 +2687,27 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let scope = request
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
-        self.authorize_scope(
-            context,
-            "ListReviewItems",
-            &scope,
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "ListReviewItems",
+                &scope,
+                Permission::ViewLogs,
+                StaffOperation::ViewHeldActions,
+                Permission::HandleLobbyReports,
+                None,
+            )
+            .await?;
+        } else {
+            self.authorize_non_hub_staff_scope(
+                context,
+                &scope,
+                StaffOperation::ViewHeldActions,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        }
         let page = request.page.unwrap_or(v2::CursorPage {
             page_size: 50,
             cursor: String::new(),
@@ -2586,15 +2789,28 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_held_action(action_id)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_scope(
-            context,
-            "AdjudicateHeldAction",
-            &contract_scope_to_proto(&existing.scope),
-            Permission::ModerateHubMessages,
-            Permission::HandleLobbyReports,
-            Permission::Administrator,
-        )
-        .await?;
+        let scope = contract_scope_to_proto(&existing.scope);
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "AdjudicateHeldAction",
+                &scope,
+                Permission::ModerateHubMessages,
+                StaffOperation::AdjudicateHeldAction,
+                Permission::HandleLobbyReports,
+                None,
+            )
+            .await?;
+        } else {
+            self.authorize_non_hub_staff_scope(
+                context,
+                &scope,
+                StaffOperation::AdjudicateHeldAction,
+                Permission::HandleLobbyReports,
+                Permission::Administrator,
+            )
+            .await?;
+        }
         let resolution = match v2::HeldActionResolution::try_from(request.resolution)
             .map_err(|_| Status::invalid_argument("invalid held action resolution"))?
         {
@@ -2628,15 +2844,27 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let scope = request
             .scope
             .ok_or_else(|| Status::invalid_argument("scope is required"))?;
-        self.authorize_scope(
-            context,
-            "GetSafetyAssessment",
-            &scope,
-            Permission::ViewLogs,
-            Permission::HandleLobbyReports,
-            Permission::ViewLogs,
-        )
-        .await?;
+        if scope.r#type == v2::ScopeType::Hub as i32 {
+            self.authorize_hub_or_staff(
+                context,
+                "GetSafetyAssessment",
+                &scope,
+                Permission::ViewLogs,
+                StaffOperation::ViewModerationRecords,
+                Permission::ViewLogs,
+                None,
+            )
+            .await?;
+        } else {
+            self.authorize_non_hub_staff_scope(
+                context,
+                &scope,
+                StaffOperation::ViewModerationRecords,
+                Permission::HandleLobbyReports,
+                Permission::ViewLogs,
+            )
+            .await?;
+        }
         let subject = request
             .subject
             .ok_or_else(|| Status::invalid_argument("subject is required"))?;
@@ -2756,7 +2984,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let decision = self
             .authorize_staff(
                 context,
-                StaffOperation::ViewModerationCases,
+                StaffOperation::ViewHeldActions,
                 Permission::HandleLobbyReports,
                 None,
                 None,
@@ -2787,7 +3015,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         let decision = self
             .authorize_staff(
                 context,
-                StaffOperation::ViewModerationCases,
+                StaffOperation::ViewHeldActions,
                 Permission::HandleLobbyReports,
                 None,
                 None,
@@ -3133,6 +3361,20 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 return Err(Status::invalid_argument("invalid stored action type"));
             }
         };
+        if self
+            .authorize_staff(
+                context,
+                StaffOperation::AdjudicateHeldAction,
+                Permission::Administrator,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
         if self
             .authorize_staff(
                 context,
