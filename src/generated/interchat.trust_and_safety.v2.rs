@@ -401,6 +401,60 @@ pub struct Report {
     pub claim_expires_at: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(message, optional, tag = "16")]
     pub last_claim_change_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "17")]
+    pub evidence_snapshot: ::core::option::Option<ReportEvidenceSnapshot>,
+}
+/// Immutable evidence range pinned to a report. Transcript entries are kept
+/// outside Report.context so reports are not constrained by Struct/JSON limits.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ReportEvidenceSnapshot {
+    #[prost(string, tag = "1")]
+    pub lobby_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub first_sequence: u64,
+    #[prost(uint64, tag = "3")]
+    pub last_sequence: u64,
+    #[prost(uint64, tag = "4")]
+    pub entry_count: u64,
+    #[prost(string, tag = "5")]
+    pub terminal_action_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TranscriptEntry {
+    #[prost(uint64, tag = "1")]
+    pub sequence: u64,
+    #[prost(string, tag = "2")]
+    pub action_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "TranscriptEntryKind", tag = "3")]
+    pub kind: i32,
+    #[prost(message, optional, tag = "4")]
+    pub occurred_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, tag = "5")]
+    pub message_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub author_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub author_display_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub author_username: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub original_content: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub approved_content: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub delivery_content: ::prost::alloc::string::String,
+    #[prost(string, tag = "12")]
+    pub reply_to_message_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "13")]
+    pub reply_author_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "14")]
+    pub reply_author_display_name: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub reply_content: ::prost::alloc::string::String,
+    #[prost(enumeration = "LobbySystemEventType", tag = "16")]
+    pub system_event_type: i32,
+    #[prost(string, tag = "17")]
+    pub system_event_reason: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StaffActionRequest {
@@ -887,6 +941,73 @@ impl NsfwOverrideClassification {
             "NSFW_OVERRIDE_CLASSIFICATION_UNSPECIFIED" => Some(Self::Unspecified),
             "NSFW_OVERRIDE_CLASSIFICATION_SAFE" => Some(Self::Safe),
             "NSFW_OVERRIDE_CLASSIFICATION_UNSAFE" => Some(Self::Unsafe),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TranscriptEntryKind {
+    Unspecified = 0,
+    UserMessage = 1,
+    SystemEvent = 2,
+}
+impl TranscriptEntryKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TRANSCRIPT_ENTRY_KIND_UNSPECIFIED",
+            Self::UserMessage => "TRANSCRIPT_ENTRY_KIND_USER_MESSAGE",
+            Self::SystemEvent => "TRANSCRIPT_ENTRY_KIND_SYSTEM_EVENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TRANSCRIPT_ENTRY_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "TRANSCRIPT_ENTRY_KIND_USER_MESSAGE" => Some(Self::UserMessage),
+            "TRANSCRIPT_ENTRY_KIND_SYSTEM_EVENT" => Some(Self::SystemEvent),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LobbySystemEventType {
+    Unspecified = 0,
+    CallConnected = 1,
+    ParticipantJoined = 2,
+    ParticipantLeft = 3,
+    ReportSubmitted = 4,
+    CallEnded = 5,
+}
+impl LobbySystemEventType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOBBY_SYSTEM_EVENT_TYPE_UNSPECIFIED",
+            Self::CallConnected => "LOBBY_SYSTEM_EVENT_TYPE_CALL_CONNECTED",
+            Self::ParticipantJoined => "LOBBY_SYSTEM_EVENT_TYPE_PARTICIPANT_JOINED",
+            Self::ParticipantLeft => "LOBBY_SYSTEM_EVENT_TYPE_PARTICIPANT_LEFT",
+            Self::ReportSubmitted => "LOBBY_SYSTEM_EVENT_TYPE_REPORT_SUBMITTED",
+            Self::CallEnded => "LOBBY_SYSTEM_EVENT_TYPE_CALL_ENDED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOBBY_SYSTEM_EVENT_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOBBY_SYSTEM_EVENT_TYPE_CALL_CONNECTED" => Some(Self::CallConnected),
+            "LOBBY_SYSTEM_EVENT_TYPE_PARTICIPANT_JOINED" => Some(Self::ParticipantJoined),
+            "LOBBY_SYSTEM_EVENT_TYPE_PARTICIPANT_LEFT" => Some(Self::ParticipantLeft),
+            "LOBBY_SYSTEM_EVENT_TYPE_REPORT_SUBMITTED" => Some(Self::ReportSubmitted),
+            "LOBBY_SYSTEM_EVENT_TYPE_CALL_ENDED" => Some(Self::CallEnded),
             _ => None,
         }
     }
@@ -2068,6 +2189,9 @@ pub struct CreateReportRequest {
     pub description: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "6")]
     pub report_context: ::core::option::Option<::prost_types::Struct>,
+    /// For Lobby reports, pins all durable call evidence through this action.
+    #[prost(string, tag = "7")]
+    pub terminal_action_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetReportRequest {
@@ -2107,6 +2231,26 @@ pub struct ListReportsResponse {
     pub reports: ::prost::alloc::vec::Vec<Report>,
     #[prost(message, optional, tag = "2")]
     pub page: ::core::option::Option<CursorPageResult>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListReportTranscriptRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub page: ::core::option::Option<CursorPage>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListReportTranscriptResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: ::prost::alloc::vec::Vec<TranscriptEntry>,
+    #[prost(message, optional, tag = "2")]
+    pub page: ::core::option::Option<CursorPageResult>,
+    #[prost(uint64, tag = "3")]
+    pub total_count: u64,
+    #[prost(message, optional, tag = "4")]
+    pub snapshot: ::core::option::Option<ReportEvidenceSnapshot>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResolveReportRequest {
@@ -3768,6 +3912,35 @@ pub mod trust_and_safety_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn list_report_transcript(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListReportTranscriptRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListReportTranscriptResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListReportTranscript",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "ListReportTranscript",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn resolve_report(
             &mut self,
             request: impl tonic::IntoRequest<super::ResolveReportRequest>,
@@ -4581,6 +4754,13 @@ pub mod trust_and_safety_service_server {
             request: tonic::Request<super::ListReportsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ListReportsResponse>,
+            tonic::Status,
+        >;
+        async fn list_report_transcript(
+            &self,
+            request: tonic::Request<super::ListReportTranscriptRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListReportTranscriptResponse>,
             tonic::Status,
         >;
         async fn resolve_report(
@@ -6910,6 +7090,55 @@ pub mod trust_and_safety_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListReportsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListReportTranscript" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListReportTranscriptSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::ListReportTranscriptRequest>
+                    for ListReportTranscriptSvc<T> {
+                        type Response = super::ListReportTranscriptResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListReportTranscriptRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::list_report_transcript(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListReportTranscriptSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

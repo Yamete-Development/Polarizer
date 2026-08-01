@@ -18,6 +18,12 @@ pub struct RestrictionPage {
     pub total_count: u64,
 }
 
+pub struct ReportEvidencePage {
+    pub action_ids: Vec<(u64, Uuid)>,
+    pub next_cursor: String,
+    pub snapshot: v2::ReportEvidenceSnapshot,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct RestrictionCursor {
     sort: String,
@@ -771,13 +777,17 @@ impl ModerationRepository {
     ) -> anyhow::Result<Page<v2::Report>> {
         let query_pattern = query.map(|q| format!("%{q}%"));
         let rows = sqlx::query(
-            "SELECT id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
-             description, status::text, context, created_at, resolved_by, resolved_at, version, \
-             claimed_by, claimed_at, claim_expires_at, last_claim_change_at \
-             FROM trust_safety.report WHERE ($1::text IS NULL OR scope_type = $1::trust_safety.scope_type) \
+            "SELECT report.id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
+             description, status::text, context, report.created_at AS created_at, resolved_by, resolved_at, version, \
+             claimed_by, claimed_at, claim_expires_at, last_claim_change_at, \
+             evidence.lobby_id AS evidence_lobby_id, evidence.first_sequence, evidence.last_sequence, \
+             evidence.entry_count, evidence.terminal_action_id \
+             FROM trust_safety.report report LEFT JOIN trust_safety.report_evidence_snapshot evidence \
+               ON evidence.report_id = report.id \
+             WHERE ($1::text IS NULL OR scope_type = $1::trust_safety.scope_type) \
                AND ($2::text IS NULL OR scope_id = $2) \
                AND ($3::text IS NULL OR status = $3::trust_safety.resource_status) \
-               AND ($4::uuid IS NULL OR id < $4) \
+               AND ($4::uuid IS NULL OR report.id < $4) \
                AND ($5::text IS NULL OR (description ILIKE $5 OR reporter_id ILIKE $5 \
                     OR (context->>'reported_user_id') ILIKE $5 \
                     OR (context->>'reported_server_id') ILIKE $5)) \
@@ -785,7 +795,7 @@ impl ModerationRepository {
                AND ($7::text IS NULL OR (context->>'reported_user_id') = $7) \
                AND ($8::text IS NULL OR (context->>'reported_server_id') = $8) \
                AND ($9::text IS NULL OR report_type = $9) \
-               ORDER BY id DESC LIMIT $10",
+               ORDER BY report.id DESC LIMIT $10",
         )
         .bind(scope.map(|scope| scope_name(scope.r#type)).transpose()?)
         .bind(scope.map(|scope| scope.id.as_str()))
@@ -815,6 +825,7 @@ impl ModerationRepository {
         report_type: &str,
         description: &str,
         report_context: serde_json::Value,
+        terminal_action_id: Option<Uuid>,
     ) -> anyhow::Result<v2::Report> {
         let scope_type = scope_name(scope.r#type)?;
         let (subject_type, subject_id) = primary_subject(subject, true)?;
@@ -855,6 +866,58 @@ impl ModerationRepository {
         .bind(report_context)
         .execute(&mut *tx)
         .await?;
+        if let Some(terminal_action_id) = terminal_action_id {
+            anyhow::ensure!(
+                scope_type == "LOBBY",
+                "call evidence is only valid for Lobby reports"
+            );
+            let terminal = sqlx::query(
+                "SELECT event.sequence, inbox.action_type \
+                 FROM trust_safety.call_evidence_event event \
+                 JOIN trust_safety.action_inbox inbox ON inbox.action_id = event.action_id \
+                 WHERE event.lobby_id = $1 AND event.action_id = $2",
+            )
+            .bind(&scope.id)
+            .bind(terminal_action_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("terminal call evidence is not available yet"))?;
+            anyhow::ensure!(
+                terminal.try_get::<String, _>("action_type")? == "lobby.call.ended",
+                "terminal_action_id must reference CALL_ENDED"
+            );
+            let last_sequence: i64 = terminal.try_get("sequence")?;
+            let bounds = sqlx::query(
+                "SELECT MIN(sequence) AS first_sequence, COUNT(*) AS entry_count \
+                 FROM trust_safety.call_evidence_event \
+                 WHERE lobby_id = $1 AND sequence <= $2",
+            )
+            .bind(&scope.id)
+            .bind(last_sequence)
+            .fetch_one(&mut *tx)
+            .await?;
+            let first_sequence: i64 = bounds
+                .try_get::<Option<i64>, _>("first_sequence")?
+                .ok_or_else(|| anyhow::anyhow!("call evidence is empty"))?;
+            let entry_count: i64 = bounds.try_get("entry_count")?;
+            anyhow::ensure!(
+                entry_count == last_sequence - first_sequence + 1,
+                "call evidence has a sequence gap"
+            );
+            sqlx::query(
+                "INSERT INTO trust_safety.report_evidence_snapshot \
+                 (report_id, lobby_id, first_sequence, last_sequence, entry_count, terminal_action_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(id)
+            .bind(&scope.id)
+            .bind(first_sequence)
+            .bind(last_sequence)
+            .bind(entry_count)
+            .bind(terminal_action_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         if matches!(subject_type, "USER" | "SERVER") {
             let (observation_id, assessment_id) = insert_derived_safety_observation_tx(
                 &mut tx,
@@ -958,12 +1021,80 @@ impl ModerationRepository {
 
     pub async fn get_report(&self, id: Uuid) -> anyhow::Result<v2::Report> {
         let row = sqlx::query(
-            "SELECT id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
-             description, status::text, context, created_at, resolved_by, resolved_at, version, \
-             claimed_by, claimed_at, claim_expires_at, last_claim_change_at \
-             FROM trust_safety.report WHERE id = $1",
+            "SELECT report.id, scope_type::text, scope_id, subject_type, subject_id, reporter_id, report_type, \
+             description, status::text, context, report.created_at AS created_at, resolved_by, resolved_at, version, \
+             claimed_by, claimed_at, claim_expires_at, last_claim_change_at, \
+             evidence.lobby_id AS evidence_lobby_id, evidence.first_sequence, evidence.last_sequence, \
+             evidence.entry_count, evidence.terminal_action_id \
+             FROM trust_safety.report report LEFT JOIN trust_safety.report_evidence_snapshot evidence \
+               ON evidence.report_id = report.id WHERE report.id = $1",
         ).bind(id).fetch_one(&self.db).await?;
         report_from_row(&row)
+    }
+
+    pub async fn list_report_evidence(
+        &self,
+        report_id: Uuid,
+        after_sequence: Option<i64>,
+        limit: i64,
+    ) -> anyhow::Result<ReportEvidencePage> {
+        let snapshot_row = sqlx::query(
+            "SELECT lobby_id, first_sequence, last_sequence, entry_count, terminal_action_id \
+             FROM trust_safety.report_evidence_snapshot WHERE report_id = $1",
+        )
+        .bind(report_id)
+        .fetch_one(&self.db)
+        .await?;
+        let lobby_id: String = snapshot_row.try_get("lobby_id")?;
+        let first_sequence: i64 = snapshot_row.try_get("first_sequence")?;
+        let last_sequence: i64 = snapshot_row.try_get("last_sequence")?;
+        let entry_count: i64 = snapshot_row.try_get("entry_count")?;
+        let terminal_action_id: Uuid = snapshot_row.try_get("terminal_action_id")?;
+        let rows = sqlx::query(
+            "SELECT sequence, action_id FROM trust_safety.call_evidence_event \
+             WHERE lobby_id = $1 AND sequence BETWEEN $2 AND $3 \
+               AND ($4::bigint IS NULL OR sequence > $4) \
+             ORDER BY sequence ASC LIMIT $5",
+        )
+        .bind(&lobby_id)
+        .bind(first_sequence)
+        .bind(last_sequence)
+        .bind(after_sequence)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.db)
+        .await?;
+        let action_ids = rows
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<i64, _>("sequence")? as u64,
+                    row.try_get("action_id")?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let next_cursor = if action_ids.len() == limit.clamp(1, 100) as usize
+            && action_ids
+                .last()
+                .is_some_and(|(sequence, _)| *sequence < last_sequence as u64)
+        {
+            action_ids
+                .last()
+                .map(|(sequence, _)| sequence.to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Ok(ReportEvidencePage {
+            action_ids,
+            next_cursor,
+            snapshot: v2::ReportEvidenceSnapshot {
+                lobby_id,
+                first_sequence: first_sequence as u64,
+                last_sequence: last_sequence as u64,
+                entry_count: entry_count as u64,
+                terminal_action_id: terminal_action_id.to_string(),
+            },
+        })
     }
 
     pub async fn claim_report(
@@ -2010,6 +2141,18 @@ fn infraction_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Infrac
 }
 
 fn report_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Report> {
+    let evidence_snapshot = row
+        .try_get::<Option<String>, _>("evidence_lobby_id")?
+        .map(|lobby_id| -> anyhow::Result<v2::ReportEvidenceSnapshot> {
+            Ok(v2::ReportEvidenceSnapshot {
+                lobby_id,
+                first_sequence: row.try_get::<i64, _>("first_sequence")? as u64,
+                last_sequence: row.try_get::<i64, _>("last_sequence")? as u64,
+                entry_count: row.try_get::<i64, _>("entry_count")? as u64,
+                terminal_action_id: row.try_get::<Uuid, _>("terminal_action_id")?.to_string(),
+            })
+        })
+        .transpose()?;
     Ok(v2::Report {
         id: row.try_get::<Uuid, _>("id")?.to_string(),
         scope: Some(scope_from_parts(
@@ -2049,6 +2192,7 @@ fn report_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::Report> {
             .try_get::<Option<DateTime<Utc>>, _>("last_claim_change_at")
             .unwrap_or_default()
             .map(timestamp),
+        evidence_snapshot,
     })
 }
 

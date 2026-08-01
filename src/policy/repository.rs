@@ -81,6 +81,70 @@ pub trait PolicyRepository: Send + Sync {
     ) -> anyhow::Result<()>;
 }
 
+async fn append_lobby_evidence_event(
+    tx: &mut Transaction<'_, Postgres>,
+    action: &Action,
+) -> anyhow::Result<()> {
+    if action.scope.scope_type != super::model::ScopeType::Lobby
+        || !matches!(
+            action.action_type.as_str(),
+            "lobby.message.created"
+                | "lobby.message.edited"
+                | "lobby.message.deleted"
+                | "lobby.call.connected"
+                | "lobby.call.ended"
+                | "lobby.participant.joined"
+                | "lobby.participant.left"
+                | "lobby.report.submitted"
+        )
+    {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        !action.scope.id.is_empty(),
+        "Lobby evidence requires a lobby id"
+    );
+    sqlx::query(
+        "INSERT INTO trust_safety.call_evidence_archive (lobby_id) VALUES ($1) \
+         ON CONFLICT (lobby_id) DO NOTHING",
+    )
+    .bind(&action.scope.id)
+    .execute(&mut **tx)
+    .await?;
+    let sequence: i64 = sqlx::query_scalar(
+        "UPDATE trust_safety.call_evidence_archive \
+         SET last_sequence = last_sequence + 1, updated_at = clock_timestamp() \
+         WHERE lobby_id = $1 RETURNING last_sequence",
+    )
+    .bind(&action.scope.id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let message_kind = action
+        .attributes
+        .get("message_kind")
+        .and_then(serde_json::Value::as_str);
+    let event_kind =
+        if action.action_type.starts_with("lobby.message.") && message_kind != Some("system") {
+            "USER_MESSAGE"
+        } else {
+            "SYSTEM_EVENT"
+        };
+    sqlx::query(
+        "INSERT INTO trust_safety.call_evidence_event \
+         (lobby_id, sequence, action_id, event_kind, occurred_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&action.scope.id)
+    .bind(sequence)
+    .bind(action.id)
+    .bind(event_kind)
+    .bind(action.occurred_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub struct ActionCipher {
     key: aead::LessSafeKey,
     random: SystemRandom,
@@ -173,6 +237,16 @@ impl PostgresPolicyRepository {
 
     pub fn pool(&self) -> &PgPool {
         &self.db
+    }
+
+    pub async fn load_persisted_action(&self, action_id: Uuid) -> anyhow::Result<Action> {
+        let encrypted: Vec<u8> = sqlx::query_scalar(
+            "SELECT action_ciphertext FROM trust_safety.action_inbox WHERE action_id = $1",
+        )
+        .bind(action_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(serde_json::from_slice(&self.cipher.open(&encrypted)?)?)
     }
 
     pub async fn create_bundle(
@@ -1618,6 +1692,8 @@ impl PolicyRepository for PostgresPolicyRepository {
             tx.rollback().await?;
             return Ok(PersistOutcome::Duplicate);
         }
+
+        append_lobby_evidence_event(&mut tx, action).await?;
 
         let effects_json = serde_json::to_value(&result.accepted_effects)?;
         let policy_versions = serde_json::to_value(&result.trace.policy_versions)?;
