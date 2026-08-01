@@ -1953,16 +1953,19 @@ pub struct ListRestrictionsRequest {
     pub page: ::core::option::Option<CursorPage>,
     #[prost(enumeration = "RestrictionType", tag = "6")]
     pub restriction_type: i32,
+    /// Optional restriction subject kind: USER or SERVER.
     #[prost(string, tag = "7")]
     pub subject_type: ::prost::alloc::string::String,
     #[prost(string, tag = "8")]
     pub subject_id: ::prost::alloc::string::String,
     #[prost(string, tag = "9")]
     pub created_by: ::prost::alloc::string::String,
+    /// Case-insensitive search across subject_id, reason, and created_by.
     #[prost(string, tag = "10")]
     pub query: ::prost::alloc::string::String,
     #[prost(bool, tag = "11")]
     pub include_total_count: bool,
+    /// created_at_desc, created_at_asc, or expires_at_asc.
     #[prost(string, tag = "12")]
     pub sort: ::prost::alloc::string::String,
 }
