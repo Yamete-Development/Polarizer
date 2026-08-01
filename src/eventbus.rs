@@ -19,6 +19,14 @@ use crate::{
     policy::{engine::PolicyEngine, repository::PostgresPolicyRepository},
 };
 
+const CANCEL_STALE_STAFF_ACTION_REQUESTS: &str =
+    "UPDATE trust_safety.staff_action_request request SET status='CANCELLED',
+        decision_reason='requester no longer owns a live report claim',decided_at=clock_timestamp(),
+        version=request.version+1 FROM trust_safety.report report
+        WHERE request.status='PENDING' AND request.report_id=report.id
+          AND (report.status<>'PENDING' OR report.claimed_by IS DISTINCT FROM request.requested_by
+               OR report.claim_expires_at<=clock_timestamp())";
+
 pub struct ActionConsumer {
     consumer: StreamConsumer,
     dlq_producer: FutureProducer,
@@ -637,12 +645,7 @@ pub async fn expiry_worker(
                     decision_reason='approval window expired',decided_at=clock_timestamp(),version=version+1
                     WHERE status='PENDING' AND expires_at<=clock_timestamp()")
                     .execute(&mut *tx).await?;
-                sqlx::query("UPDATE trust_safety.staff_action_request request SET status='CANCELLED',
-                    decision_reason='requester no longer owns a live report claim',decided_at=clock_timestamp(),
-                    version=version+1 FROM trust_safety.report report
-                    WHERE request.status='PENDING' AND request.report_id=report.id
-                      AND (report.status<>'PENDING' OR report.claimed_by IS DISTINCT FROM request.requested_by
-                           OR report.claim_expires_at<=clock_timestamp())")
+                sqlx::query(CANCEL_STALE_STAFF_ACTION_REQUESTS)
                     .execute(&mut *tx).await?;
                 sqlx::query("DELETE FROM trust_safety.policy_counter WHERE window_end <= clock_timestamp() - INTERVAL '1 day'")
                     .execute(&mut *tx).await?;
@@ -656,7 +659,9 @@ pub async fn expiry_worker(
 
 #[cfg(test)]
 mod cloud_event_tests {
-    use super::{dlq_headers, header_value, validate_cloud_event_headers};
+    use super::{
+        CANCEL_STALE_STAFF_ACTION_REQUESTS, dlq_headers, header_value, validate_cloud_event_headers,
+    };
     use rdkafka::message::{Header, Headers, OwnedHeaders};
 
     fn valid_headers(event_type: &str) -> OwnedHeaders {
@@ -741,5 +746,10 @@ mod cloud_event_tests {
             assert!(header_value(&headers, required).is_some_and(|value| !value.is_empty()));
         }
         assert!(headers.count() >= 8);
+    }
+
+    #[test]
+    fn joined_expiry_update_qualifies_target_version() {
+        assert!(CANCEL_STALE_STAFF_ACTION_REQUESTS.contains("version=request.version+1"));
     }
 }
