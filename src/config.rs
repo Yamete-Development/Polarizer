@@ -201,7 +201,7 @@ impl AppConfig {
             iris_tls_cert_path: path("IRIS_TLS_CERT"),
             iris_tls_key_path: path("IRIS_TLS_KEY"),
             iris_timeout: Duration::from_millis(parse("IRIS_TIMEOUT_MS", "2000")?),
-            staff_authorization_mode: parse("STAFF_AUTHORIZATION_MODE", "legacy")?,
+            staff_authorization_mode: parse("STAFF_AUTHORIZATION_MODE", "enforce")?,
             staff_case_claim_lease: Duration::from_secs(parse(
                 "STAFF_CASE_CLAIM_LEASE_SECONDS",
                 "1800",
