@@ -2309,6 +2309,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                     .report_context
                     .map(struct_to_json)
                     .unwrap_or_else(|| serde_json::json!({})),
+                optional_uuid(&request.terminal_action_id, "terminal_action_id")?,
             )
             .await
             .map_err(resource_error)?;
@@ -2443,6 +2444,72 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             page: Some(v2::CursorPageResult {
                 next_cursor: result.next_cursor,
             }),
+        }))
+    }
+    async fn list_report_transcript(
+        &self,
+        request: Request<v2::ListReportTranscriptRequest>,
+    ) -> Result<Response<v2::ListReportTranscriptResponse>, Status> {
+        authenticate_request!(self, request, context, false);
+        let report_id = parse_uuid(&request.report_id, "report_id")?;
+        let _report = self
+            .moderation
+            .get_report(report_id)
+            .await
+            .map_err(not_found_or_internal)?;
+        if v2::ActorType::try_from(context.actor_type).unwrap_or_default() == v2::ActorType::Service
+        {
+            self.authorizer
+                .authorize(context, "ListReportTranscript", None, None)
+                .await?;
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationCases,
+                Permission::HandleLobbyReports,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        let page = request.page.unwrap_or(v2::CursorPage {
+            page_size: 50,
+            cursor: String::new(),
+        });
+        let cursor = if page.cursor.is_empty() {
+            None
+        } else {
+            Some(
+                page.cursor
+                    .parse::<i64>()
+                    .map_err(|_| Status::invalid_argument("cursor is invalid"))?,
+            )
+        };
+        let evidence = self
+            .moderation
+            .list_report_evidence(report_id, cursor, i64::from(page.page_size.max(1)))
+            .await
+            .map_err(not_found_or_internal)?;
+        let mut entries = Vec::with_capacity(evidence.action_ids.len());
+        for (sequence, action_id) in evidence.action_ids {
+            let action = self
+                .repository
+                .load_persisted_action(action_id)
+                .await
+                .map_err(internal)?;
+            entries.push(transcript_entry_from_action(sequence, &action));
+        }
+        Ok(Response::new(v2::ListReportTranscriptResponse {
+            entries,
+            page: Some(v2::CursorPageResult {
+                next_cursor: evidence.next_cursor,
+            }),
+            total_count: evidence.snapshot.entry_count,
+            snapshot: Some(evidence.snapshot),
         }))
     }
     async fn resolve_report(
@@ -4685,6 +4752,66 @@ fn conflict_or_internal(error: anyhow::Error) -> Status {
         internal(error)
     }
 }
+
+fn transcript_entry_from_action(sequence: u64, action: &Action) -> v2::TranscriptEntry {
+    let attribute = |name: &str| {
+        action
+            .attributes
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let system_event_type = match action.action_type.as_str() {
+        "lobby.call.connected" => v2::LobbySystemEventType::CallConnected,
+        "lobby.participant.joined" => v2::LobbySystemEventType::ParticipantJoined,
+        "lobby.participant.left" => v2::LobbySystemEventType::ParticipantLeft,
+        "lobby.report.submitted" => v2::LobbySystemEventType::ReportSubmitted,
+        "lobby.call.ended" => v2::LobbySystemEventType::CallEnded,
+        _ => v2::LobbySystemEventType::Unspecified,
+    };
+    let is_system = system_event_type != v2::LobbySystemEventType::Unspecified
+        || attribute("message_kind") == "system";
+    v2::TranscriptEntry {
+        sequence,
+        action_id: action.id.to_string(),
+        kind: if is_system {
+            v2::TranscriptEntryKind::SystemEvent
+        } else {
+            v2::TranscriptEntryKind::UserMessage
+        } as i32,
+        occurred_at: Some(timestamp(action.occurred_at)),
+        message_id: action.subject.message_id.clone().unwrap_or_default(),
+        author_id: action.subject.user_id.clone().unwrap_or_default(),
+        author_display_name: attribute("author_display_name"),
+        author_username: attribute("author_username"),
+        original_content: {
+            let original = attribute("original_content");
+            if original.is_empty() {
+                attribute("content")
+            } else {
+                original
+            }
+        },
+        approved_content: attribute("content"),
+        delivery_content: attribute("delivery_content"),
+        reply_to_message_id: attribute("reply_to_message_id"),
+        reply_author_id: attribute("reply_author_id"),
+        reply_author_display_name: attribute("reply_author_display_name"),
+        reply_content: attribute("reply_content"),
+        system_event_type: system_event_type as i32,
+        system_event_reason: attribute("reason"),
+    }
+}
+
+fn optional_uuid(value: &str, field: &str) -> Result<Option<Uuid>, Status> {
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        parse_uuid(value, field).map(Some)
+    }
+}
+
 fn not_found_or_internal(error: anyhow::Error) -> Status {
     if error
         .downcast_ref::<sqlx::Error>()
@@ -4699,7 +4826,9 @@ fn resource_error(error: anyhow::Error) -> Status {
     let message = error.to_string();
     if message.contains("conflict") || message.contains("already used") {
         Status::aborted(message)
-    } else if message.contains("illegal policy bundle state transition")
+    } else if message.contains("terminal call evidence is not available yet")
+        || message.contains("call evidence has a sequence gap")
+        || message.contains("illegal policy bundle state transition")
         || message.contains("retired policy bundle")
         || message.contains("cannot change after versions are activated")
     {
