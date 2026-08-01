@@ -1,4 +1,5 @@
 /target
+/tools/proto-gen/target
 .env
 *.onnx
 *.ort

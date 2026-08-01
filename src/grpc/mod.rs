@@ -38,7 +38,8 @@ pub async fn serve(
         .identity(Identity::from_pem(cert, key))
         .client_ca_root(Certificate::from_pem(client_ca));
     let address = SocketAddr::new(config.grpc_host, config.grpc_port);
-    let service = TrustAndSafetyService::new(engine, repository, authorizer, moderation, commands);
+    let service =
+        TrustAndSafetyService::new(engine, repository, authorizer, moderation, commands, config);
     info!(%address, "mTLS gRPC server starting");
     Server::builder()
         .tls_config(tls)?

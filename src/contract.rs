@@ -14,6 +14,9 @@ pub mod authz {
     pub mod v1 {
         include!("generated/authz.v1.rs");
     }
+    pub mod v2 {
+        include!("generated/authz.v2.rs");
+    }
 }
 
 pub use interchat::trust_and_safety::v2;

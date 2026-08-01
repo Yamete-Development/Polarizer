@@ -19,6 +19,14 @@ use crate::{
     policy::{engine::PolicyEngine, repository::PostgresPolicyRepository},
 };
 
+const CANCEL_STALE_STAFF_ACTION_REQUESTS: &str =
+    "UPDATE trust_safety.staff_action_request request SET status='CANCELLED',
+        decision_reason='requester no longer owns a live report claim',decided_at=clock_timestamp(),
+        version=request.version+1 FROM trust_safety.report report
+        WHERE request.status='PENDING' AND request.report_id=report.id
+          AND (report.status<>'PENDING' OR report.claimed_by IS DISTINCT FROM request.requested_by
+               OR report.claim_expires_at<=clock_timestamp())";
+
 pub struct ActionConsumer {
     consumer: StreamConsumer,
     dlq_producer: FutureProducer,
@@ -36,6 +44,87 @@ pub struct DeliveryCallbackConsumer {
     dlq_topic: String,
     repository: Arc<PostgresPolicyRepository>,
     cancel: CancellationToken,
+}
+
+pub struct StaffAuthorizationChangeConsumer {
+    consumer: StreamConsumer,
+    topic: String,
+    db: PgPool,
+    cancel: CancellationToken,
+}
+
+impl StaffAuthorizationChangeConsumer {
+    pub fn new(config: &AppConfig, db: PgPool, cancel: CancellationToken) -> anyhow::Result<Self> {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &config.kafka_brokers)
+            .set(
+                "group.id",
+                format!("{}-staff-authz-changes", config.kafka_group_id),
+            )
+            .set("enable.auto.commit", "false")
+            .set("enable.auto.offset.store", "false")
+            .set("auto.offset.reset", "earliest")
+            .set("isolation.level", "read_committed")
+            .create()?;
+        consumer.subscribe(&[&config.staff_authorization_change_topic])?;
+        Ok(Self {
+            consumer,
+            topic: config.staff_authorization_change_topic.clone(),
+            db,
+            cancel,
+        })
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        info!(topic=%self.topic,"staff authorization change consumer started");
+        loop {
+            let message = tokio::select! {_=self.cancel.cancelled()=>break,message=self.consumer.recv()=>match message{Ok(message)=>message,Err(error)=>{warn!(error=%error,"staff authorization change receive failed");continue;}}};
+            let envelope: serde_json::Value =
+                match serde_json::from_slice(message.payload().unwrap_or_default()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        warn!(error=%error,"invalid staff authorization change event");
+                        self.consumer.commit_message(&message, CommitMode::Sync)?;
+                        continue;
+                    }
+                };
+            let user_id = envelope
+                .pointer("/data/user_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if user_id.is_empty() {
+                warn!("staff authorization change missing user_id");
+                self.consumer.commit_message(&message, CommitMode::Sync)?;
+                continue;
+            }
+            let event_id = envelope
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("iris-staff-change");
+            let mut tx = self.db.begin().await?;
+            sqlx::query("WITH changed AS (
+                UPDATE trust_safety.report SET claimed_by=NULL,claimed_at=NULL,claim_expires_at=NULL,
+                    last_claim_change_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1
+                WHERE claimed_by=$1 RETURNING id
+            ) INSERT INTO trust_safety.audit_log
+                (request_id,actor_id,actor_type,action,resource_type,resource_id,metadata)
+                SELECT $2,'iris','SERVICE','RELEASE_CLAIM_AFTER_STAFF_AUTH_CHANGE','REPORT',id::text,
+                    jsonb_build_object('staff_user_id',$1) FROM changed")
+                .bind(user_id).bind(event_id).execute(&mut *tx).await?;
+            sqlx::query("WITH changed AS (
+                UPDATE trust_safety.staff_action_request SET status='CANCELLED',decided_by='iris',
+                    decision_reason='staff authorization changed',decided_at=clock_timestamp(),version=version+1
+                WHERE requested_by=$1 AND status='PENDING' AND report_id IS NOT NULL RETURNING id
+            ) INSERT INTO trust_safety.audit_log
+                (request_id,actor_id,actor_type,action,resource_type,resource_id,metadata)
+                SELECT $2,'iris','SERVICE','CANCEL_ACTION_AFTER_STAFF_AUTH_CHANGE','STAFF_ACTION_REQUEST',
+                    id::text,jsonb_build_object('staff_user_id',$1) FROM changed")
+                .bind(user_id).bind(event_id).execute(&mut *tx).await?;
+            tx.commit().await?;
+            self.consumer.commit_message(&message, CommitMode::Sync)?;
+        }
+        Ok(())
+    }
 }
 
 impl DeliveryCallbackConsumer {
@@ -552,6 +641,12 @@ pub async fn expiry_worker(
                     .execute(&mut *tx).await?;
                 sqlx::query("UPDATE trust_safety.infraction SET status = 'EXPIRED', version = version + 1, updated_at = clock_timestamp() WHERE status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at <= clock_timestamp()")
                     .execute(&mut *tx).await?;
+                sqlx::query("UPDATE trust_safety.staff_action_request SET status='EXPIRED',
+                    decision_reason='approval window expired',decided_at=clock_timestamp(),version=version+1
+                    WHERE status='PENDING' AND expires_at<=clock_timestamp()")
+                    .execute(&mut *tx).await?;
+                sqlx::query(CANCEL_STALE_STAFF_ACTION_REQUESTS)
+                    .execute(&mut *tx).await?;
                 sqlx::query("DELETE FROM trust_safety.policy_counter WHERE window_end <= clock_timestamp() - INTERVAL '1 day'")
                     .execute(&mut *tx).await?;
                 tx.commit().await?;
@@ -564,7 +659,9 @@ pub async fn expiry_worker(
 
 #[cfg(test)]
 mod cloud_event_tests {
-    use super::{dlq_headers, header_value, validate_cloud_event_headers};
+    use super::{
+        CANCEL_STALE_STAFF_ACTION_REQUESTS, dlq_headers, header_value, validate_cloud_event_headers,
+    };
     use rdkafka::message::{Header, Headers, OwnedHeaders};
 
     fn valid_headers(event_type: &str) -> OwnedHeaders {
@@ -649,5 +746,10 @@ mod cloud_event_tests {
             assert!(header_value(&headers, required).is_some_and(|value| !value.is_empty()));
         }
         assert!(headers.count() >= 8);
+    }
+
+    #[test]
+    fn joined_expiry_update_qualifies_target_version() {
+        assert!(CANCEL_STALE_STAFF_ACTION_REQUESTS.contains("version=request.version+1"));
     }
 }

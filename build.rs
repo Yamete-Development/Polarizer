@@ -4,5 +4,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sibling repository or a locally installed protoc plugin.
     println!("cargo:rerun-if-changed=src/generated/interchat.trust_and_safety.v2.rs");
     println!("cargo:rerun-if-changed=src/generated/prism.rs");
+    println!("cargo:rerun-if-changed=src/generated/authz.v2.rs");
     Ok(())
 }

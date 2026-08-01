@@ -312,6 +312,8 @@ pub struct Restriction {
     pub version: u64,
     #[prost(bool, tag = "11")]
     pub is_active: bool,
+    #[prost(string, tag = "12")]
+    pub source_report_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Infraction {
@@ -339,6 +341,8 @@ pub struct Infraction {
     pub enforcement_restriction_id: ::prost::alloc::string::String,
     #[prost(bool, tag = "12")]
     pub is_active: bool,
+    #[prost(string, tag = "13")]
+    pub source_report_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NsfwOverride {
@@ -388,6 +392,51 @@ pub struct Report {
     #[prost(message, optional, tag = "11")]
     pub resolved_at: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(uint64, tag = "12")]
+    pub version: u64,
+    #[prost(string, tag = "13")]
+    pub claimed_by: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "14")]
+    pub claimed_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "15")]
+    pub claim_expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(message, optional, tag = "16")]
+    pub last_claim_change_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StaffActionRequest {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(enumeration = "StaffActionType", tag = "2")]
+    pub action_type: i32,
+    #[prost(message, optional, tag = "3")]
+    pub subject: ::core::option::Option<Subject>,
+    #[prost(message, optional, tag = "4")]
+    pub scope: ::core::option::Option<Scope>,
+    #[prost(string, tag = "5")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub requested_reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "7")]
+    pub requested_expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, tag = "8")]
+    pub requested_by: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "9")]
+    pub requested_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(enumeration = "StaffActionRequestStatus", tag = "10")]
+    pub status: i32,
+    #[prost(string, tag = "11")]
+    pub decided_by: ::prost::alloc::string::String,
+    #[prost(string, tag = "12")]
+    pub decision_reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "13")]
+    pub decided_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, tag = "14")]
+    pub executed_infraction_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "15")]
+    pub executed_restriction_id: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "16")]
+    pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(uint64, tag = "17")]
     pub version: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -842,6 +891,73 @@ impl NsfwOverrideClassification {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum StaffActionType {
+    Unspecified = 0,
+    LobbyBan = 1,
+    GlobalBlacklist = 2,
+}
+impl StaffActionType {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "STAFF_ACTION_TYPE_UNSPECIFIED",
+            Self::LobbyBan => "STAFF_ACTION_TYPE_LOBBY_BAN",
+            Self::GlobalBlacklist => "STAFF_ACTION_TYPE_GLOBAL_BLACKLIST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STAFF_ACTION_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "STAFF_ACTION_TYPE_LOBBY_BAN" => Some(Self::LobbyBan),
+            "STAFF_ACTION_TYPE_GLOBAL_BLACKLIST" => Some(Self::GlobalBlacklist),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum StaffActionRequestStatus {
+    Unspecified = 0,
+    Pending = 1,
+    Rejected = 2,
+    Expired = 3,
+    Executed = 4,
+    Cancelled = 5,
+}
+impl StaffActionRequestStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "STAFF_ACTION_REQUEST_STATUS_UNSPECIFIED",
+            Self::Pending => "STAFF_ACTION_REQUEST_STATUS_PENDING",
+            Self::Rejected => "STAFF_ACTION_REQUEST_STATUS_REJECTED",
+            Self::Expired => "STAFF_ACTION_REQUEST_STATUS_EXPIRED",
+            Self::Executed => "STAFF_ACTION_REQUEST_STATUS_EXECUTED",
+            Self::Cancelled => "STAFF_ACTION_REQUEST_STATUS_CANCELLED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STAFF_ACTION_REQUEST_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "STAFF_ACTION_REQUEST_STATUS_PENDING" => Some(Self::Pending),
+            "STAFF_ACTION_REQUEST_STATUS_REJECTED" => Some(Self::Rejected),
+            "STAFF_ACTION_REQUEST_STATUS_EXPIRED" => Some(Self::Expired),
+            "STAFF_ACTION_REQUEST_STATUS_EXECUTED" => Some(Self::Executed),
+            "STAFF_ACTION_REQUEST_STATUS_CANCELLED" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ActionRequested {
     #[prost(message, optional, tag = "1")]
@@ -865,6 +981,10 @@ pub struct DecisionPublished {
     pub scope: ::core::option::Option<Scope>,
     #[prost(message, optional, tag = "4")]
     pub subject: ::core::option::Option<Subject>,
+    /// Canonical presentation-free content after accepted policy effects.
+    /// Consumers must never recover canonical content from the delivery payload.
+    #[prost(string, optional, tag = "5")]
+    pub approved_content: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandEnvelope {
@@ -1831,6 +1951,23 @@ pub struct ListRestrictionsRequest {
     pub status: i32,
     #[prost(message, optional, tag = "5")]
     pub page: ::core::option::Option<CursorPage>,
+    #[prost(enumeration = "RestrictionType", tag = "6")]
+    pub restriction_type: i32,
+    /// Optional restriction subject kind: USER or SERVER.
+    #[prost(string, tag = "7")]
+    pub subject_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub subject_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub created_by: ::prost::alloc::string::String,
+    /// Case-insensitive search across subject_id, reason, and created_by.
+    #[prost(string, tag = "10")]
+    pub query: ::prost::alloc::string::String,
+    #[prost(bool, tag = "11")]
+    pub include_total_count: bool,
+    /// created_at_desc, created_at_asc, or expires_at_asc.
+    #[prost(string, tag = "12")]
+    pub sort: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListRestrictionsResponse {
@@ -1838,6 +1975,8 @@ pub struct ListRestrictionsResponse {
     pub restrictions: ::prost::alloc::vec::Vec<Restriction>,
     #[prost(message, optional, tag = "2")]
     pub page: ::core::option::Option<CursorPageResult>,
+    #[prost(uint64, tag = "3")]
+    pub total_count: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateInfractionRequest {
@@ -2164,6 +2303,120 @@ pub struct ModerationStatistics {
     pub review_items: u64,
     #[prost(map = "string, uint64", tag = "7")]
     pub reason_counts: ::std::collections::HashMap<::prost::alloc::string::String, u64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetStaffActionRequestRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub action_request_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListStaffActionRequestsRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(enumeration = "StaffActionRequestStatus", tag = "2")]
+    pub status: i32,
+    #[prost(string, tag = "3")]
+    pub requested_by: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub page: ::core::option::Option<CursorPage>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListStaffActionRequestsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub requests: ::prost::alloc::vec::Vec<StaffActionRequest>,
+    #[prost(message, optional, tag = "2")]
+    pub page: ::core::option::Option<CursorPageResult>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ClaimReportRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_version: u64,
+    #[prost(string, tag = "4")]
+    pub bypass_reason: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RenewReportClaimRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub expected_version: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UnclaimReportRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub expected_version: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AssignReportRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub assignee_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub expected_version: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TransferReportRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub assignee_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub bypass_reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "6")]
+    pub expected_version: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateStaffActionRequestRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(enumeration = "StaffActionType", tag = "2")]
+    pub action_type: i32,
+    #[prost(message, optional, tag = "3")]
+    pub subject: ::core::option::Option<Subject>,
+    #[prost(message, optional, tag = "4")]
+    pub scope: ::core::option::Option<Scope>,
+    #[prost(string, tag = "5")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "7")]
+    pub requested_expires_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ResolveStaffActionRequestRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(string, tag = "2")]
+    pub action_request_id: ::prost::alloc::string::String,
+    #[prost(bool, tag = "3")]
+    pub approve: bool,
+    #[prost(string, tag = "4")]
+    pub reason: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub expected_version: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -3347,6 +3600,35 @@ pub mod trust_and_safety_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn revoke_infractions_by_type(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RevokeInfractionsByTypeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RevokeInfractionsByTypeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/RevokeInfractionsByType",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "RevokeInfractionsByType",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn list_infractions(
             &mut self,
             request: impl tonic::IntoRequest<super::ListInfractionsRequest>,
@@ -3816,6 +4098,252 @@ pub mod trust_and_safety_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_staff_action_request(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetStaffActionRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StaffActionRequest>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/GetStaffActionRequest",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "GetStaffActionRequest",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_staff_action_requests(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListStaffActionRequestsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListStaffActionRequestsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListStaffActionRequests",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "ListStaffActionRequests",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn claim_report(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClaimReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ClaimReport",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "ClaimReport",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn renew_report_claim(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RenewReportClaimRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/RenewReportClaim",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "RenewReportClaim",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn unclaim_report(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UnclaimReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/UnclaimReport",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "UnclaimReport",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn assign_report(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AssignReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/AssignReport",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "AssignReport",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn transfer_report(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TransferReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/TransferReport",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "TransferReport",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn create_staff_action_request(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateStaffActionRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StaffActionRequest>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/CreateStaffActionRequest",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "CreateStaffActionRequest",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn resolve_staff_action_request(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ResolveStaffActionRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StaffActionRequest>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ResolveStaffActionRequest",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "ResolveStaffActionRequest",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -4119,6 +4647,54 @@ pub mod trust_and_safety_service_server {
             request: tonic::Request<super::GetModerationStatisticsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ModerationStatistics>,
+            tonic::Status,
+        >;
+        async fn get_staff_action_request(
+            &self,
+            request: tonic::Request<super::GetStaffActionRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StaffActionRequest>,
+            tonic::Status,
+        >;
+        async fn list_staff_action_requests(
+            &self,
+            request: tonic::Request<super::ListStaffActionRequestsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListStaffActionRequestsResponse>,
+            tonic::Status,
+        >;
+        async fn claim_report(
+            &self,
+            request: tonic::Request<super::ClaimReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status>;
+        async fn renew_report_claim(
+            &self,
+            request: tonic::Request<super::RenewReportClaimRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status>;
+        async fn unclaim_report(
+            &self,
+            request: tonic::Request<super::UnclaimReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status>;
+        async fn assign_report(
+            &self,
+            request: tonic::Request<super::AssignReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status>;
+        async fn transfer_report(
+            &self,
+            request: tonic::Request<super::TransferReportRequest>,
+        ) -> std::result::Result<tonic::Response<super::Report>, tonic::Status>;
+        async fn create_staff_action_request(
+            &self,
+            request: tonic::Request<super::CreateStaffActionRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StaffActionRequest>,
+            tonic::Status,
+        >;
+        async fn resolve_staff_action_request(
+            &self,
+            request: tonic::Request<super::ResolveStaffActionRequestRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::StaffActionRequest>,
             tonic::Status,
         >;
     }
@@ -6060,6 +6636,59 @@ pub mod trust_and_safety_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/RevokeInfractionsByType" => {
+                    #[allow(non_camel_case_types)]
+                    struct RevokeInfractionsByTypeSvc<T: TrustAndSafetyService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::RevokeInfractionsByTypeRequest>
+                    for RevokeInfractionsByTypeSvc<T> {
+                        type Response = super::RevokeInfractionsByTypeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::RevokeInfractionsByTypeRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::revoke_infractions_by_type(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RevokeInfractionsByTypeSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListInfractions" => {
                     #[allow(non_camel_case_types)]
                     struct ListInfractionsSvc<T: TrustAndSafetyService>(pub Arc<T>);
@@ -6873,6 +7502,456 @@ pub mod trust_and_safety_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetModerationStatisticsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/GetStaffActionRequest" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetStaffActionRequestSvc<T: TrustAndSafetyService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::GetStaffActionRequestRequest>
+                    for GetStaffActionRequestSvc<T> {
+                        type Response = super::StaffActionRequest;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetStaffActionRequestRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::get_staff_action_request(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetStaffActionRequestSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListStaffActionRequests" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListStaffActionRequestsSvc<T: TrustAndSafetyService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::ListStaffActionRequestsRequest>
+                    for ListStaffActionRequestsSvc<T> {
+                        type Response = super::ListStaffActionRequestsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::ListStaffActionRequestsRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::list_staff_action_requests(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListStaffActionRequestsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ClaimReport" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClaimReportSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::ClaimReportRequest>
+                    for ClaimReportSvc<T> {
+                        type Response = super::Report;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ClaimReportRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::claim_report(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClaimReportSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/RenewReportClaim" => {
+                    #[allow(non_camel_case_types)]
+                    struct RenewReportClaimSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::RenewReportClaimRequest>
+                    for RenewReportClaimSvc<T> {
+                        type Response = super::Report;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RenewReportClaimRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::renew_report_claim(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RenewReportClaimSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/UnclaimReport" => {
+                    #[allow(non_camel_case_types)]
+                    struct UnclaimReportSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::UnclaimReportRequest>
+                    for UnclaimReportSvc<T> {
+                        type Response = super::Report;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UnclaimReportRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::unclaim_report(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UnclaimReportSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/AssignReport" => {
+                    #[allow(non_camel_case_types)]
+                    struct AssignReportSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::AssignReportRequest>
+                    for AssignReportSvc<T> {
+                        type Response = super::Report;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AssignReportRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::assign_report(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = AssignReportSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/TransferReport" => {
+                    #[allow(non_camel_case_types)]
+                    struct TransferReportSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::TransferReportRequest>
+                    for TransferReportSvc<T> {
+                        type Response = super::Report;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::TransferReportRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::transfer_report(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TransferReportSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/CreateStaffActionRequest" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateStaffActionRequestSvc<T: TrustAndSafetyService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::CreateStaffActionRequestRequest>
+                    for CreateStaffActionRequestSvc<T> {
+                        type Response = super::StaffActionRequest;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::CreateStaffActionRequestRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::create_staff_action_request(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CreateStaffActionRequestSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ResolveStaffActionRequest" => {
+                    #[allow(non_camel_case_types)]
+                    struct ResolveStaffActionRequestSvc<T: TrustAndSafetyService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<
+                        super::ResolveStaffActionRequestRequest,
+                    > for ResolveStaffActionRequestSvc<T> {
+                        type Response = super::StaffActionRequest;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::ResolveStaffActionRequestRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::resolve_staff_action_request(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ResolveStaffActionRequestSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(
