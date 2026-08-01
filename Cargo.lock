@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "polarizer"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "aho-corasick",
  "anyhow",
