@@ -1588,7 +1588,9 @@ impl PolicyRepository for PostgresPolicyRepository {
         action: &Action,
         result: &EvaluationResult,
     ) -> anyhow::Result<PersistOutcome> {
-        let approved_prism_payload = build_approved_prism_payload(action, result)?;
+        let approved_content = build_approved_content(action, result)?;
+        let approved_prism_payload =
+            build_approved_prism_payload(action, result, approved_content.as_deref())?;
         let mut action_without_prism = action.clone();
         action_without_prism.prism_payload = None;
         let action_ciphertext = self
@@ -1695,6 +1697,7 @@ impl PolicyRepository for PostgresPolicyRepository {
             approved_prism_payload: approved_prism_payload.clone(),
             scope: Some(scope_to_proto(&action.scope)),
             subject: Some(subject_to_proto(&action.subject)),
+            approved_content,
         };
         insert_outbox(
             &mut tx,
@@ -1809,9 +1812,62 @@ fn effect_differences(active: &EvaluationResult, shadow: &EvaluationResult) -> s
     serde_json::Value::Array(differences)
 }
 
+fn build_approved_content(
+    action: &Action,
+    result: &EvaluationResult,
+) -> anyhow::Result<Option<String>> {
+    if !matches!(result.decision, Decision::Allow | Decision::Censor) {
+        return Ok(None);
+    }
+    if action.prism_payload.is_none() {
+        return Ok(None);
+    }
+    let content = action
+        .attributes
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("approving decision requires canonical string content"))?;
+    if result.decision == Decision::Allow {
+        return Ok(Some(content.to_owned()));
+    }
+
+    let replacements = censor_replacements(result);
+    anyhow::ensure!(
+        !replacements.is_empty(),
+        "censor decision did not include any character spans"
+    );
+    Ok(Some(apply_censors_to_content(content, replacements)?))
+}
+
+fn censor_replacements(result: &EvaluationResult) -> Vec<(usize, usize, String)> {
+    result
+        .accepted_effects
+        .iter()
+        .filter_map(|emitted| match &emitted.effect {
+            Effect::Censor {
+                spans, replacement, ..
+            } => Some(
+                spans
+                    .iter()
+                    .map(|span| {
+                        (
+                            span.start_character as usize,
+                            span.end_character as usize,
+                            replacement.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 fn build_approved_prism_payload(
     action: &Action,
     result: &EvaluationResult,
+    approved_content: Option<&str>,
 ) -> anyhow::Result<Option<prism::PrismStreamPayload>> {
     if !matches!(result.decision, Decision::Allow | Decision::Censor) {
         return Ok(None);
@@ -1823,44 +1879,50 @@ fn build_approved_prism_payload(
     // Polarizer owns the moderation identity. Never trust a producer-supplied
     // value here: Prism callbacks must correlate to the action we persisted.
     payload.action_id = Some(action.id.to_string());
-    if result.decision == Decision::Censor {
+    let structured_prefix = action
+        .attributes
+        .get("content_prefix")
+        .and_then(serde_json::Value::as_str);
+    if let Some(prefix) = structured_prefix {
+        let mut body: serde_json::Value = serde_json::from_str(&payload.payload)
+            .map_err(|_| anyhow::anyhow!("Prism content payload is not valid JSON"))?;
+        let canonical = approved_content
+            .ok_or_else(|| anyhow::anyhow!("approving decision requires canonical content"))?;
+        if body
+            .get("content")
+            .is_some_and(serde_json::Value::is_string)
+        {
+            body["content"] =
+                serde_json::Value::String(compose_delivery_content(prefix, canonical));
+            payload.payload = serde_json::to_string(&body)?;
+        }
+    } else if result.decision == Decision::Censor {
+        // Rolling-upgrade compatibility for producers that do not yet send
+        // structured presentation metadata. Remove after all producers use it.
         let mut body: serde_json::Value = serde_json::from_str(&payload.payload)
             .map_err(|_| anyhow::anyhow!("Prism content payload is not valid JSON"))?;
         let content = body
             .get("content")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("censor decision requires a string content field"))?;
-        let replacements = result
-            .accepted_effects
-            .iter()
-            .filter_map(|emitted| match &emitted.effect {
-                Effect::Censor {
-                    spans, replacement, ..
-                } => Some(
-                    spans
-                        .iter()
-                        .map(|span| {
-                            (
-                                span.start_character as usize,
-                                span.end_character as usize,
-                                replacement.clone(),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            !replacements.is_empty(),
-            "censor decision did not include any character spans"
-        );
-        body["content"] =
-            serde_json::Value::String(apply_censors_to_content(content, replacements)?);
+        body["content"] = serde_json::Value::String(apply_censors_to_content(
+            content,
+            censor_replacements(result),
+        )?);
         payload.payload = serde_json::to_string(&body)?;
     }
     Ok(Some(payload))
+}
+
+fn compose_delivery_content(prefix: &str, canonical: &str) -> String {
+    const DISCORD_CONTENT_LIMIT: usize = 2_000;
+    let prefix_chars = prefix
+        .chars()
+        .take(DISCORD_CONTENT_LIMIT)
+        .collect::<String>();
+    let remaining = DISCORD_CONTENT_LIMIT.saturating_sub(prefix_chars.chars().count());
+    let body = canonical.chars().take(remaining).collect::<String>();
+    format!("{prefix_chars}{body}")
 }
 
 fn hold_deadline(
@@ -3009,14 +3071,15 @@ fn timestamp(value: chrono::DateTime<Utc>) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionCipher, HeldActionResolution, apply_censors_to_content, build_approved_prism_payload,
-        cloud_event_headers, held_resolution_values, hold_deadline, is_legal_bundle_transition,
-        scope_partition_key, validate_bundle_fields, validate_effect_for_action,
+        ActionCipher, HeldActionResolution, apply_censors_to_content, build_approved_content,
+        build_approved_prism_payload, cloud_event_headers, held_resolution_values, hold_deadline,
+        is_legal_bundle_transition, scope_partition_key, validate_bundle_fields,
+        validate_effect_for_action,
     };
     use crate::contract::prism;
     use crate::policy::model::{
         Action, DataHandlingClass, Decision, Effect, EffectOrigin, EmittedEffect, EvaluationResult,
-        ExecutionTrace, PolicyBundleState, Product, Scope, ScopeType, Subject,
+        ExecutionTrace, PolicyBundleState, Product, Scope, ScopeType, Subject, TextSpan,
     };
     use prost::Message;
     use uuid::Uuid;
@@ -3087,11 +3150,89 @@ mod tests {
             .encode_to_vec(),
         );
 
-        let approved = build_approved_prism_payload(&action, &allow_result(action.id))
+        let approved = build_approved_prism_payload(&action, &allow_result(action.id), Some(""))
             .expect("valid payload")
             .expect("approved payload");
 
         assert_eq!(approved.action_id, Some(action.id.to_string()));
+    }
+
+    #[test]
+    fn legacy_allow_payload_is_unchanged_during_rolling_upgrade() {
+        let mut action = action();
+        action.attributes = serde_json::json!({"content": "canonical"});
+        action.prism_payload = Some(
+            prism::PrismStreamPayload {
+                payload: serde_json::json!({"content": "legacy decorated content"}).to_string(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+
+        let approved =
+            build_approved_prism_payload(&action, &allow_result(action.id), Some("canonical"))
+                .expect("valid payload")
+                .expect("approved payload");
+        let body: serde_json::Value = serde_json::from_str(&approved.payload).unwrap();
+
+        assert_eq!(body["content"], "legacy decorated content");
+    }
+
+    #[test]
+    fn censor_uses_canonical_content_and_structured_prefix() {
+        let mut action = action();
+        let canonical = "hello unsafe\n-# <:developer_badge:2>";
+        let system_prefix = "-# <:staff_badge:1>\n";
+        action.attributes = serde_json::json!({
+            "content": canonical,
+            "content_prefix": system_prefix,
+        });
+        action.prism_payload = Some(
+            prism::PrismStreamPayload {
+                batch_id: "batch-1".into(),
+                action: "execute".into(),
+                payload: serde_json::json!({"content": format!("{system_prefix}{canonical}")})
+                    .to_string(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        );
+        let mut result = allow_result(action.id);
+        result.decision = Decision::Censor;
+        result.accepted_effects.push(EmittedEffect {
+            origin: EffectOrigin {
+                policy_bundle_id: Uuid::now_v7(),
+                policy_version_id: Uuid::now_v7(),
+                rule_id: "rule-1".into(),
+                scope: action.scope.clone(),
+                priority: 1,
+                mandatory: false,
+            },
+            effect: Effect::Censor {
+                effect_id: "censor-1".into(),
+                spans: vec![TextSpan {
+                    start_character: 6,
+                    end_character: 12,
+                }],
+                replacement: "██████".into(),
+                reason_codes: vec![],
+            },
+        });
+
+        let approved_content = build_approved_content(&action, &result)
+            .expect("valid content")
+            .expect("approved content");
+        let approved_payload =
+            build_approved_prism_payload(&action, &result, Some(&approved_content))
+                .expect("valid payload")
+                .expect("approved payload");
+        let body: serde_json::Value = serde_json::from_str(&approved_payload.payload).unwrap();
+
+        assert_eq!(approved_content, "hello ██████\n-# <:developer_badge:2>");
+        assert_eq!(
+            body["content"],
+            "-# <:staff_badge:1>\nhello ██████\n-# <:developer_badge:2>"
+        );
     }
 
     #[test]

@@ -981,6 +981,10 @@ pub struct DecisionPublished {
     pub scope: ::core::option::Option<Scope>,
     #[prost(message, optional, tag = "4")]
     pub subject: ::core::option::Option<Subject>,
+    /// Canonical presentation-free content after accepted policy effects.
+    /// Consumers must never recover canonical content from the delivery payload.
+    #[prost(string, optional, tag = "5")]
+    pub approved_content: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CommandEnvelope {
