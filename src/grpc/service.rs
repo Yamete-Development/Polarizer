@@ -1524,7 +1524,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .await?;
         }
         if let Some((operation, legacy)) = staff_operation {
-            let expiry = restriction.expires_at.clone().map(datetime).transpose()?;
+            let expiry = restriction.expires_at.map(datetime).transpose()?;
             let duration = expiry.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
             match self
                 .authorize_staff(context, operation, legacy, None, duration, expiry.is_none())
@@ -1852,7 +1852,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             } else {
                 Permission::Administrator
             };
-        let expires_at = infraction.expires_at.clone().map(datetime).transpose()?;
+        let expires_at = infraction.expires_at.map(datetime).transpose()?;
         let duration = expires_at.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
         let permanent = expires_at.is_none();
         let staff_operation = if infraction.r#type == v2::InfractionType::Warning as i32
@@ -2239,21 +2239,19 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             {
                 return Err(Status::permission_denied("staff authorization denied"));
             }
-        } else {
-            if self
-                .authorize_staff(
-                    context,
-                    StaffOperation::ViewModerationCases,
-                    Permission::Administrator,
-                    None,
-                    None,
-                    false,
-                )
-                .await?
-                != StaffDecision::Allow
-            {
-                return Err(Status::permission_denied("staff authorization denied"));
-            }
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationCases,
+                Permission::Administrator,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
         }
         let page = request.page.unwrap_or(v2::CursorPage {
             page_size: 50,
@@ -3070,11 +3068,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 return Err(Status::invalid_argument("action type is required"));
             }
         };
-        let expiry = request
-            .requested_expires_at
-            .clone()
-            .map(datetime)
-            .transpose()?;
+        let expiry = request.requested_expires_at.map(datetime).transpose()?;
         let duration = expiry.map(|value| (value - Utc::now()).num_seconds().max(0) as u64);
         let permanent = expiry.is_none();
         if self

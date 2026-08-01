@@ -182,6 +182,7 @@ impl ModerationRepository {
         self.get_restriction(id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_restrictions(
         &self,
         scope: &v2::Scope,
@@ -1017,6 +1018,7 @@ impl ModerationRepository {
         self.get_report(id).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn transfer_report(
         &self,
         context: &v2::RequestContext,
@@ -1064,6 +1066,7 @@ impl ModerationRepository {
         let rows=sqlx::query("SELECT id,action_type,subject_type,subject_id,scope_type::text,scope_id,report_id,requested_reason,requested_expires_at,requested_by,requested_at,status,decided_by,decision_reason,decided_at,executed_infraction_id,executed_restriction_id,expires_at,version FROM trust_safety.staff_action_request WHERE ($1::text IS NULL OR status=$1) AND ($2::text IS NULL OR requested_by=$2) ORDER BY requested_at DESC LIMIT $3").bind(status).bind(requested_by).bind(limit).fetch_all(&self.db).await?;
         rows.iter().map(staff_action_request_from_row).collect()
     }
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_staff_action_request(
         &self,
         context: &v2::RequestContext,
@@ -2316,6 +2319,7 @@ fn timestamp(value: DateTime<Utc>) -> prost_types::Timestamp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_restriction_filters<'args>(
     query: &mut QueryBuilder<'args, Postgres>,
     scope_type: &'args str,
@@ -2425,7 +2429,7 @@ fn push_restriction_cursor(
         "created_at_desc" => {
             query
                 .push(" AND (created_at, id) < (")
-                .push_bind(cursor.created_at.clone())
+                .push_bind(cursor.created_at)
                 .push(", ")
                 .push_bind(cursor.id)
                 .push(")");
@@ -2433,7 +2437,7 @@ fn push_restriction_cursor(
         "created_at_asc" => {
             query
                 .push(" AND (created_at, id) > (")
-                .push_bind(cursor.created_at.clone())
+                .push_bind(cursor.created_at)
                 .push(", ")
                 .push_bind(cursor.id)
                 .push(")");
