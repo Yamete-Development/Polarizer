@@ -24,6 +24,11 @@ pub struct ReportEvidencePage {
     pub snapshot: v2::ReportEvidenceSnapshot,
 }
 
+pub struct ReportSubmissionData {
+    pub context: serde_json::Value,
+    pub terminal_action_id: Option<Uuid>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct RestrictionCursor {
     sort: String,
@@ -824,8 +829,7 @@ impl ModerationRepository {
         subject: &v2::Subject,
         report_type: &str,
         description: &str,
-        report_context: serde_json::Value,
-        terminal_action_id: Option<Uuid>,
+        submission: ReportSubmissionData,
     ) -> anyhow::Result<v2::Report> {
         let scope_type = scope_name(scope.r#type)?;
         let (subject_type, subject_id) = primary_subject(subject, true)?;
@@ -839,7 +843,7 @@ impl ModerationRepository {
             "report description exceeds 4000 characters"
         );
         anyhow::ensure!(
-            serde_json::to_vec(&report_context)?.len() <= 65_536,
+            serde_json::to_vec(&submission.context)?.len() <= 65_536,
             "report context exceeds 64 KiB"
         );
         let id = Uuid::now_v7();
@@ -863,10 +867,10 @@ impl ModerationRepository {
         .bind(subject_id)
         .bind(report_type)
         .bind(description.trim())
-        .bind(report_context)
+        .bind(submission.context)
         .execute(&mut *tx)
         .await?;
-        if let Some(terminal_action_id) = terminal_action_id {
+        if let Some(terminal_action_id) = submission.terminal_action_id {
             anyhow::ensure!(
                 scope_type == "LOBBY",
                 "call evidence is only valid for Lobby reports"

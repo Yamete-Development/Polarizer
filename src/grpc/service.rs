@@ -25,7 +25,7 @@ use crate::{
             trust_and_safety_service_server::TrustAndSafetyService as TrustAndSafetyServiceApi,
         },
     },
-    moderation::ModerationRepository,
+    moderation::{ModerationRepository, ReportSubmissionData},
     nsfw::{
         NsfwOverrideRepository, NsfwOverrideUpdateMask,
         classification_name as nsfw_classification_name,
@@ -275,6 +275,7 @@ impl TrustAndSafetyService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn authorize_hub_or_staff(
         &self,
         context: &v2::RequestContext,
@@ -1995,8 +1996,9 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         } else {
             None
         };
-        if scope.r#type == v2::ScopeType::Hub as i32 && staff_operation.is_some() {
-            let (operation, legacy) = staff_operation.expect("checked above");
+        if scope.r#type == v2::ScopeType::Hub as i32
+            && let Some((operation, legacy)) = staff_operation
+        {
             self.authorize_hub_or_staff(
                 context,
                 "CreateInfraction",
@@ -2305,11 +2307,16 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 &subject,
                 &request.r#type,
                 &request.description,
-                request
-                    .report_context
-                    .map(struct_to_json)
-                    .unwrap_or_else(|| serde_json::json!({})),
-                optional_uuid(&request.terminal_action_id, "terminal_action_id")?,
+                ReportSubmissionData {
+                    context: request
+                        .report_context
+                        .map(struct_to_json)
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    terminal_action_id: optional_uuid(
+                        &request.terminal_action_id,
+                        "terminal_action_id",
+                    )?,
+                },
             )
             .await
             .map_err(resource_error)?;
@@ -2551,8 +2558,8 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             )
             .await?;
         }
-        if scope.r#type != v2::ScopeType::Hub as i32 {
-            if self
+        if scope.r#type != v2::ScopeType::Hub as i32
+            && self
                 .authorize_staff(
                     context,
                     operation,
@@ -2563,9 +2570,8 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 )
                 .await?
                 != StaffDecision::Allow
-            {
-                return Err(Status::permission_denied("staff authorization denied"));
-            }
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
         }
         let result = self
             .moderation
