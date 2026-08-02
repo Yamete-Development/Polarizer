@@ -181,7 +181,8 @@ impl PolicyEngine {
             .flat_map(|policy| policy.version.manifest.required_features.clone())
             .collect::<Vec<_>>();
 
-        let is_message_action = action.action_type.starts_with("hub.message.") || action.action_type.starts_with("lobby.message.");
+        let is_message_action = action.action_type.starts_with("hub.message.")
+            || action.action_type.starts_with("lobby.message.");
         if is_message_action {
             requirements.push(crate::policy::model::FeatureRequirement {
                 name: "restrictions.active".into(),
@@ -226,8 +227,11 @@ impl PolicyEngine {
                                     effect: Effect::Block {
                                         effect_id: Uuid::new_v4().to_string(),
                                         reason_codes: vec![format!("ACTIVE_{}", rtype)],
-                                        public_reason: Some(format!("You have an active {}.", rtype.to_lowercase())),
-                                    }
+                                        public_reason: Some(format!(
+                                            "You have an active {}.",
+                                            rtype.to_lowercase()
+                                        )),
+                                    },
                                 });
                                 break;
                             }
