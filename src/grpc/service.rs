@@ -1750,14 +1750,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 StaffOperation::EditOthersPunishment,
             );
             if self
-                .authorize_staff(
-                    context,
-                    operation,
-                    legacy,
-                    target_staff_id,
-                    None,
-                    false,
-                )
+                .authorize_staff(context, operation, legacy, target_staff_id, None, false)
                 .await?
                 != StaffDecision::Allow
             {
@@ -1867,14 +1860,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 StaffOperation::RemoveOthersPunishment,
             );
             if self
-                .authorize_staff(
-                    context,
-                    operation,
-                    legacy,
-                    target_staff_id,
-                    None,
-                    false,
-                )
+                .authorize_staff(context, operation, legacy, target_staff_id, None, false)
                 .await?
                 != StaffDecision::Allow
             {
@@ -2158,14 +2144,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 StaffOperation::RemoveOthersPunishment,
             );
             if self
-                .authorize_staff(
-                    context,
-                    operation,
-                    legacy,
-                    target_staff_id,
-                    None,
-                    false,
-                )
+                .authorize_staff(context, operation, legacy, target_staff_id, None, false)
                 .await?
                 != StaffDecision::Allow
             {
