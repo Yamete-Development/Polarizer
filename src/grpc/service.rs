@@ -66,6 +66,19 @@ macro_rules! authenticate_request {
     };
 }
 
+fn punishment_operation<'a>(
+    creator_id: &'a str,
+    actor_id: &str,
+    own: StaffOperation,
+    others: StaffOperation,
+) -> (StaffOperation, Option<&'a str>) {
+    if creator_id == actor_id {
+        (own, None)
+    } else {
+        (others, Some(creator_id))
+    }
+}
+
 impl TrustAndSafetyService {
     pub fn new(
         engine: Arc<PolicyEngine>,
@@ -1694,11 +1707,12 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             Permission::ModerateHubMessages
         };
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            let operation = if existing.created_by == context.actor_id {
-                StaffOperation::EditOwnPunishment
-            } else {
-                StaffOperation::EditOthersPunishment
-            };
+            let (operation, target_staff_id) = punishment_operation(
+                &existing.created_by,
+                &context.actor_id,
+                StaffOperation::EditOwnPunishment,
+                StaffOperation::EditOthersPunishment,
+            );
             self.authorize_hub_or_staff(
                 context,
                 "UpdateRestriction",
@@ -1706,7 +1720,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 hub_permission,
                 operation,
                 Permission::HandleLobbyReports,
-                Some(&existing.created_by),
+                target_staff_id,
             )
             .await?;
         } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
@@ -1729,17 +1743,18 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             } else {
                 Permission::HandleLobbyReports
             };
-            let operation = if existing.created_by == context.actor_id {
-                StaffOperation::EditOwnPunishment
-            } else {
-                StaffOperation::EditOthersPunishment
-            };
+            let (operation, target_staff_id) = punishment_operation(
+                &existing.created_by,
+                &context.actor_id,
+                StaffOperation::EditOwnPunishment,
+                StaffOperation::EditOthersPunishment,
+            );
             if self
                 .authorize_staff(
                     context,
                     operation,
                     legacy,
-                    Some(&existing.created_by),
+                    target_staff_id,
                     None,
                     false,
                 )
@@ -1809,11 +1824,12 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             Permission::ModerateHubMessages
         };
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            let operation = if existing.created_by == context.actor_id {
-                StaffOperation::RemoveOwnPunishment
-            } else {
-                StaffOperation::RemoveOthersPunishment
-            };
+            let (operation, target_staff_id) = punishment_operation(
+                &existing.created_by,
+                &context.actor_id,
+                StaffOperation::RemoveOwnPunishment,
+                StaffOperation::RemoveOthersPunishment,
+            );
             self.authorize_hub_or_staff(
                 context,
                 "RevokeRestriction",
@@ -1821,7 +1837,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 hub_permission,
                 operation,
                 Permission::HandleLobbyReports,
-                Some(&existing.created_by),
+                target_staff_id,
             )
             .await?;
         } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
@@ -1844,17 +1860,18 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             } else {
                 Permission::HandleLobbyReports
             };
-            let operation = if existing.created_by == context.actor_id {
-                StaffOperation::RemoveOwnPunishment
-            } else {
-                StaffOperation::RemoveOthersPunishment
-            };
+            let (operation, target_staff_id) = punishment_operation(
+                &existing.created_by,
+                &context.actor_id,
+                StaffOperation::RemoveOwnPunishment,
+                StaffOperation::RemoveOthersPunishment,
+            );
             if self
                 .authorize_staff(
                     context,
                     operation,
                     legacy,
-                    Some(&existing.created_by),
+                    target_staff_id,
                     None,
                     false,
                 )
@@ -2098,11 +2115,12 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .map_err(not_found_or_internal)?;
         let scope = existing.scope.as_ref().expect("stored infraction scope");
         if scope.r#type == v2::ScopeType::Hub as i32 {
-            let operation = if existing.created_by == context.actor_id {
-                StaffOperation::RemoveOwnPunishment
-            } else {
-                StaffOperation::RemoveOthersPunishment
-            };
+            let (operation, target_staff_id) = punishment_operation(
+                &existing.created_by,
+                &context.actor_id,
+                StaffOperation::RemoveOwnPunishment,
+                StaffOperation::RemoveOthersPunishment,
+            );
             self.authorize_hub_or_staff(
                 context,
                 "RevokeInfraction",
@@ -2110,7 +2128,7 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
                 Permission::ModerateHubMessages,
                 operation,
                 Permission::HandleLobbyReports,
-                Some(&existing.created_by),
+                target_staff_id,
             )
             .await?;
         } else if self.staff_authorization_mode != crate::config::StaffAuthorizationMode::Enforce {
@@ -2133,17 +2151,18 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             } else {
                 Permission::HandleLobbyReports
             };
-            let operation = if existing.created_by == context.actor_id {
-                StaffOperation::RemoveOwnPunishment
-            } else {
-                StaffOperation::RemoveOthersPunishment
-            };
+            let (operation, target_staff_id) = punishment_operation(
+                &existing.created_by,
+                &context.actor_id,
+                StaffOperation::RemoveOwnPunishment,
+                StaffOperation::RemoveOthersPunishment,
+            );
             if self
                 .authorize_staff(
                     context,
                     operation,
                     legacy,
-                    Some(&existing.created_by),
+                    target_staff_id,
                     None,
                     false,
                 )
