@@ -174,18 +174,68 @@ impl PolicyEngine {
     ) -> anyhow::Result<EvaluationResult> {
         let started = Instant::now();
         let policies = self.repository.active_policies(action).await?;
-        let requirements = policies
+        let mut requirements = policies
             .iter()
             .filter(|policy| policy.shadow == shadow_only)
             .filter(|policy| policy.version.manifest.accepts(action))
             .flat_map(|policy| policy.version.manifest.required_features.clone())
             .collect::<Vec<_>>();
+
+        let is_message_action = action.action_type.starts_with("hub.message.") || action.action_type.starts_with("lobby.message.");
+        if is_message_action {
+            requirements.push(crate::policy::model::FeatureRequirement {
+                name: "restrictions.active".into(),
+                error_behavior: crate::policy::model::ErrorBehavior::Continue,
+                deadline_ms: 500,
+                maximum_data_handling: action.data_handling,
+                configuration: serde_json::Value::Null,
+            });
+        }
+
         let resolved_features = self.features.resolve(action, &requirements).await;
         let mut emitted = Vec::new();
         let mut rule_traces = Vec::new();
         let mut policy_versions = Vec::new();
         let mut terminal_global_block = false;
         let mut had_error = false;
+
+        if is_message_action {
+            let reqs = vec![crate::policy::model::FeatureRequirement {
+                name: "restrictions.active".into(),
+                error_behavior: crate::policy::model::ErrorBehavior::Continue,
+                deadline_ms: 500,
+                maximum_data_handling: action.data_handling,
+                configuration: serde_json::Value::Null,
+            }];
+            let snapshot = resolved_features.runtime_snapshot(&reqs);
+            if let Some(val) = snapshot.get("restrictions.active") {
+                if let Some(arr) = val.value.as_ref().and_then(|v| v.as_array()) {
+                    for r in arr {
+                        if let Some(rtype) = r.get("restriction_type").and_then(|v| v.as_str()) {
+                            if rtype == "BAN" || rtype == "MUTE" || rtype == "BLACKLIST" {
+                                terminal_global_block = true;
+                                emitted.push(EmittedEffect {
+                                    origin: EffectOrigin {
+                                        policy_bundle_id: Uuid::nil(),
+                                        policy_version_id: Uuid::nil(),
+                                        rule_id: "builtin.moderation".into(),
+                                        scope: action.scope.clone(),
+                                        priority: 1000,
+                                        mandatory: true,
+                                    },
+                                    effect: Effect::Block {
+                                        effect_id: Uuid::new_v4().to_string(),
+                                        reason_codes: vec![format!("ACTIVE_{}", rtype)],
+                                        public_reason: Some(format!("You have an active {}.", rtype.to_lowercase())),
+                                    }
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         for policy in policies {
             if shadow_only && !policy.shadow {
