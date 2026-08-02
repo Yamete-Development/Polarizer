@@ -533,7 +533,10 @@ fn elapsed_micros(started: Instant) -> u64 {
 mod tests {
     use super::*;
     use crate::policy::{
-        features::text::NormalizedTextProvider,
+        features::{
+            FeatureProvider, FeatureRegistry, ProviderCategory, ProviderOutput,
+            text::NormalizedTextProvider,
+        },
         ir::{POLICY_IR_RUNTIME_VERSION, PolicyIrRuntime},
         model::{
             DataHandlingClass, ErrorBehavior, FeatureRequirement, PolicyBundle, PolicyManifest,
@@ -544,6 +547,85 @@ mod tests {
     };
     use chrono::Utc;
     use std::collections::BTreeSet;
+
+    struct ActiveRestrictionProvider {
+        restriction_type: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl FeatureProvider for ActiveRestrictionProvider {
+        fn name(&self) -> &str {
+            "restrictions.active"
+        }
+
+        fn version(&self) -> &str {
+            "test"
+        }
+
+        fn category(&self) -> ProviderCategory {
+            ProviderCategory::State
+        }
+
+        async fn resolve(
+            &self,
+            _action: &Action,
+            _configuration: &serde_json::Value,
+        ) -> Result<ProviderOutput, crate::policy::features::ProviderError> {
+            Ok(ProviderOutput {
+                value: serde_json::json!([{"restriction_type": self.restriction_type}]),
+                cache_hit: false,
+                input_hash: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn message_actions_block_active_bans_and_mutes_without_policy_bundle() {
+        for restriction_type in ["BAN", "MUTE"] {
+            let repo = Arc::new(InMemoryPolicyRepository::default());
+            let features = Arc::new(
+                FeatureRegistry::from_providers([Arc::new(ActiveRestrictionProvider {
+                    restriction_type,
+                }) as Arc<dyn FeatureProvider>])
+                .unwrap(),
+            );
+            let mut engine = PolicyEngine::new(repo, features, 0.0);
+            engine.register_runtime(Arc::new(PolicyIrRuntime));
+
+            let action = Action {
+                id: Uuid::now_v7(),
+                action_type: "hub.message.created".into(),
+                schema_version: 1,
+                scope: Scope {
+                    scope_type: ScopeType::Hub,
+                    id: "hub-1".into(),
+                    product: Some(Product::Hub),
+                },
+                subject: Subject {
+                    user_id: Some("user-1".into()),
+                    server_id: Some("server-1".into()),
+                    ..Subject::default()
+                },
+                occurred_at: Utc::now(),
+                attributes: serde_json::json!({}),
+                data_handling: DataHandlingClass::Sensitive,
+                prism_payload: None,
+            };
+
+            let (result, _) = engine.evaluate(&action, false).await.unwrap();
+
+            assert_eq!(
+                result.decision,
+                Decision::Block,
+                "{restriction_type} must block"
+            );
+            assert!(
+                result
+                    .reason_codes
+                    .contains(&format!("ACTIVE_{restriction_type}"))
+            );
+        }
+    }
 
     #[tokio::test]
     async fn engine_enforces_global_precedence_and_persists_once() {
