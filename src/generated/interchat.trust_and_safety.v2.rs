@@ -345,6 +345,22 @@ pub struct Infraction {
     pub source_report_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ModerationRecord {
+    #[prost(enumeration = "ModerationRecordKind", tag = "1")]
+    pub kind: i32,
+    #[prost(oneof = "moderation_record::Resource", tags = "2, 3")]
+    pub resource: ::core::option::Option<moderation_record::Resource>,
+}
+pub mod moderation_record {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Resource {
+        #[prost(message, tag = "2")]
+        Restriction(super::Restriction),
+        #[prost(message, tag = "3")]
+        Infraction(super::Infraction),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NsfwOverride {
     #[prost(string, tag = "1")]
     pub id: ::prost::alloc::string::String,
@@ -836,6 +852,60 @@ impl RestrictionType {
             "RESTRICTION_TYPE_BAN" => Some(Self::Ban),
             "RESTRICTION_TYPE_BLACKLIST" => Some(Self::Blacklist),
             "RESTRICTION_TYPE_CONTENT_QUARANTINE" => Some(Self::ContentQuarantine),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModerationRecordKind {
+    Unspecified = 0,
+    Blacklist = 1,
+    Warning = 2,
+    LobbyWarning = 3,
+    LobbyBan = 4,
+}
+impl ModerationRecordKind {
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MODERATION_RECORD_KIND_UNSPECIFIED",
+            Self::Blacklist => "MODERATION_RECORD_KIND_BLACKLIST",
+            Self::Warning => "MODERATION_RECORD_KIND_WARNING",
+            Self::LobbyWarning => "MODERATION_RECORD_KIND_LOBBY_WARNING",
+            Self::LobbyBan => "MODERATION_RECORD_KIND_LOBBY_BAN",
+        }
+    }
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODERATION_RECORD_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MODERATION_RECORD_KIND_BLACKLIST" => Some(Self::Blacklist),
+            "MODERATION_RECORD_KIND_WARNING" => Some(Self::Warning),
+            "MODERATION_RECORD_KIND_LOBBY_WARNING" => Some(Self::LobbyWarning),
+            "MODERATION_RECORD_KIND_LOBBY_BAN" => Some(Self::LobbyBan),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModerationResourceType {
+    Unspecified = 0,
+    Restriction = 1,
+    Infraction = 2,
+}
+impl ModerationResourceType {
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MODERATION_RESOURCE_TYPE_UNSPECIFIED",
+            Self::Restriction => "MODERATION_RESOURCE_TYPE_RESTRICTION",
+            Self::Infraction => "MODERATION_RESOURCE_TYPE_INFRACTION",
+        }
+    }
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODERATION_RESOURCE_TYPE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MODERATION_RESOURCE_TYPE_RESTRICTION" => Some(Self::Restriction),
+            "MODERATION_RESOURCE_TYPE_INFRACTION" => Some(Self::Infraction),
             _ => None,
         }
     }
@@ -2174,6 +2244,51 @@ pub struct ListInfractionsResponse {
     pub infractions: ::prost::alloc::vec::Vec<Infraction>,
     #[prost(message, optional, tag = "2")]
     pub page: ::core::option::Option<CursorPageResult>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListModerationRecordsRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(enumeration = "ModerationRecordKind", repeated, tag = "2")]
+    pub kinds: ::prost::alloc::vec::Vec<i32>,
+    #[prost(string, tag = "3")]
+    pub subject_type: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub subject_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub created_by: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub query: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub sort: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "8")]
+    pub page: ::core::option::Option<CursorPage>,
+    #[prost(bool, tag = "9")]
+    pub include_total_count: bool,
+    #[prost(enumeration = "ResourceStatus", tag = "10")]
+    pub status: i32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListModerationRecordsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub records: ::prost::alloc::vec::Vec<ModerationRecord>,
+    #[prost(message, optional, tag = "2")]
+    pub page: ::core::option::Option<CursorPageResult>,
+    #[prost(uint64, tag = "3")]
+    pub total_count: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkModerationRecordReportRequest {
+    #[prost(message, optional, tag = "1")]
+    pub context: ::core::option::Option<RequestContext>,
+    #[prost(enumeration = "ModerationResourceType", tag = "2")]
+    pub resource_type: i32,
+    #[prost(string, tag = "3")]
+    pub record_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub report_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "5")]
+    pub expected_version: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateReportRequest {
@@ -3831,6 +3946,64 @@ pub mod trust_and_safety_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn list_moderation_records(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListModerationRecordsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListModerationRecordsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListModerationRecords",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "ListModerationRecords",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn link_moderation_record_report(
+            &mut self,
+            request: impl tonic::IntoRequest<super::LinkModerationRecordReportRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ModerationRecord>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/LinkModerationRecordReport",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "interchat.trust_and_safety.v2.TrustAndSafetyService",
+                        "LinkModerationRecordReport",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn create_report(
             &mut self,
             request: impl tonic::IntoRequest<super::CreateReportRequest>,
@@ -4739,6 +4912,20 @@ pub mod trust_and_safety_service_server {
             request: tonic::Request<super::ListMyInfractionsRequest>,
         ) -> std::result::Result<
             tonic::Response<super::ListInfractionsResponse>,
+            tonic::Status,
+        >;
+        async fn list_moderation_records(
+            &self,
+            request: tonic::Request<super::ListModerationRecordsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListModerationRecordsResponse>,
+            tonic::Status,
+        >;
+        async fn link_moderation_record_report(
+            &self,
+            request: tonic::Request<super::LinkModerationRecordReportRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ModerationRecord>,
             tonic::Status,
         >;
         async fn create_report(
@@ -6952,6 +7139,104 @@ pub mod trust_and_safety_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ListMyInfractionsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/ListModerationRecords" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListModerationRecordsSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::ListModerationRecordsRequest>
+                    for ListModerationRecordsSvc<T> {
+                        type Response = super::ListModerationRecordsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListModerationRecordsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::list_moderation_records(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ListModerationRecordsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/interchat.trust_and_safety.v2.TrustAndSafetyService/LinkModerationRecordReport" => {
+                    #[allow(non_camel_case_types)]
+                    struct LinkModerationRecordReportSvc<T: TrustAndSafetyService>(pub Arc<T>);
+                    impl<
+                        T: TrustAndSafetyService,
+                    > tonic::server::UnaryService<super::LinkModerationRecordReportRequest>
+                    for LinkModerationRecordReportSvc<T> {
+                        type Response = super::ModerationRecord;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::LinkModerationRecordReportRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TrustAndSafetyService>::link_moderation_record_report(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = LinkModerationRecordReportSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

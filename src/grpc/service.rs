@@ -393,6 +393,37 @@ impl TrustAndSafetyService {
             .map_err(internal)?;
         self.evaluate_safety_assessment_update(&assessment).await
     }
+
+    async fn authorize_moderation_record_link(
+        &self,
+        context: &v2::RequestContext,
+        record: &v2::ModerationRecord,
+    ) -> Result<(), Status> {
+        let (created_by, scope, kind) = moderation_record_authorization_fields(record)?;
+        let (operation, target_staff_id) = punishment_operation(
+            created_by,
+            &context.actor_id,
+            StaffOperation::EditOwnPunishment,
+            StaffOperation::EditOthersPunishment,
+        );
+        let legacy_permission = moderation_record_legacy_permission(kind, scope);
+        if self
+            .authorize_staff(
+                context,
+                operation,
+                legacy_permission,
+                target_staff_id,
+                None,
+                false,
+            )
+            .await?
+            == StaffDecision::Allow
+        {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("staff authorization denied"))
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -2284,6 +2315,92 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             }),
         }))
     }
+    async fn list_moderation_records(
+        &self,
+        request: Request<v2::ListModerationRecordsRequest>,
+    ) -> Result<Response<v2::ListModerationRecordsResponse>, Status> {
+        authenticate_request!(self, request, context, false);
+        if context.actor_type == v2::ActorType::Service as i32 {
+            self.authorizer
+                .authorize(context, "ListModerationRecords", None, None)
+                .await?;
+        } else if self
+            .authorize_staff(
+                context,
+                StaffOperation::ViewModerationRecords,
+                Permission::ViewLogs,
+                None,
+                None,
+                false,
+            )
+            .await?
+            != StaffDecision::Allow
+        {
+            return Err(Status::permission_denied("staff authorization denied"));
+        }
+        let page = request.page.unwrap_or(v2::CursorPage {
+            page_size: 50,
+            cursor: String::new(),
+        });
+        let result = self
+            .moderation
+            .list_moderation_records(
+                &request.kinds,
+                moderation_subject_type_filter(&request.subject_type)?,
+                optional_string_filter(&request.subject_id),
+                optional_string_filter(&request.created_by),
+                optional_string_filter(&request.query),
+                resource_status_filter(request.status)?,
+                &request.sort,
+                &page.cursor,
+                i64::from(page.page_size.max(1)),
+                request.include_total_count,
+            )
+            .await
+            .map_err(resource_error)?;
+        Ok(Response::new(v2::ListModerationRecordsResponse {
+            records: result.items,
+            page: Some(v2::CursorPageResult {
+                next_cursor: result.next_cursor,
+            }),
+            total_count: result.total_count,
+        }))
+    }
+    async fn link_moderation_record_report(
+        &self,
+        request: Request<v2::LinkModerationRecordReportRequest>,
+    ) -> Result<Response<v2::ModerationRecord>, Status> {
+        authenticate_request!(self, request, context, true);
+        let resource_type = v2::ModerationResourceType::try_from(request.resource_type)
+            .map_err(|_| Status::invalid_argument("invalid moderation resource type"))?;
+        if resource_type == v2::ModerationResourceType::Unspecified {
+            return Err(Status::invalid_argument(
+                "moderation resource type is required",
+            ));
+        }
+        let record_id = parse_uuid(&request.record_id, "record_id")?;
+        let report_id = parse_uuid(&request.report_id, "report_id")?;
+        let expected_version = i64::try_from(request.expected_version)
+            .map_err(|_| Status::invalid_argument("expected_version is out of range"))?;
+        let existing = self
+            .moderation
+            .get_moderation_record(resource_type, record_id)
+            .await
+            .map_err(not_found_or_internal)?;
+        self.authorize_moderation_record_link(context, &existing).await?;
+        let result = self
+            .moderation
+            .link_moderation_record_report(
+                context,
+                resource_type,
+                record_id,
+                report_id,
+                expected_version,
+            )
+            .await
+            .map_err(resource_error)?;
+        Ok(Response::new(result))
+    }
     async fn create_report(
         &self,
         request: Request<v2::CreateReportRequest>,
@@ -3600,6 +3717,19 @@ mod authentication_tests {
     }
 
     #[test]
+    fn moderation_record_subject_filter_accepts_known_subject_types_only() {
+        assert_eq!(moderation_subject_type_filter("").unwrap(), None);
+        assert_eq!(moderation_subject_type_filter("USER").unwrap(), Some("USER"));
+        assert_eq!(moderation_subject_type_filter("MESSAGE").unwrap(), Some("MESSAGE"));
+        assert_eq!(
+            moderation_subject_type_filter("CHANNEL")
+                .expect_err("unsupported subject types must be rejected")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[test]
     fn policy_bundle_update_mask_rejects_immutable_fields() {
         let mutable = prost_types::FieldMask {
             paths: vec!["name".into(), "priority".into()],
@@ -4835,6 +4965,7 @@ fn resource_error(error: anyhow::Error) -> Status {
         || message.contains("illegal policy bundle state transition")
         || message.contains("retired policy bundle")
         || message.contains("cannot change after versions are activated")
+        || message.contains("must match")
     {
         Status::failed_precondition(message)
     } else if error
@@ -4867,6 +4998,59 @@ fn optional_uuid_cursor(value: &str) -> Result<Option<Uuid>, Status> {
 
 fn optional_string_filter(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
+}
+
+fn moderation_subject_type_filter(value: &str) -> Result<Option<&str>, Status> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    match value {
+        "USER" | "SERVER" | "MESSAGE" => Ok(Some(value)),
+        _ => Err(Status::invalid_argument(
+            "subject_type must be USER, SERVER, or MESSAGE",
+        )),
+    }
+}
+
+fn moderation_record_authorization_fields(
+    record: &v2::ModerationRecord,
+) -> Result<(&str, &v2::Scope, v2::ModerationRecordKind), Status> {
+    let kind = v2::ModerationRecordKind::try_from(record.kind)
+        .map_err(|_| Status::invalid_argument("invalid moderation record kind"))?;
+    let resource = record
+        .resource
+        .as_ref()
+        .ok_or_else(|| Status::internal("moderation record resource is missing"))?;
+    let (created_by, scope) = match resource {
+        v2::moderation_record::Resource::Restriction(restriction) => (
+            restriction.created_by.as_str(),
+            restriction
+                .scope
+                .as_ref()
+                .ok_or_else(|| Status::internal("moderation record scope is missing"))?,
+        ),
+        v2::moderation_record::Resource::Infraction(infraction) => (
+            infraction.created_by.as_str(),
+            infraction
+                .scope
+                .as_ref()
+                .ok_or_else(|| Status::internal("moderation record scope is missing"))?,
+        ),
+    };
+    Ok((created_by, scope, kind))
+}
+
+fn moderation_record_legacy_permission(
+    kind: v2::ModerationRecordKind,
+    scope: &v2::Scope,
+) -> Permission {
+    if kind == v2::ModerationRecordKind::Blacklist
+        || scope.r#type == v2::ScopeType::Platform as i32
+    {
+        Permission::ManageGlobalBlacklists
+    } else {
+        Permission::HandleLobbyReports
+    }
 }
 
 fn restriction_type_filter(value: i32) -> Result<Option<&'static str>, Status> {

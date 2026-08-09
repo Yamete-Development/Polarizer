@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,12 @@ pub struct Page<T> {
 
 pub struct RestrictionPage {
     pub items: Vec<v2::Restriction>,
+    pub next_cursor: String,
+    pub total_count: u64,
+}
+
+pub struct ModerationRecordPage {
+    pub items: Vec<v2::ModerationRecord>,
     pub next_cursor: String,
     pub total_count: u64,
 }
@@ -35,6 +41,27 @@ struct RestrictionCursor {
     created_at: Option<DateTime<Utc>>,
     expires_at: Option<DateTime<Utc>>,
     id: Uuid,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ModerationRecordCursor {
+    sort: String,
+    created_at: Option<DateTime<Utc>>,
+    expires_at: Option<DateTime<Utc>>,
+    id: Uuid,
+}
+
+struct ModerationLinkTarget {
+    resource_type: &'static str,
+    id: Uuid,
+    subject_type: String,
+    subject_id: String,
+    scope_type: String,
+    scope_id: String,
+    kind: &'static str,
+    source_report_id: Option<Uuid>,
+    version: i64,
+    enforcement_restriction_id: Option<Uuid>,
 }
 
 struct EnforcementInsert {
@@ -738,6 +765,446 @@ impl ModerationRepository {
             .map(infraction_from_row)
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Page { items, next_cursor })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_moderation_records(
+        &self,
+        kinds: &[i32],
+        subject_type: Option<&str>,
+        subject_id: Option<&str>,
+        created_by: Option<&str>,
+        query: Option<&str>,
+        status: Option<&str>,
+        sort: &str,
+        cursor: &str,
+        limit: i64,
+        include_total_count: bool,
+    ) -> anyhow::Result<ModerationRecordPage> {
+        let selected_kinds = moderation_kind_names(kinds)?;
+        let sort = normalize_moderation_record_sort(sort)?;
+        let cursor = parse_moderation_record_cursor(cursor, sort)?;
+        let page_size = limit.clamp(1, 100);
+        let query_pattern = query.map(like_pattern);
+
+        let mut records = QueryBuilder::<Postgres>::new("WITH records AS (");
+        let mut branch_count = 0;
+        if selected_kinds.contains("BLACKLIST") {
+            records.push(
+                "SELECT 'RESTRICTION'::text AS resource_type, 'BLACKLIST'::text AS kind, \
+                 restriction.id, restriction.subject_type, restriction.subject_id, \
+                 restriction.scope_type::text AS scope_type, restriction.scope_id, \
+                 restriction.restriction_type, NULL::text AS infraction_type, \
+                 restriction.status::text AS status, restriction.reason, restriction.created_by, \
+                 restriction.created_at, restriction.expires_at, restriction.version, \
+                 NULL::uuid AS enforcement_restriction_id, restriction.source_report_id \
+                 FROM trust_safety.restriction restriction \
+                 WHERE restriction.scope_type = 'PLATFORM'::trust_safety.scope_type \
+                   AND restriction.restriction_type = 'BLACKLIST'",
+            );
+            branch_count += 1;
+        }
+
+        let include_warning = selected_kinds.contains("WARNING");
+        let include_lobby_warning = selected_kinds.contains("LOBBY_WARNING");
+        let include_lobby_ban = selected_kinds.contains("LOBBY_BAN");
+        if include_warning || include_lobby_warning || include_lobby_ban {
+            if branch_count > 0 {
+                records.push(" UNION ALL ");
+            }
+            records.push(
+                "SELECT 'INFRACTION'::text AS resource_type, \
+                 CASE WHEN infraction.infraction_type = 'WARNING' \
+                      AND infraction.scope_type = 'LOBBY'::trust_safety.scope_type \
+                   THEN 'LOBBY_WARNING' WHEN infraction.infraction_type = 'BAN' \
+                       AND infraction.scope_type = 'PRODUCT'::trust_safety.scope_type \
+                   THEN 'LOBBY_BAN' ELSE 'WARNING' END AS kind, \
+                 infraction.id, infraction.subject_type, infraction.subject_id, \
+                 infraction.scope_type::text AS scope_type, infraction.scope_id, \
+                 NULL::text AS restriction_type, infraction.infraction_type, \
+                 infraction.status::text AS status, infraction.reason, infraction.created_by, \
+                 infraction.created_at, infraction.expires_at, infraction.version, \
+                 infraction.enforcement_restriction_id, infraction.source_report_id \
+                 FROM trust_safety.infraction infraction WHERE (",
+            );
+            let mut condition_count = 0;
+            if include_warning {
+                records.push(
+                    "(infraction.infraction_type = 'WARNING' \
+                      AND infraction.scope_type <> 'LOBBY'::trust_safety.scope_type)",
+                );
+                condition_count += 1;
+            }
+            if include_lobby_warning {
+                if condition_count > 0 {
+                    records.push(" OR ");
+                }
+                records.push(
+                    "(infraction.infraction_type = 'WARNING' \
+                      AND infraction.scope_type = 'LOBBY'::trust_safety.scope_type)",
+                );
+                condition_count += 1;
+            }
+            if include_lobby_ban {
+                if condition_count > 0 {
+                    records.push(" OR ");
+                }
+                records.push(
+                    "(infraction.infraction_type = 'BAN' \
+                      AND infraction.scope_type = 'PRODUCT'::trust_safety.scope_type)",
+                );
+            }
+            records.push(")");
+            branch_count += 1;
+        }
+
+        if branch_count == 0 {
+            records.push(
+                "SELECT NULL::text AS resource_type, NULL::text AS kind, NULL::uuid AS id, \
+                 NULL::text AS subject_type, NULL::text AS subject_id, NULL::text AS scope_type, \
+                 NULL::text AS scope_id, NULL::text AS restriction_type, \
+                 NULL::text AS infraction_type, NULL::text AS status, NULL::text AS reason, \
+                 NULL::text AS created_by, NULL::timestamptz AS created_at, \
+                 NULL::timestamptz AS expires_at, NULL::bigint AS version, \
+                 NULL::uuid AS enforcement_restriction_id, NULL::uuid AS source_report_id \
+                 WHERE FALSE",
+            );
+        }
+
+        records.push("), filtered AS (SELECT records.*");
+        if include_total_count {
+            records.push(", COUNT(*) OVER() AS total_count");
+        } else {
+            records.push(", 0::bigint AS total_count");
+        }
+        records.push(" FROM records WHERE TRUE");
+        push_moderation_record_filters(
+            &mut records,
+            subject_type,
+            subject_id,
+            created_by,
+            query_pattern.as_deref(),
+            status,
+        );
+        records.push(") SELECT resource_type, kind, id, subject_type, subject_id, scope_type, \
+                      scope_id, restriction_type, infraction_type, status, reason, created_by, \
+                      created_at, expires_at, version, enforcement_restriction_id, \
+                      source_report_id, total_count FROM filtered WHERE TRUE");
+        push_moderation_record_cursor(&mut records, sort, cursor.as_ref());
+        records
+            .push(" ORDER BY ")
+            .push(moderation_record_sort_sql(sort))
+            .push(" LIMIT ")
+            .push_bind(page_size + 1);
+
+        let mut rows = records.build().fetch_all(&self.db).await?;
+        let total_count = rows
+            .first()
+            .map(|row| row.try_get::<i64, _>("total_count"))
+            .transpose()?
+            .unwrap_or_default()
+            .max(0) as u64;
+        let has_more = rows.len() > page_size as usize;
+        if has_more {
+            rows.truncate(page_size as usize);
+        }
+        let next_cursor = if has_more {
+            moderation_record_page_cursor(&rows, sort)?
+        } else {
+            String::new()
+        };
+        let items = rows
+            .iter()
+            .map(moderation_record_from_row)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(ModerationRecordPage {
+            items,
+            next_cursor,
+            total_count,
+        })
+    }
+
+    pub async fn get_moderation_record(
+        &self,
+        resource_type: v2::ModerationResourceType,
+        id: Uuid,
+    ) -> anyhow::Result<v2::ModerationRecord> {
+        let row = match resource_type {
+            v2::ModerationResourceType::Restriction => sqlx::query(
+                "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
+                 restriction_type, NULL::text AS infraction_type, status::text, reason, \
+                 created_by, created_at, expires_at, version, NULL::uuid AS enforcement_restriction_id, \
+                 source_report_id, 'RESTRICTION'::text AS resource_type, 'BLACKLIST'::text AS kind \
+                 FROM trust_safety.restriction \
+                 WHERE id = $1 AND scope_type = 'PLATFORM'::trust_safety.scope_type \
+                   AND restriction_type = 'BLACKLIST'",
+            )
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?,
+            v2::ModerationResourceType::Infraction => sqlx::query(
+                "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
+                 NULL::text AS restriction_type, infraction_type, status::text, reason, \
+                 created_by, created_at, expires_at, version, enforcement_restriction_id, \
+                 source_report_id, 'INFRACTION'::text AS resource_type, \
+                 CASE WHEN infraction_type = 'WARNING' \
+                      AND scope_type = 'LOBBY'::trust_safety.scope_type \
+                   THEN 'LOBBY_WARNING' WHEN infraction_type = 'BAN' \
+                      AND scope_type = 'PRODUCT'::trust_safety.scope_type \
+                   THEN 'LOBBY_BAN' ELSE 'WARNING' END AS kind \
+                 FROM trust_safety.infraction \
+                 WHERE id = $1 AND (infraction_type = 'WARNING' \
+                   OR (infraction_type = 'BAN' AND scope_type = 'PRODUCT'::trust_safety.scope_type))",
+            )
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?,
+            v2::ModerationResourceType::Unspecified => {
+                anyhow::bail!("moderation resource type is required")
+            }
+        };
+        moderation_record_from_row(&row)
+    }
+
+    pub async fn link_moderation_record_report(
+        &self,
+        context: &v2::RequestContext,
+        resource_type: v2::ModerationResourceType,
+        record_id: Uuid,
+        report_id: Uuid,
+        expected_version: i64,
+    ) -> anyhow::Result<v2::ModerationRecord> {
+        anyhow::ensure!(expected_version > 0, "expected_version is required");
+        let (resource_name, operation) = match resource_type {
+            v2::ModerationResourceType::Restriction => (
+                "RESTRICTION",
+                "LINK_MODERATION_RECORD_REPORT_RESTRICTION",
+            ),
+            v2::ModerationResourceType::Infraction => (
+                "INFRACTION",
+                "LINK_MODERATION_RECORD_REPORT_INFRACTION",
+            ),
+            v2::ModerationResourceType::Unspecified => {
+                anyhow::bail!("moderation resource type is required")
+            }
+        };
+
+        let mut tx = self.db.begin().await?;
+        if let IdempotencyClaim::Existing(existing) =
+            claim_idempotency(&mut tx, context, operation, record_id).await?
+        {
+            tx.rollback().await?;
+            return self
+                .get_moderation_record(resource_type, existing)
+                .await;
+        }
+
+        let row = match resource_type {
+            v2::ModerationResourceType::Restriction => sqlx::query(
+                "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
+                 restriction_type, NULL::text AS infraction_type, status::text, reason, \
+                 created_by, created_at, expires_at, version, NULL::uuid AS enforcement_restriction_id, \
+                 source_report_id, 'RESTRICTION'::text AS resource_type, 'BLACKLIST'::text AS kind \
+                 FROM trust_safety.restriction \
+                 WHERE id = $1 AND scope_type = 'PLATFORM'::trust_safety.scope_type \
+                   AND restriction_type = 'BLACKLIST' FOR UPDATE",
+            )
+            .bind(record_id)
+            .fetch_one(&mut *tx)
+            .await?,
+            v2::ModerationResourceType::Infraction => sqlx::query(
+                "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
+                 NULL::text AS restriction_type, infraction_type, status::text, reason, \
+                 created_by, created_at, expires_at, version, enforcement_restriction_id, \
+                 source_report_id, 'INFRACTION'::text AS resource_type, \
+                 CASE WHEN infraction_type = 'WARNING' \
+                      AND scope_type = 'LOBBY'::trust_safety.scope_type \
+                   THEN 'LOBBY_WARNING' WHEN infraction_type = 'BAN' \
+                      AND scope_type = 'PRODUCT'::trust_safety.scope_type \
+                   THEN 'LOBBY_BAN' ELSE 'WARNING' END AS kind \
+                 FROM trust_safety.infraction \
+                 WHERE id = $1 AND (infraction_type = 'WARNING' \
+                   OR (infraction_type = 'BAN' AND scope_type = 'PRODUCT'::trust_safety.scope_type)) \
+                 FOR UPDATE",
+            )
+            .bind(record_id)
+            .fetch_one(&mut *tx)
+            .await?,
+            v2::ModerationResourceType::Unspecified => unreachable!(),
+        };
+        let target = moderation_link_target_from_row(&row, resource_type)?;
+        anyhow::ensure!(
+            target.version == expected_version,
+            "moderation record version conflict"
+        );
+
+        let report = sqlx::query(
+            "SELECT subject_type, subject_id, scope_type::text, scope_id \
+             FROM trust_safety.report WHERE id = $1 FOR SHARE",
+        )
+        .bind(report_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let report_subject_type: String = report.try_get("subject_type")?;
+        let report_subject_id: String = report.try_get("subject_id")?;
+        let report_scope_type: String = report.try_get("scope_type")?;
+        let report_scope_id: String = report.try_get("scope_id")?;
+        validate_moderation_record_report_link(
+            &target,
+            &report_subject_type,
+            &report_subject_id,
+            &report_scope_type,
+            &report_scope_id,
+        )?;
+
+        let mut paired = Vec::new();
+        match resource_type {
+            v2::ModerationResourceType::Restriction => {
+                let rows = sqlx::query(
+                    "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
+                     NULL::text AS restriction_type, infraction_type, status::text, reason, \
+                     created_by, created_at, expires_at, version, enforcement_restriction_id, \
+                     source_report_id, 'INFRACTION'::text AS resource_type, \
+                     CASE WHEN infraction_type = 'WARNING' \
+                          AND scope_type = 'LOBBY'::trust_safety.scope_type \
+                       THEN 'LOBBY_WARNING' WHEN infraction_type = 'BAN' \
+                          AND scope_type = 'PRODUCT'::trust_safety.scope_type \
+                       THEN 'LOBBY_BAN' ELSE 'WARNING' END AS kind \
+                     FROM trust_safety.infraction \
+                     WHERE enforcement_restriction_id = $1 FOR UPDATE",
+                )
+                .bind(record_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                for row in rows {
+                    paired.push(moderation_link_target_from_row(
+                        &row,
+                        v2::ModerationResourceType::Infraction,
+                    )?);
+                }
+            }
+            v2::ModerationResourceType::Infraction => {
+                if let Some(enforcement_id) = target.enforcement_restriction_id {
+                    if let Some(row) = sqlx::query(
+                        "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
+                         restriction_type, NULL::text AS infraction_type, status::text, reason, \
+                         created_by, created_at, expires_at, version, NULL::uuid AS enforcement_restriction_id, \
+                         source_report_id, 'RESTRICTION'::text AS resource_type, 'BLACKLIST'::text AS kind \
+                         FROM trust_safety.restriction WHERE id = $1 FOR UPDATE",
+                    )
+                    .bind(enforcement_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    {
+                        paired.push(moderation_link_target_from_row(
+                            &row,
+                            v2::ModerationResourceType::Restriction,
+                        )?);
+                    }
+                }
+            }
+            v2::ModerationResourceType::Unspecified => unreachable!(),
+        }
+        for pair in &paired {
+            anyhow::ensure!(
+                pair.subject_type == target.subject_type && pair.subject_id == target.subject_id,
+                "paired enforcement resource subject must match moderation record subject"
+            );
+        }
+
+        ensure_report_link_is_compatible(
+            target.source_report_id,
+            report_id,
+            "record",
+        )?;
+        for pair in &paired {
+            ensure_report_link_is_compatible(pair.source_report_id, report_id, "paired resource")?;
+        }
+
+        if target.source_report_id.is_none() {
+            let updated = match resource_type {
+                v2::ModerationResourceType::Restriction => sqlx::query(
+                    "UPDATE trust_safety.restriction SET source_report_id = $1, \
+                     version = version + 1, updated_at = clock_timestamp() \
+                     WHERE id = $2 AND version = $3 AND source_report_id IS NULL",
+                )
+                .bind(report_id)
+                .bind(target.id)
+                .bind(target.version)
+                .execute(&mut *tx)
+                .await?,
+                v2::ModerationResourceType::Infraction => sqlx::query(
+                    "UPDATE trust_safety.infraction SET source_report_id = $1, \
+                     version = version + 1, updated_at = clock_timestamp() \
+                     WHERE id = $2 AND version = $3 AND source_report_id IS NULL",
+                )
+                .bind(report_id)
+                .bind(target.id)
+                .bind(target.version)
+                .execute(&mut *tx)
+                .await?,
+                v2::ModerationResourceType::Unspecified => unreachable!(),
+            };
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "moderation record version conflict"
+            );
+            insert_audit(
+                &mut tx,
+                context,
+                "LINK_MODERATION_RECORD_REPORT",
+                resource_name,
+                target.id,
+            )
+            .await?;
+        }
+
+        for pair in &paired {
+            if pair.source_report_id.is_some() {
+                continue;
+            }
+            let updated = match pair.resource_type {
+                "RESTRICTION" => {
+                    sqlx::query(
+                        "UPDATE trust_safety.restriction SET source_report_id = $1, \
+                         version = version + 1, updated_at = clock_timestamp() \
+                         WHERE id = $2 AND version = $3 AND source_report_id IS NULL",
+                    )
+                    .bind(report_id)
+                    .bind(pair.id)
+                    .bind(pair.version)
+                    .execute(&mut *tx)
+                    .await?
+                }
+                "INFRACTION" => {
+                    sqlx::query(
+                        "UPDATE trust_safety.infraction SET source_report_id = $1, \
+                         version = version + 1, updated_at = clock_timestamp() \
+                         WHERE id = $2 AND version = $3 AND source_report_id IS NULL",
+                    )
+                    .bind(report_id)
+                    .bind(pair.id)
+                    .bind(pair.version)
+                    .execute(&mut *tx)
+                    .await?
+                }
+                _ => unreachable!(),
+            };
+            anyhow::ensure!(
+                updated.rows_affected() == 1,
+                "paired enforcement resource version conflict"
+            );
+            insert_audit(
+                &mut tx,
+                context,
+                "LINK_MODERATION_RECORD_REPORT",
+                pair.resource_type,
+                pair.id,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        self.get_moderation_record(resource_type, record_id).await
     }
 
     pub async fn list_execution_traces(
@@ -2641,6 +3108,306 @@ fn restriction_page_cursor(rows: &[sqlx::postgres::PgRow], sort: &str) -> anyhow
     })?)
 }
 
+fn moderation_kind_names(values: &[i32]) -> anyhow::Result<BTreeSet<&'static str>> {
+    let values = if values.is_empty() {
+        vec![
+            v2::ModerationRecordKind::Blacklist,
+            v2::ModerationRecordKind::Warning,
+            v2::ModerationRecordKind::LobbyWarning,
+            v2::ModerationRecordKind::LobbyBan,
+        ]
+    } else {
+        values
+            .iter()
+            .map(|value| v2::ModerationRecordKind::try_from(*value))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            v2::ModerationRecordKind::Blacklist => Ok("BLACKLIST"),
+            v2::ModerationRecordKind::Warning => Ok("WARNING"),
+            v2::ModerationRecordKind::LobbyWarning => Ok("LOBBY_WARNING"),
+            v2::ModerationRecordKind::LobbyBan => Ok("LOBBY_BAN"),
+            v2::ModerationRecordKind::Unspecified => {
+                anyhow::bail!("moderation record kind is required")
+            }
+        })
+        .collect()
+}
+
+fn moderation_record_kind(value: &str) -> anyhow::Result<v2::ModerationRecordKind> {
+    Ok(match value {
+        "BLACKLIST" => v2::ModerationRecordKind::Blacklist,
+        "WARNING" => v2::ModerationRecordKind::Warning,
+        "LOBBY_WARNING" => v2::ModerationRecordKind::LobbyWarning,
+        "LOBBY_BAN" => v2::ModerationRecordKind::LobbyBan,
+        _ => anyhow::bail!("invalid stored moderation record kind"),
+    })
+}
+
+fn classify_infraction_moderation_kind(
+    infraction_type: &str,
+    scope_type: &str,
+) -> Option<&'static str> {
+    match (infraction_type, scope_type) {
+        ("WARNING", "LOBBY") => Some("LOBBY_WARNING"),
+        ("WARNING", _) => Some("WARNING"),
+        ("BAN", "PRODUCT") => Some("LOBBY_BAN"),
+        _ => None,
+    }
+}
+
+fn moderation_record_kind_from_values(
+    resource_type: &str,
+    stored_kind: &str,
+    infraction_type: Option<&str>,
+    scope_type: &str,
+) -> anyhow::Result<v2::ModerationRecordKind> {
+    let kind = if resource_type == "INFRACTION" {
+        infraction_type
+            .and_then(|infraction_type| {
+                classify_infraction_moderation_kind(infraction_type, scope_type)
+            })
+            .unwrap_or(stored_kind)
+    } else {
+        stored_kind
+    };
+    moderation_record_kind(kind)
+}
+
+fn moderation_record_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> anyhow::Result<v2::ModerationRecord> {
+    let resource_type: String = row.try_get("resource_type")?;
+    let stored_kind: String = row.try_get("kind")?;
+    let infraction_type: Option<String> = row.try_get("infraction_type")?;
+    let scope_type: String = row.try_get("scope_type")?;
+    let kind = moderation_record_kind_from_values(
+        &resource_type,
+        &stored_kind,
+        infraction_type.as_deref(),
+        &scope_type,
+    )?;
+    let resource = match resource_type.as_str() {
+        "RESTRICTION" => v2::moderation_record::Resource::Restriction(restriction_from_row(row)?),
+        "INFRACTION" => v2::moderation_record::Resource::Infraction(infraction_from_row(row)?),
+        _ => anyhow::bail!("invalid stored moderation resource type"),
+    };
+    Ok(v2::ModerationRecord {
+        kind: kind as i32,
+        resource: Some(resource),
+    })
+}
+
+fn moderation_link_target_from_row(
+    row: &sqlx::postgres::PgRow,
+    resource_type: v2::ModerationResourceType,
+) -> anyhow::Result<ModerationLinkTarget> {
+    let resource_type_name = match resource_type {
+        v2::ModerationResourceType::Restriction => "RESTRICTION",
+        v2::ModerationResourceType::Infraction => "INFRACTION",
+        v2::ModerationResourceType::Unspecified => {
+            anyhow::bail!("moderation resource type is required")
+        }
+    };
+    let stored_kind: String = row.try_get("kind")?;
+    let infraction_type: Option<String> = row.try_get("infraction_type")?;
+    let scope_type: String = row.try_get("scope_type")?;
+    let kind = moderation_record_kind_from_values(
+        resource_type_name,
+        &stored_kind,
+        infraction_type.as_deref(),
+        &scope_type,
+    )?;
+    Ok(ModerationLinkTarget {
+        resource_type: resource_type_name,
+        id: row.try_get("id")?,
+        subject_type: row.try_get("subject_type")?,
+        subject_id: row.try_get("subject_id")?,
+        scope_type: row.try_get("scope_type")?,
+        scope_id: row.try_get("scope_id")?,
+        kind: match kind {
+            v2::ModerationRecordKind::Blacklist => "BLACKLIST",
+            v2::ModerationRecordKind::Warning => "WARNING",
+            v2::ModerationRecordKind::LobbyWarning => "LOBBY_WARNING",
+            v2::ModerationRecordKind::LobbyBan => "LOBBY_BAN",
+            v2::ModerationRecordKind::Unspecified => unreachable!(),
+        },
+        source_report_id: row.try_get("source_report_id")?,
+        version: row.try_get("version")?,
+        enforcement_restriction_id: row.try_get("enforcement_restriction_id")?,
+    })
+}
+
+fn validate_moderation_record_report_link(
+    target: &ModerationLinkTarget,
+    report_subject_type: &str,
+    report_subject_id: &str,
+    report_scope_type: &str,
+    report_scope_id: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        target.subject_type == report_subject_type && target.subject_id == report_subject_id,
+        "report subject must match moderation record subject"
+    );
+    if matches!(target.kind, "WARNING" | "LOBBY_WARNING") {
+        anyhow::ensure!(
+            target.scope_type == report_scope_type && target.scope_id == report_scope_id,
+            "warning report scope must match moderation record scope"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_report_link_is_compatible(
+    existing_report_id: Option<Uuid>,
+    report_id: Uuid,
+    resource_label: &str,
+) -> anyhow::Result<()> {
+    if let Some(existing_report_id) = existing_report_id {
+        anyhow::ensure!(
+            existing_report_id == report_id,
+            "moderation record link conflict: {resource_label} is linked to a different report"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_moderation_record_filters<'args>(
+    query: &mut QueryBuilder<'args, Postgres>,
+    subject_type: Option<&'args str>,
+    subject_id: Option<&'args str>,
+    created_by: Option<&'args str>,
+    search: Option<&'args str>,
+    status: Option<&'args str>,
+) {
+    if let Some(subject_type) = subject_type {
+        query.push(" AND subject_type = ").push_bind(subject_type);
+    }
+    if let Some(subject_id) = subject_id {
+        query.push(" AND subject_id = ").push_bind(subject_id);
+    }
+    if let Some(created_by) = created_by {
+        query.push(" AND created_by = ").push_bind(created_by);
+    }
+    if let Some(search) = search {
+        query
+            .push(" AND (subject_id ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!' OR scope_id ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!' OR reason ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!' OR created_by ILIKE ")
+            .push_bind(search)
+            .push(" ESCAPE '!')");
+    }
+    if let Some(status) = status {
+        query
+            .push(" AND status = ")
+            .push_bind(status)
+            .push("::trust_safety.resource_status");
+    }
+}
+
+fn normalize_moderation_record_sort(value: &str) -> anyhow::Result<&'static str> {
+    match value {
+        "" | "created_at_desc" => Ok("created_at_desc"),
+        "created_at_asc" => Ok("created_at_asc"),
+        "expires_at_asc" => Ok("expires_at_asc"),
+        _ => anyhow::bail!("unsupported moderation record sort: {value}"),
+    }
+}
+
+fn moderation_record_sort_sql(sort: &str) -> &'static str {
+    match sort {
+        "created_at_asc" => "created_at ASC, id ASC",
+        "expires_at_asc" => "(expires_at IS NULL) ASC, expires_at ASC NULLS LAST, id ASC",
+        _ => "created_at DESC, id DESC",
+    }
+}
+
+fn parse_moderation_record_cursor(
+    value: &str,
+    sort: &str,
+) -> anyhow::Result<Option<ModerationRecordCursor>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let cursor: ModerationRecordCursor = serde_json::from_str(value)?;
+    anyhow::ensure!(
+        cursor.sort == sort,
+        "moderation record cursor sort does not match request"
+    );
+    if matches!(sort, "created_at_desc" | "created_at_asc") {
+        anyhow::ensure!(
+            cursor.created_at.is_some(),
+            "moderation record cursor is missing created_at"
+        );
+    }
+    Ok(Some(cursor))
+}
+
+fn push_moderation_record_cursor(
+    query: &mut QueryBuilder<'_, Postgres>,
+    sort: &str,
+    cursor: Option<&ModerationRecordCursor>,
+) {
+    let Some(cursor) = cursor else {
+        return;
+    };
+    match sort {
+        "created_at_desc" => {
+            query
+                .push(" AND (created_at, id) < (")
+                .push_bind(cursor.created_at)
+                .push(", ")
+                .push_bind(cursor.id)
+                .push(")");
+        }
+        "created_at_asc" => {
+            query
+                .push(" AND (created_at, id) > (")
+                .push_bind(cursor.created_at)
+                .push(", ")
+                .push_bind(cursor.id)
+                .push(")");
+        }
+        "expires_at_asc" => {
+            if let Some(expires_at) = cursor.expires_at {
+                query
+                    .push(" AND ((expires_at IS NOT NULL AND (expires_at, id) > (")
+                    .push_bind(expires_at)
+                    .push(", ")
+                    .push_bind(cursor.id)
+                    .push(")) OR expires_at IS NULL)");
+            } else {
+                query
+                    .push(" AND expires_at IS NULL AND id > ")
+                    .push_bind(cursor.id);
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn moderation_record_page_cursor(
+    rows: &[sqlx::postgres::PgRow],
+    sort: &str,
+) -> anyhow::Result<String> {
+    let Some(row) = rows.last() else {
+        return Ok(String::new());
+    };
+    Ok(serde_json::to_string(&ModerationRecordCursor {
+        sort: sort.to_owned(),
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+        id: row.try_get("id")?,
+    })?)
+}
+
 fn page_cursor(
     rows: &[sqlx::postgres::PgRow],
     requested_limit: i64,
@@ -2659,9 +3426,15 @@ fn page_cursor(
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
     use super::{
-        calculate_safety_score, like_pattern, normalize_restriction_sort, parse_restriction_cursor,
+        calculate_safety_score, classify_infraction_moderation_kind,
+        ensure_report_link_is_compatible, like_pattern, moderation_kind_names,
+        moderation_record_kind_from_values, normalize_moderation_record_sort,
+        normalize_restriction_sort, parse_moderation_record_cursor, parse_restriction_cursor,
+        validate_moderation_record_report_link, ModerationLinkTarget, ModerationRecordCursor,
     };
+    use uuid::Uuid;
 
     #[test]
     fn safety_score_aggregates_repeated_signals_and_mitigation() {
@@ -2710,5 +3483,150 @@ mod tests {
     #[test]
     fn restriction_search_treats_like_metacharacters_literally() {
         assert_eq!(like_pattern("100%_done!"), "%100!%!_done!!%");
+    }
+
+    #[test]
+    fn moderation_record_kinds_default_to_all_supported_sources() {
+        let kinds = moderation_kind_names(&[]).expect("all kinds");
+        assert_eq!(kinds.len(), 4);
+        assert!(kinds.contains("BLACKLIST"));
+        assert!(kinds.contains("WARNING"));
+        assert!(kinds.contains("LOBBY_WARNING"));
+        assert!(kinds.contains("LOBBY_BAN"));
+    }
+
+    #[test]
+    fn moderation_record_kind_classifies_warning_sources_by_scope() {
+        assert_eq!(
+            classify_infraction_moderation_kind("WARNING", "LOBBY"),
+            Some("LOBBY_WARNING")
+        );
+        assert_eq!(
+            classify_infraction_moderation_kind("WARNING", "HUB"),
+            Some("WARNING")
+        );
+        assert_eq!(
+            classify_infraction_moderation_kind("BAN", "PRODUCT"),
+            Some("LOBBY_BAN")
+        );
+        assert_eq!(classify_infraction_moderation_kind("BAN", "LOBBY"), None);
+        assert_eq!(
+            moderation_record_kind_from_values("INFRACTION", "WARNING", Some("BAN"), "PRODUCT")
+                .expect("product ban"),
+            crate::contract::v2::ModerationRecordKind::LobbyBan
+        );
+    }
+
+    #[test]
+    fn moderation_record_sort_accepts_only_documented_orders() {
+        assert_eq!(
+            normalize_moderation_record_sort("").unwrap(),
+            "created_at_desc"
+        );
+        assert_eq!(
+            normalize_moderation_record_sort("expires_at_asc").unwrap(),
+            "expires_at_asc"
+        );
+        assert!(normalize_moderation_record_sort("random").is_err());
+    }
+
+    #[test]
+    fn moderation_record_cursor_requires_matching_sort_and_created_at() {
+        let id = Uuid::now_v7();
+        let cursor = ModerationRecordCursor {
+            sort: "created_at_desc".to_owned(),
+            created_at: Some(Utc.timestamp_opt(1_700_000_000, 0).single().unwrap()),
+            expires_at: None,
+            id,
+        };
+        let encoded = serde_json::to_string(&cursor).expect("cursor encoding");
+        let decoded = parse_moderation_record_cursor(&encoded, "created_at_desc")
+            .expect("cursor decoding")
+            .expect("cursor");
+        assert_eq!(decoded.id, id);
+        assert!(parse_moderation_record_cursor(&encoded, "created_at_asc").is_err());
+
+        let missing_created_at = serde_json::json!({
+            "sort": "created_at_desc",
+            "created_at": null,
+            "expires_at": null,
+            "id": id,
+        })
+        .to_string();
+        assert!(
+            parse_moderation_record_cursor(&missing_created_at, "created_at_desc").is_err()
+        );
+    }
+
+    fn link_target(kind: &'static str, scope_type: &str, scope_id: &str) -> ModerationLinkTarget {
+        ModerationLinkTarget {
+            resource_type: "INFRACTION",
+            id: Uuid::now_v7(),
+            subject_type: "USER".to_owned(),
+            subject_id: "user-1".to_owned(),
+            scope_type: scope_type.to_owned(),
+            scope_id: scope_id.to_owned(),
+            kind,
+            source_report_id: None,
+            version: 1,
+            enforcement_restriction_id: None,
+        }
+    }
+
+    #[test]
+    fn moderation_record_report_link_checks_subject_and_warning_scope() {
+        let blacklist = link_target("BLACKLIST", "PLATFORM", "platform");
+        assert!(validate_moderation_record_report_link(
+            &blacklist,
+            "USER",
+            "user-1",
+            "LOBBY",
+            "lobby-1",
+        )
+        .is_ok());
+
+        let lobby_ban = link_target("LOBBY_BAN", "PRODUCT", "product");
+        assert!(validate_moderation_record_report_link(
+            &lobby_ban,
+            "USER",
+            "user-1",
+            "LOBBY",
+            "lobby-1",
+        )
+        .is_ok());
+
+        let warning = link_target("WARNING", "HUB", "hub-1");
+        assert!(validate_moderation_record_report_link(
+            &warning, "USER", "user-1", "HUB", "hub-1",
+        )
+        .is_ok());
+        assert!(validate_moderation_record_report_link(
+            &warning,
+            "USER",
+            "user-1",
+            "LOBBY",
+            "lobby-1",
+        )
+        .is_err());
+        assert!(validate_moderation_record_report_link(
+            &warning, "USER", "user-2", "HUB", "hub-1",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn moderation_record_report_link_is_idempotent_but_rejects_conflicts() {
+        let report_id = Uuid::now_v7();
+        assert!(ensure_report_link_is_compatible(None, report_id, "record").is_ok());
+        assert!(ensure_report_link_is_compatible(Some(report_id), report_id, "record").is_ok());
+
+        let different_report_id = Uuid::now_v7();
+        let error = ensure_report_link_is_compatible(
+            Some(report_id),
+            different_report_id,
+            "paired resource",
+        )
+        .expect_err("different report links must conflict");
+        assert!(error.to_string().contains("different report"));
     }
 }
