@@ -886,10 +886,12 @@ impl ModerationRepository {
             query_pattern.as_deref(),
             status,
         );
-        records.push(") SELECT resource_type, kind, id, subject_type, subject_id, scope_type, \
+        records.push(
+            ") SELECT resource_type, kind, id, subject_type, subject_id, scope_type, \
                       scope_id, restriction_type, infraction_type, status, reason, created_by, \
                       created_at, expires_at, version, enforcement_restriction_id, \
-                      source_report_id, total_count FROM filtered WHERE TRUE");
+                      source_report_id, total_count FROM filtered WHERE TRUE",
+        );
         push_moderation_record_cursor(&mut records, sort, cursor.as_ref());
         records
             .push(" ORDER BY ")
@@ -976,14 +978,12 @@ impl ModerationRepository {
     ) -> anyhow::Result<v2::ModerationRecord> {
         anyhow::ensure!(expected_version > 0, "expected_version is required");
         let (resource_name, operation) = match resource_type {
-            v2::ModerationResourceType::Restriction => (
-                "RESTRICTION",
-                "LINK_MODERATION_RECORD_REPORT_RESTRICTION",
-            ),
-            v2::ModerationResourceType::Infraction => (
-                "INFRACTION",
-                "LINK_MODERATION_RECORD_REPORT_INFRACTION",
-            ),
+            v2::ModerationResourceType::Restriction => {
+                ("RESTRICTION", "LINK_MODERATION_RECORD_REPORT_RESTRICTION")
+            }
+            v2::ModerationResourceType::Infraction => {
+                ("INFRACTION", "LINK_MODERATION_RECORD_REPORT_INFRACTION")
+            }
             v2::ModerationResourceType::Unspecified => {
                 anyhow::bail!("moderation resource type is required")
             }
@@ -994,9 +994,7 @@ impl ModerationRepository {
             claim_idempotency(&mut tx, context, operation, record_id).await?
         {
             tx.rollback().await?;
-            return self
-                .get_moderation_record(resource_type, existing)
-                .await;
+            return self.get_moderation_record(resource_type, existing).await;
         }
 
         let row = match resource_type {
@@ -1112,37 +1110,37 @@ impl ModerationRepository {
             );
         }
 
-        ensure_report_link_is_compatible(
-            target.source_report_id,
-            report_id,
-            "record",
-        )?;
+        ensure_report_link_is_compatible(target.source_report_id, report_id, "record")?;
         for pair in &paired {
             ensure_report_link_is_compatible(pair.source_report_id, report_id, "paired resource")?;
         }
 
         if target.source_report_id.is_none() {
             let updated = match resource_type {
-                v2::ModerationResourceType::Restriction => sqlx::query(
-                    "UPDATE trust_safety.restriction SET source_report_id = $1, \
+                v2::ModerationResourceType::Restriction => {
+                    sqlx::query(
+                        "UPDATE trust_safety.restriction SET source_report_id = $1, \
                      version = version + 1, updated_at = clock_timestamp() \
                      WHERE id = $2 AND version = $3 AND source_report_id IS NULL",
-                )
-                .bind(report_id)
-                .bind(target.id)
-                .bind(target.version)
-                .execute(&mut *tx)
-                .await?,
-                v2::ModerationResourceType::Infraction => sqlx::query(
-                    "UPDATE trust_safety.infraction SET source_report_id = $1, \
+                    )
+                    .bind(report_id)
+                    .bind(target.id)
+                    .bind(target.version)
+                    .execute(&mut *tx)
+                    .await?
+                }
+                v2::ModerationResourceType::Infraction => {
+                    sqlx::query(
+                        "UPDATE trust_safety.infraction SET source_report_id = $1, \
                      version = version + 1, updated_at = clock_timestamp() \
                      WHERE id = $2 AND version = $3 AND source_report_id IS NULL",
-                )
-                .bind(report_id)
-                .bind(target.id)
-                .bind(target.version)
-                .execute(&mut *tx)
-                .await?,
+                    )
+                    .bind(report_id)
+                    .bind(target.id)
+                    .bind(target.version)
+                    .execute(&mut *tx)
+                    .await?
+                }
                 v2::ModerationResourceType::Unspecified => unreachable!(),
             };
             anyhow::ensure!(
@@ -3176,9 +3174,7 @@ fn moderation_record_kind_from_values(
     moderation_record_kind(kind)
 }
 
-fn moderation_record_from_row(
-    row: &sqlx::postgres::PgRow,
-) -> anyhow::Result<v2::ModerationRecord> {
+fn moderation_record_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<v2::ModerationRecord> {
     let resource_type: String = row.try_get("resource_type")?;
     let stored_kind: String = row.try_get("kind")?;
     let infraction_type: Option<String> = row.try_get("infraction_type")?;
@@ -3426,14 +3422,15 @@ fn page_cursor(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
     use super::{
-        calculate_safety_score, classify_infraction_moderation_kind,
-        ensure_report_link_is_compatible, like_pattern, moderation_kind_names,
-        moderation_record_kind_from_values, normalize_moderation_record_sort,
-        normalize_restriction_sort, parse_moderation_record_cursor, parse_restriction_cursor,
-        validate_moderation_record_report_link, ModerationLinkTarget, ModerationRecordCursor,
+        ModerationLinkTarget, ModerationRecordCursor, calculate_safety_score,
+        classify_infraction_moderation_kind, ensure_report_link_is_compatible, like_pattern,
+        moderation_kind_names, moderation_record_kind_from_values,
+        normalize_moderation_record_sort, normalize_restriction_sort,
+        parse_moderation_record_cursor, parse_restriction_cursor,
+        validate_moderation_record_report_link,
     };
+    use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
     #[test]
@@ -3553,9 +3550,7 @@ mod tests {
             "id": id,
         })
         .to_string();
-        assert!(
-            parse_moderation_record_cursor(&missing_created_at, "created_at_desc").is_err()
-        );
+        assert!(parse_moderation_record_cursor(&missing_created_at, "created_at_desc").is_err());
     }
 
     fn link_target(kind: &'static str, scope_type: &str, scope_id: &str) -> ModerationLinkTarget {
@@ -3576,42 +3571,34 @@ mod tests {
     #[test]
     fn moderation_record_report_link_checks_subject_and_warning_scope() {
         let blacklist = link_target("BLACKLIST", "PLATFORM", "platform");
-        assert!(validate_moderation_record_report_link(
-            &blacklist,
-            "USER",
-            "user-1",
-            "LOBBY",
-            "lobby-1",
-        )
-        .is_ok());
+        assert!(
+            validate_moderation_record_report_link(
+                &blacklist, "USER", "user-1", "LOBBY", "lobby-1",
+            )
+            .is_ok()
+        );
 
         let lobby_ban = link_target("LOBBY_BAN", "PRODUCT", "product");
-        assert!(validate_moderation_record_report_link(
-            &lobby_ban,
-            "USER",
-            "user-1",
-            "LOBBY",
-            "lobby-1",
-        )
-        .is_ok());
+        assert!(
+            validate_moderation_record_report_link(
+                &lobby_ban, "USER", "user-1", "LOBBY", "lobby-1",
+            )
+            .is_ok()
+        );
 
         let warning = link_target("WARNING", "HUB", "hub-1");
-        assert!(validate_moderation_record_report_link(
-            &warning, "USER", "user-1", "HUB", "hub-1",
-        )
-        .is_ok());
-        assert!(validate_moderation_record_report_link(
-            &warning,
-            "USER",
-            "user-1",
-            "LOBBY",
-            "lobby-1",
-        )
-        .is_err());
-        assert!(validate_moderation_record_report_link(
-            &warning, "USER", "user-2", "HUB", "hub-1",
-        )
-        .is_err());
+        assert!(
+            validate_moderation_record_report_link(&warning, "USER", "user-1", "HUB", "hub-1",)
+                .is_ok()
+        );
+        assert!(
+            validate_moderation_record_report_link(&warning, "USER", "user-1", "LOBBY", "lobby-1",)
+                .is_err()
+        );
+        assert!(
+            validate_moderation_record_report_link(&warning, "USER", "user-2", "HUB", "hub-1",)
+                .is_err()
+        );
     }
 
     #[test]

@@ -2387,7 +2387,8 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
             .get_moderation_record(resource_type, record_id)
             .await
             .map_err(not_found_or_internal)?;
-        self.authorize_moderation_record_link(context, &existing).await?;
+        self.authorize_moderation_record_link(context, &existing)
+            .await?;
         let result = self
             .moderation
             .link_moderation_record_report(
@@ -3719,8 +3720,14 @@ mod authentication_tests {
     #[test]
     fn moderation_record_subject_filter_accepts_known_subject_types_only() {
         assert_eq!(moderation_subject_type_filter("").unwrap(), None);
-        assert_eq!(moderation_subject_type_filter("USER").unwrap(), Some("USER"));
-        assert_eq!(moderation_subject_type_filter("MESSAGE").unwrap(), Some("MESSAGE"));
+        assert_eq!(
+            moderation_subject_type_filter("USER").unwrap(),
+            Some("USER")
+        );
+        assert_eq!(
+            moderation_subject_type_filter("MESSAGE").unwrap(),
+            Some("MESSAGE")
+        );
         assert_eq!(
             moderation_subject_type_filter("CHANNEL")
                 .expect_err("unsupported subject types must be rejected")
@@ -5044,8 +5051,7 @@ fn moderation_record_legacy_permission(
     kind: v2::ModerationRecordKind,
     scope: &v2::Scope,
 ) -> Permission {
-    if kind == v2::ModerationRecordKind::Blacklist
-        || scope.r#type == v2::ScopeType::Platform as i32
+    if kind == v2::ModerationRecordKind::Blacklist || scope.r#type == v2::ScopeType::Platform as i32
     {
         Permission::ManageGlobalBlacklists
     } else {
