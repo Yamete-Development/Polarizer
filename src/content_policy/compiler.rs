@@ -217,7 +217,7 @@ impl CompiledPolicySnapshot {
                     .rule_names
                     .get(&matched.rule_name)
                     .copied()
-                    .ok_or_else(|| PolicyMatchError::UnknownRule(matched.rule_id))?;
+                    .ok_or(PolicyMatchError::UnknownRule(matched.rule_id))?;
                 let rule = self
                     .rules
                     .get(&rule_id)

@@ -231,16 +231,21 @@ impl ContentPolicyInvalidationConsumer {
         &self,
         invalidation: &ParsedContentPolicyInvalidation,
     ) -> anyhow::Result<()> {
-        for attempt in 0..=RELOAD_RETRY_DELAYS.len() {
+        // One attempt per retry delay, plus a final attempt with no delay after it.
+        let schedule = RELOAD_RETRY_DELAYS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None));
+        for (attempt, retry_delay) in schedule.enumerate() {
             match self
                 .runtime
                 .reload_scope(&invalidation.scope, invalidation.version)
                 .await
             {
                 Ok(_) => return Ok(()),
-                Err(ReloadError::VersionNotVisible { loaded, .. })
-                    if attempt < RELOAD_RETRY_DELAYS.len() =>
-                {
+                Err(ReloadError::VersionNotVisible { loaded, .. }) if retry_delay.is_some() => {
+                    let delay = retry_delay.unwrap_or_default();
                     debug!(
                         scope = ?invalidation.scope,
                         expected_version = invalidation.version,
@@ -252,7 +257,7 @@ impl ContentPolicyInvalidationConsumer {
                         _ = self.cancel.cancelled() => {
                             anyhow::bail!("content policy invalidation cancelled during retry")
                         }
-                        _ = tokio::time::sleep(RELOAD_RETRY_DELAYS[attempt]) => {}
+                        _ = tokio::time::sleep(delay) => {}
                     }
                 }
                 Err(error) => {
