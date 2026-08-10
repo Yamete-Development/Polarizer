@@ -64,6 +64,7 @@ pub struct AppConfig {
     pub command_topic: String,
     pub command_result_topic: String,
     pub policy_invalidation_topic: String,
+    pub content_policy_invalidation_topic: String,
     pub staff_authorization_change_topic: String,
     pub prism_topic: String,
     pub delivery_callback_topic: String,
@@ -169,6 +170,10 @@ impl AppConfig {
             policy_invalidation_topic: optional(
                 "KAFKA_POLICY_INVALIDATION_TOPIC",
                 "events.trust-safety.policy.invalidated.v2",
+            ),
+            content_policy_invalidation_topic: optional(
+                "KAFKA_CONTENT_POLICY_INVALIDATION_TOPIC",
+                "events.trust-safety.content-policy.invalidated.v1",
             ),
             staff_authorization_change_topic: optional(
                 "KAFKA_STAFF_AUTHZ_CHANGE_TOPIC",

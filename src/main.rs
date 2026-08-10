@@ -5,6 +5,12 @@ use polarizer::{
     auth::Authorizer,
     command::CommandRepository,
     config::{AppConfig, MigrationConfig},
+    content_policy::{
+        ContentPolicyEvaluator, ContentPolicyRuntime, PolicyLimits, PolicySnapshotStore,
+        SideEffectCooldown,
+        invalidation::{ContentPolicyInvalidationConsumer, ContentPolicyReconciliationTask},
+        repository::{ContentPolicySource, PostgresContentPolicyRepository},
+    },
     db,
     eventbus::{
         self, ActionConsumer, DeliveryCallbackConsumer, OutboxRelay,
@@ -51,6 +57,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let repository = Arc::new(PostgresPolicyRepository::new(db.clone(), &config)?);
+    let content_policy_repository = Arc::new(PostgresContentPolicyRepository::new(
+        db.clone(),
+        config.content_policy_invalidation_topic.clone(),
+    ));
+    let content_policy_source: Arc<dyn ContentPolicySource> = content_policy_repository;
+    let content_policy_snapshots = Arc::new(PolicySnapshotStore::new());
+    let content_policy_runtime = Arc::new(ContentPolicyRuntime::new(
+        content_policy_source,
+        content_policy_snapshots.clone(),
+        PolicyLimits::default(),
+    ));
+    let loaded_content_policy_scopes = content_policy_runtime
+        .bootstrap()
+        .await
+        .context("native content policy bootstrap failed")?;
+    info!(
+        loaded_content_policy_scopes,
+        "native content policies compiled"
+    );
     let moderation = Arc::new(ModerationRepository::new(db.clone()));
     let commands = Arc::new(CommandRepository::new(
         db.clone(),
@@ -66,6 +91,10 @@ async fn main() -> anyhow::Result<()> {
         config.clean_allow_trace_sample_rate,
     );
     engine.register_runtime(Arc::new(PolicyIrRuntime));
+    engine.register_content_policy(Arc::new(ContentPolicyEvaluator::new(
+        content_policy_snapshots,
+        Arc::new(SideEffectCooldown::new()),
+    )));
     engine.register_runtime(Arc::new(LuauRuntime::new(
         config.policy_worker_bin.clone(),
         config.policy_worker_count,
@@ -114,6 +143,15 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(DeliveryCallbackConsumer::new(&config, repository.clone(), cancel.clone())?.run());
     tasks.spawn(StaffAuthorizationChangeConsumer::new(&config, db.clone(), cancel.clone())?.run());
     tasks.spawn(OutboxRelay::new(db.clone(), &config, cancel.clone())?.run());
+    tasks.spawn(
+        ContentPolicyInvalidationConsumer::new(
+            &config,
+            content_policy_runtime.clone(),
+            cancel.clone(),
+        )?
+        .run(),
+    );
+    tasks.spawn(ContentPolicyReconciliationTask::new(content_policy_runtime, cancel.clone()).run());
     tasks.spawn(eventbus::policy_activation_worker(
         repository.clone(),
         engine,

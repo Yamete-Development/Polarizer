@@ -4,8 +4,17 @@ use std::{
     time::Instant,
 };
 
+use prost::Message;
 use rand::Rng;
 use uuid::Uuid;
+
+use crate::{
+    content_policy::{
+        AnalyzedContent, ContentPolicyEvaluator, ContentPolicyPlan, Destination, PolicyActionType,
+        Presentation, SenderFeedback, SideEffectRequest,
+    },
+    contract::prism,
+};
 
 use super::{
     features::FeatureRegistry,
@@ -25,6 +34,7 @@ pub struct PolicyEngine {
     repository: Arc<dyn PolicyRepository>,
     features: Arc<FeatureRegistry>,
     runtimes: HashMap<PolicyLanguage, Arc<dyn PolicyRuntime>>,
+    content_policy: Option<Arc<ContentPolicyEvaluator>>,
     clean_allow_sample_rate: f64,
 }
 
@@ -38,8 +48,13 @@ impl PolicyEngine {
             repository,
             features,
             runtimes: HashMap::new(),
+            content_policy: None,
             clean_allow_sample_rate,
         }
+    }
+
+    pub fn register_content_policy(&mut self, evaluator: Arc<ContentPolicyEvaluator>) {
+        self.content_policy = Some(evaluator);
     }
 
     pub fn register_runtime(&mut self, runtime: Arc<dyn PolicyRuntime>) {
@@ -157,6 +172,12 @@ impl PolicyEngine {
         if outcome == PersistOutcome::Duplicate {
             return Ok((active, None, outcome));
         }
+        // Native message policy is authoritative for Hub/Call content. Do not
+        // query or execute the legacy script-policy shadow path for the same
+        // action after the hot-path snapshot evaluation has completed.
+        if active.content_policy.is_some() {
+            return Ok((active, None, outcome));
+        }
         let shadow = self.evaluate_result(action, true).await?;
         if shadow.trace.policy_versions.is_empty() {
             return Ok((active, None, outcome));
@@ -173,7 +194,16 @@ impl PolicyEngine {
         shadow_only: bool,
     ) -> anyhow::Result<EvaluationResult> {
         let started = Instant::now();
-        let policies = self.repository.active_policies(action).await?;
+        let content_policy = if shadow_only {
+            None
+        } else {
+            self.evaluate_content_policy(action)?
+        };
+        let policies = if content_policy.is_some() {
+            Vec::new()
+        } else {
+            self.repository.active_policies(action).await?
+        };
         let mut requirements = policies
             .iter()
             .filter(|policy| policy.shadow == shadow_only)
@@ -183,7 +213,7 @@ impl PolicyEngine {
 
         let is_message_action = action.action_type.starts_with("hub.message.")
             || action.action_type.starts_with("lobby.message.");
-        if is_message_action {
+        if is_message_action && content_policy.is_none() {
             requirements.push(crate::policy::model::FeatureRequirement {
                 name: "restrictions.active".into(),
                 error_behavior: crate::policy::model::ErrorBehavior::Continue,
@@ -200,7 +230,11 @@ impl PolicyEngine {
         let mut terminal_global_block = false;
         let mut had_error = false;
 
-        if is_message_action {
+        if let Some(plan) = content_policy.as_ref() {
+            emitted.extend(content_policy_effects(action, plan));
+        }
+
+        if is_message_action && content_policy.is_none() {
             let reqs = vec![crate::policy::model::FeatureRequirement {
                 name: "restrictions.active".into(),
                 error_behavior: crate::policy::model::ErrorBehavior::Continue,
@@ -480,8 +514,444 @@ impl PolicyEngine {
                 created_at: chrono::Utc::now(),
                 sampled,
             },
+            content_policy,
         };
         Ok(result)
+    }
+
+    fn evaluate_content_policy(
+        &self,
+        action: &Action,
+    ) -> anyhow::Result<Option<ContentPolicyPlan>> {
+        let Some(evaluator) = self.content_policy.as_ref() else {
+            return Ok(None);
+        };
+        let is_hub_message = action.action_type.starts_with("hub.message.");
+        let is_call_message = action.action_type.starts_with("lobby.message.");
+        if (!is_hub_message && !is_call_message)
+            || action
+                .attributes
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Ok(None);
+        }
+
+        let presentation = presentation_from_action(action);
+        let analyzed = AnalyzedContent::from_presentation(&presentation);
+        let subject_id = action.subject.user_id.as_deref().unwrap_or("anonymous");
+        if is_call_message {
+            return Ok(Some(ContentPolicyPlan::Call(evaluator.evaluate_call(
+                subject_id,
+                &presentation,
+                &analyzed,
+            )?)));
+        }
+
+        let destinations = action
+            .prism_payload
+            .as_deref()
+            .map(prism::PrismStreamPayload::decode)
+            .transpose()?
+            .map(|payload| {
+                payload
+                    .targets
+                    .into_iter()
+                    .enumerate()
+                    .map(|(target_index, target)| Destination {
+                        target_index,
+                        server_id: target.guild_id.unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(Some(ContentPolicyPlan::Hub(evaluator.evaluate_hub(
+            subject_id,
+            &action.scope.id,
+            &presentation,
+            &analyzed,
+            &destinations,
+        )?)))
+    }
+}
+
+fn presentation_from_action(action: &Action) -> Presentation {
+    let field = |name: &str| {
+        Arc::<str>::from(
+            action
+                .attributes
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )
+    };
+    Presentation {
+        message_content: field("content"),
+        display_name: field("display_name"),
+        username: field("username"),
+        server_name: field("server_name"),
+        hub_name: field("hub_name"),
+        ..Presentation::default()
+    }
+}
+
+fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<EmittedEffect> {
+    let (blocked_by, side_effects, feedback, feedback_attribution) = match plan {
+        ContentPolicyPlan::Hub(plan) => {
+            let blocked_by = if plan.global.delivery.is_blocked() {
+                &plan.global.delivery.blocked_by
+            } else {
+                &plan.hub.delivery.blocked_by
+            };
+            let feedback_attribution = blocked_by.first().or_else(|| {
+                plan.destinations
+                    .iter()
+                    .find_map(|destination| destination.blocked_by.first())
+            });
+            (
+                blocked_by.as_slice(),
+                plan.side_effects.as_slice(),
+                plan.sender_feedback.as_ref(),
+                feedback_attribution,
+            )
+        }
+        ContentPolicyPlan::Call(plan) => (
+            plan.global.delivery.blocked_by.as_slice(),
+            plan.side_effects.as_slice(),
+            plan.sender_feedback.as_ref(),
+            plan.global.delivery.blocked_by.first(),
+        ),
+    };
+
+    let mut emitted = Vec::new();
+    if let Some(attribution) = blocked_by.first() {
+        emitted.push(native_emitted(
+            attribution,
+            scope_from_native(&attribution.scope),
+            Effect::Block {
+                effect_id: format!("content-policy:block:{}", attribution.rule_id),
+                reason_codes: vec![format!(
+                    "CONTENT_POLICY_{}_BLOCK",
+                    authority_name(attribution.scope.authority)
+                )],
+                public_reason: attribution.custom_reason.clone(),
+            },
+        ));
+    }
+    if let ContentPolicyPlan::Hub(plan) = plan
+        && matches!(
+            plan.sender_feedback,
+            Some(SenderFeedback::ServerFilters { .. })
+        )
+        && let Some(attribution) = feedback_attribution
+    {
+        emitted.push(native_emitted(
+            attribution,
+            action.scope.clone(),
+            Effect::Allow {
+                effect_id: format!("content-policy:server-filter:{}", action.id),
+                reason_codes: vec!["CONTENT_POLICY_SERVER_FILTERED".into()],
+            },
+        ));
+    }
+    for request in side_effects {
+        emitted.extend(native_side_effects(action, request, plan));
+    }
+    if let (Some(feedback), Some(user_id)) = (feedback, action.subject.user_id.as_deref()) {
+        let (template, reason, parameters) = sender_feedback(feedback);
+        let attribution =
+            feedback_attribution.or_else(|| side_effects.first().map(|item| &item.attribution));
+        if let Some(attribution) = attribution {
+            emitted.push(native_emitted(
+                attribution,
+                action.scope.clone(),
+                Effect::Notify {
+                    effect_id: format!("content-policy:notify:{}", action.id),
+                    recipient: user_id.to_owned(),
+                    template: template.to_owned(),
+                    parameters: serde_json::json!({
+                        "reason": reason,
+                        "filtered_destinations": parameters,
+                    }),
+                },
+            ));
+        }
+    }
+    emitted
+}
+
+fn native_side_effects(
+    action: &Action,
+    request: &SideEffectRequest,
+    plan: &ContentPolicyPlan,
+) -> Vec<EmittedEffect> {
+    let duration_ms = request
+        .duration_seconds
+        .and_then(|value| value.checked_mul(1_000));
+    let reason = request
+        .attribution
+        .custom_reason
+        .clone()
+        .unwrap_or_else(|| {
+            format!(
+                "Matched content policy rule {}",
+                request.attribution.rule_name
+            )
+        });
+    let subject = action.subject.clone();
+    let action_scope = action.scope.clone();
+    let platform_scope = super::model::Scope {
+        scope_type: ScopeType::Platform,
+        id: String::new(),
+        product: None,
+    };
+    let make =
+        |scope: super::model::Scope, effect| native_emitted(&request.attribution, scope, effect);
+    let id = |suffix: &str| {
+        format!(
+            "content-policy:{}:{}:{suffix}",
+            request.attribution.rule_id, action.id
+        )
+    };
+
+    match request.action_type {
+        PolicyActionType::Log => vec![make(
+            action_scope,
+            Effect::Flag {
+                effect_id: id("log"),
+                flag_type: "CONTENT_POLICY_LOG".into(),
+                severity: 50.0,
+                evidence: serde_json::json!({
+                    "policy_id": request.attribution.policy_id,
+                    "policy_version": request.attribution.policy_version,
+                    "rule_id": request.attribution.rule_id,
+                    "rule_name": request.attribution.rule_name,
+                    "custom_reason": request.attribution.custom_reason,
+                    "action": policy_action_name(request.action_type),
+                    "original_content": action.attributes
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                    "transformed_content": representative_transformed_content(plan),
+                    "scope_authority": authority_name(request.attribution.scope.authority),
+                    "scope_id": request.attribution.scope.id,
+                }),
+            },
+        )],
+        PolicyActionType::HubWarn if action.scope.scope_type == ScopeType::Hub => vec![make(
+            action_scope,
+            Effect::CreateInfraction {
+                effect_id: id("hub-warning"),
+                subject,
+                infraction_type: "WARNING".into(),
+                reason,
+                duration_ms,
+            },
+        )],
+        PolicyActionType::HubMute if action.scope.scope_type == ScopeType::Hub => vec![
+            make(
+                action_scope.clone(),
+                Effect::CreateInfraction {
+                    effect_id: id("hub-mute-infraction"),
+                    subject: subject.clone(),
+                    infraction_type: "MUTE".into(),
+                    reason: reason.clone(),
+                    duration_ms,
+                },
+            ),
+            make(
+                action_scope,
+                Effect::CreateRestriction {
+                    effect_id: id("hub-mute-restriction"),
+                    subject,
+                    restriction_type: "MUTE".into(),
+                    reason,
+                    duration_ms,
+                },
+            ),
+        ],
+        PolicyActionType::HubBan if action.scope.scope_type == ScopeType::Hub => vec![
+            make(
+                action_scope.clone(),
+                Effect::CreateInfraction {
+                    effect_id: id("hub-ban-infraction"),
+                    subject: subject.clone(),
+                    infraction_type: "BAN".into(),
+                    reason: reason.clone(),
+                    duration_ms,
+                },
+            ),
+            make(
+                action_scope,
+                Effect::CreateRestriction {
+                    effect_id: id("hub-ban-restriction"),
+                    subject,
+                    restriction_type: "BAN".into(),
+                    reason,
+                    duration_ms,
+                },
+            ),
+        ],
+        PolicyActionType::LobbyWarn if action.scope.scope_type == ScopeType::Lobby => vec![make(
+            action_scope,
+            Effect::CreateInfraction {
+                effect_id: id("lobby-warning"),
+                subject,
+                infraction_type: "WARNING".into(),
+                reason,
+                duration_ms,
+            },
+        )],
+        PolicyActionType::LobbyBan if action.scope.scope_type == ScopeType::Lobby => vec![
+            make(
+                action_scope.clone(),
+                Effect::CreateInfraction {
+                    effect_id: id("lobby-ban-infraction"),
+                    subject: subject.clone(),
+                    infraction_type: "BAN".into(),
+                    reason: reason.clone(),
+                    duration_ms,
+                },
+            ),
+            make(
+                action_scope,
+                Effect::CreateRestriction {
+                    effect_id: id("lobby-ban-restriction"),
+                    subject,
+                    restriction_type: "BAN".into(),
+                    reason,
+                    duration_ms,
+                },
+            ),
+        ],
+        PolicyActionType::Blacklist => vec![make(
+            platform_scope,
+            Effect::CreateRestriction {
+                effect_id: id("blacklist"),
+                subject,
+                restriction_type: "BLACKLIST".into(),
+                reason,
+                duration_ms,
+            },
+        )],
+        _ => Vec::new(),
+    }
+}
+
+fn representative_transformed_content(plan: &ContentPolicyPlan) -> String {
+    match plan {
+        ContentPolicyPlan::Call(plan) => plan
+            .variant
+            .as_ref()
+            .map(|variant| variant.message_content.to_string())
+            .unwrap_or_default(),
+        ContentPolicyPlan::Hub(plan) => {
+            let mut variants = plan.variants.values();
+            let Some(first) = variants.next() else {
+                return String::new();
+            };
+            if variants.all(|variant| {
+                variant.message_content.as_ref() == first.message_content.as_ref()
+            }) {
+                first.message_content.to_string()
+            } else {
+                "<varies by destination policy>".to_owned()
+            }
+        }
+    }
+}
+
+const fn policy_action_name(action: PolicyActionType) -> &'static str {
+    match action {
+        PolicyActionType::Allow => "ALLOW",
+        PolicyActionType::Block => "BLOCK",
+        PolicyActionType::CensorMatch => "CENSOR_MATCH",
+        PolicyActionType::StripLink => "STRIP_LINK",
+        PolicyActionType::SuppressLinks => "SUPPRESS_LINKS",
+        PolicyActionType::ReplaceName => "REPLACE_NAME",
+        PolicyActionType::Log => "LOG",
+        PolicyActionType::LobbyWarn => "LOBBY_WARN",
+        PolicyActionType::LobbyBan => "LOBBY_BAN",
+        PolicyActionType::Blacklist => "BLACKLIST",
+        PolicyActionType::HubWarn => "HUB_WARN",
+        PolicyActionType::HubMute => "HUB_MUTE",
+        PolicyActionType::HubBan => "HUB_BAN",
+    }
+}
+
+fn native_emitted(
+    attribution: &crate::content_policy::resolver::EffectAttribution,
+    scope: super::model::Scope,
+    effect: Effect,
+) -> EmittedEffect {
+    EmittedEffect {
+        origin: EffectOrigin {
+            policy_bundle_id: attribution.policy_id,
+            policy_version_id: Uuid::nil(),
+            rule_id: attribution.rule_id.to_string(),
+            scope,
+            priority: 2_000 - i32::from(attribution.scope.authority.precedence()),
+            mandatory: true,
+        },
+        effect,
+    }
+}
+
+fn scope_from_native(scope: &crate::content_policy::PolicyScope) -> super::model::Scope {
+    match scope.authority {
+        crate::content_policy::Authority::Global => super::model::Scope {
+            scope_type: ScopeType::Platform,
+            id: String::new(),
+            product: None,
+        },
+        crate::content_policy::Authority::Hub => super::model::Scope {
+            scope_type: ScopeType::Hub,
+            id: scope.id.clone(),
+            product: Some(super::model::Product::Hub),
+        },
+        crate::content_policy::Authority::Server => super::model::Scope {
+            scope_type: ScopeType::Platform,
+            id: scope.id.clone(),
+            product: None,
+        },
+    }
+}
+
+fn authority_name(authority: crate::content_policy::Authority) -> &'static str {
+    match authority {
+        crate::content_policy::Authority::Global => "GLOBAL",
+        crate::content_policy::Authority::Hub => "HUB",
+        crate::content_policy::Authority::Server => "SERVER",
+    }
+}
+
+fn sender_feedback(feedback: &SenderFeedback) -> (&'static str, String, String) {
+    match feedback {
+        SenderFeedback::GlobalSafetyBlock => (
+            "Message blocked by InterChat safety",
+            "Your message was blocked by an InterChat safety policy.".into(),
+            String::new(),
+        ),
+        SenderFeedback::CallSafetyBlock => (
+            "Call message blocked by InterChat safety",
+            "Your call message was blocked by an InterChat safety policy.".into(),
+            String::new(),
+        ),
+        SenderFeedback::HubModerationBlock { custom_reason } => (
+            "Message blocked by hub moderation",
+            custom_reason.clone().unwrap_or_else(|| {
+                "Your message was blocked by this hub's moderation policy.".into()
+            }),
+            String::new(),
+        ),
+        SenderFeedback::ServerFilters { destination_count } => (
+            "Message filtered by destination servers",
+            format!(
+                "Your message was withheld from {destination_count} destination server(s) by their local filters."
+            ),
+            destination_count.to_string(),
+        ),
     }
 }
 

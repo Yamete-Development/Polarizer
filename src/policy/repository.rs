@@ -60,7 +60,7 @@ pub enum PersistOutcome {
     Duplicate,
 }
 
-enum PolicyIdempotencyClaim {
+pub(crate) enum PolicyIdempotencyClaim {
     Claimed,
     Existing(Uuid),
 }
@@ -1737,6 +1737,7 @@ impl PolicyRepository for PostgresPolicyRepository {
         }
 
         let state = match result.decision {
+            Decision::Allow | Decision::Censor if approved_prism_payload.is_none() => "ACTIVE",
             Decision::Allow | Decision::Censor => "APPROVED_PENDING_DELIVERY",
             Decision::Hold => "HELD",
             Decision::Block => "BLOCKED",
@@ -1987,7 +1988,118 @@ fn build_approved_prism_payload(
         )?);
         payload.payload = serde_json::to_string(&body)?;
     }
+    if let Some(plan) = result.content_policy.as_ref() {
+        apply_content_policy_plan(action, &mut payload, plan)?;
+        if payload.targets.is_empty() {
+            return Ok(None);
+        }
+    }
     Ok(Some(payload))
+}
+
+fn apply_content_policy_plan(
+    action: &Action,
+    payload: &mut prism::PrismStreamPayload,
+    plan: &crate::content_policy::ContentPolicyPlan,
+) -> anyhow::Result<()> {
+    let structured_prefix = action
+        .attributes
+        .get("content_prefix")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match plan {
+        crate::content_policy::ContentPolicyPlan::Call(plan) => {
+            let Some(variant) = plan.variant.as_ref() else {
+                payload.targets.clear();
+                return Ok(());
+            };
+            let mut body: serde_json::Value = serde_json::from_str(&payload.payload)
+                .map_err(|_| anyhow::anyhow!("Prism content payload is not valid JSON"))?;
+            apply_delivery_variant(action, &mut body, structured_prefix, variant);
+            payload.payload = serde_json::to_string(&body)?;
+        }
+        crate::content_policy::ContentPolicyPlan::Hub(plan) => {
+            let decisions = plan
+                .destinations
+                .iter()
+                .map(|decision| (decision.target_index, decision))
+                .collect::<HashMap<_, _>>();
+            let mut retained = Vec::with_capacity(payload.targets.len());
+            for (target_index, mut target) in payload.targets.drain(..).enumerate() {
+                let Some(decision) = decisions.get(&target_index) else {
+                    // A target without a policy decision is unsafe to deliver:
+                    // the decoded target set is the evaluator's exact input.
+                    continue;
+                };
+                if decision.is_blocked() {
+                    continue;
+                }
+                let fingerprint = decision.variant_fingerprint.ok_or_else(|| {
+                    anyhow::anyhow!("allowed content-policy destination has no delivery variant")
+                })?;
+                let variant = plan
+                    .variants
+                    .get(&fingerprint)
+                    .ok_or_else(|| anyhow::anyhow!("content-policy delivery variant is missing"))?;
+                let mut overrides = target
+                    .overrides
+                    .as_deref()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .transpose()
+                    .map_err(|_| anyhow::anyhow!("Prism target overrides are not valid JSON"))?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                anyhow::ensure!(
+                    overrides.is_object(),
+                    "Prism target overrides must be a JSON object"
+                );
+                apply_delivery_variant(action, &mut overrides, structured_prefix, variant);
+                target.overrides = Some(serde_json::to_string(&overrides)?);
+                retained.push(target);
+            }
+            payload.targets = retained;
+        }
+    }
+    Ok(())
+}
+
+fn apply_delivery_variant(
+    action: &Action,
+    body: &mut serde_json::Value,
+    prefix: &str,
+    variant: &crate::content_policy::DeliveryVariant,
+) {
+    body["content"] =
+        serde_json::Value::String(compose_delivery_content(prefix, &variant.message_content));
+
+    let changed_name = [
+        ("display_name", variant.display_name.as_ref()),
+        ("username", variant.username.as_ref()),
+        ("server_name", variant.server_name.as_ref()),
+        ("hub_name", variant.hub_name.as_ref()),
+    ]
+    .into_iter()
+    .find_map(|(field, transformed)| {
+        let original = action
+            .attributes
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        (original != transformed).then_some(transformed)
+    });
+    if let Some(name) = changed_name {
+        body["username"] = serde_json::Value::String(if name.is_empty() {
+            crate::content_policy::delivery::DEFAULT_SAFE_NAME.to_owned()
+        } else {
+            name.to_owned()
+        });
+    }
+    if variant.suppress_links {
+        let flags = body
+            .get("flags")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        body["flags"] = serde_json::Value::from(flags | 4);
+    }
 }
 
 fn compose_delivery_content(prefix: &str, canonical: &str) -> String {
@@ -2098,7 +2210,14 @@ async fn apply_effect(
     validate_effect_for_action(effect, action)?;
     let action_scope_type = scope_name(action.scope.scope_type);
     let action_scope_id = &action.scope.id;
-    let policy_actor = format!("policy:{}", emitted.origin.policy_version_id);
+    let policy_actor = if emitted.origin.policy_version_id.is_nil() {
+        format!(
+            "content-policy:{}:rule:{}",
+            emitted.origin.policy_bundle_id, emitted.origin.rule_id
+        )
+    } else {
+        format!("policy:{}", emitted.origin.policy_version_id)
+    };
     match effect {
         Effect::CreateRestriction {
             subject,
@@ -2108,6 +2227,10 @@ async fn apply_effect(
             ..
         } => {
             let (subject_type, subject_id) = primary_subject(subject)?;
+            let effect_scope_type = scope_name(emitted.origin.scope.scope_type);
+            let effect_scope_id = &emitted.origin.scope.id;
+            let source_policy_version_id = (!emitted.origin.policy_version_id.is_nil())
+                .then_some(emitted.origin.policy_version_id);
             let expires_at = duration_ms
                 .map(|duration| Utc::now() + chrono::Duration::milliseconds(duration as i64));
             let restriction_id: Uuid = sqlx::query_scalar(
@@ -2122,12 +2245,12 @@ async fn apply_effect(
             )
             .bind(subject_type)
             .bind(subject_id)
-            .bind(action_scope_type)
-            .bind(action_scope_id)
+            .bind(effect_scope_type)
+            .bind(effect_scope_id)
             .bind(restriction_type)
             .bind(reason)
             .bind(action.id)
-            .bind(emitted.origin.policy_version_id)
+            .bind(source_policy_version_id)
             .bind(&policy_actor)
             .bind(expires_at)
             .fetch_one(&mut **tx)
@@ -2150,6 +2273,10 @@ async fn apply_effect(
             ..
         } => {
             let (subject_type, subject_id) = primary_subject(subject)?;
+            let effect_scope_type = scope_name(emitted.origin.scope.scope_type);
+            let effect_scope_id = &emitted.origin.scope.id;
+            let source_policy_version_id = (!emitted.origin.policy_version_id.is_nil())
+                .then_some(emitted.origin.policy_version_id);
             let expires_at = duration_ms
                 .map(|duration| Utc::now() + chrono::Duration::milliseconds(duration as i64));
             let infraction_id: Uuid = sqlx::query_scalar(
@@ -2159,12 +2286,12 @@ async fn apply_effect(
             )
             .bind(subject_type)
             .bind(subject_id)
-            .bind(action_scope_type)
-            .bind(action_scope_id)
+            .bind(effect_scope_type)
+            .bind(effect_scope_id)
             .bind(infraction_type)
             .bind(reason)
             .bind(action.id)
-            .bind(emitted.origin.policy_version_id)
+            .bind(source_policy_version_id)
             .bind(&policy_actor)
             .bind(expires_at)
             .fetch_one(&mut **tx)
@@ -2181,8 +2308,8 @@ async fn apply_effect(
                     tx,
                     subject_type,
                     subject_id,
-                    action_scope_type,
-                    action_scope_id,
+                    effect_scope_type,
+                    effect_scope_id,
                     &format!("INFRACTION_{infraction_type}"),
                     signal_value,
                     false,
@@ -2733,7 +2860,7 @@ async fn register_command(
     Ok(())
 }
 
-async fn insert_outbox(
+pub(crate) async fn insert_outbox(
     tx: &mut Transaction<'_, Postgres>,
     aggregate_type: &str,
     aggregate_id: Uuid,
@@ -2762,7 +2889,7 @@ fn cloud_event_headers(event_type: &str) -> serde_json::Value {
     })
 }
 
-async fn insert_audit(
+pub(crate) async fn insert_audit(
     tx: &mut Transaction<'_, Postgres>,
     context: &v2::RequestContext,
     action: &str,
@@ -2778,7 +2905,7 @@ async fn insert_audit(
     Ok(())
 }
 
-async fn claim_policy_idempotency(
+pub(crate) async fn claim_policy_idempotency(
     tx: &mut Transaction<'_, Postgres>,
     context: &v2::RequestContext,
     operation: &str,
@@ -3193,6 +3320,7 @@ mod tests {
             accepted_effects: Vec::new(),
             rejected_effects: Vec::new(),
             shadow: false,
+            content_policy: None,
             trace: ExecutionTrace {
                 id: Uuid::now_v7(),
                 action_id,

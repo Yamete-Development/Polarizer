@@ -411,4 +411,9 @@ pub struct EvaluationResult {
     pub rejected_effects: Vec<RejectedEffect>,
     pub trace: ExecutionTrace,
     pub shadow: bool,
+    /// Runtime-only delivery plan produced by the native content engine. Its
+    /// relational attribution is persisted through accepted effects and the
+    /// transformed variants are applied only while building the Prism job.
+    #[serde(skip, default)]
+    pub content_policy: Option<crate::content_policy::ContentPolicyPlan>,
 }

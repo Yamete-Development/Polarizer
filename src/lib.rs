@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod command;
 pub mod config;
+pub mod content_policy;
 pub mod contract;
 pub mod db;
 pub mod eventbus;
