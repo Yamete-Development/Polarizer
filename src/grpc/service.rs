@@ -2,7 +2,10 @@
 // type instead of introducing wrapper conversions solely to reduce its size.
 #![allow(clippy::result_large_err)]
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use chrono::{TimeZone, Utc};
 use sha2::{Digest, Sha256};
@@ -11,9 +14,14 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    auth::{Authorizer, Permission},
+    auth::{Authorizer, MANAGE_GLOBAL_CONTENT_POLICY_PERMISSION, Permission},
     command::{
         ClaimState, CommandCompletion, CommandOutcome, CommandRepository, CommandRepositoryError,
+    },
+    content_policy::{
+        Authority as ContentAuthority, ContentPolicy, PolicyAction, PolicyActionType, PolicyLimits,
+        PolicyRule, PolicyScope, RulePattern, Surface as ContentSurface, WildcardPatternType,
+        repository::{ContentPolicySource, PostgresContentPolicyRepository},
     },
     contract::{
         authz::v2::{AuthorizationDecision as StaffDecision, StaffOperation},
@@ -45,6 +53,7 @@ use crate::{
 pub struct TrustAndSafetyService {
     engine: Arc<PolicyEngine>,
     repository: Arc<PostgresPolicyRepository>,
+    content_policy_repository: Arc<PostgresContentPolicyRepository>,
     authorizer: Arc<Authorizer>,
     moderation: Arc<ModerationRepository>,
     commands: Arc<CommandRepository>,
@@ -83,6 +92,7 @@ impl TrustAndSafetyService {
     pub fn new(
         engine: Arc<PolicyEngine>,
         repository: Arc<PostgresPolicyRepository>,
+        content_policy_repository: Arc<PostgresContentPolicyRepository>,
         authorizer: Arc<Authorizer>,
         moderation: Arc<ModerationRepository>,
         commands: Arc<CommandRepository>,
@@ -92,6 +102,7 @@ impl TrustAndSafetyService {
         Self {
             engine,
             repository,
+            content_policy_repository,
             authorizer,
             moderation,
             commands,
@@ -131,6 +142,36 @@ impl TrustAndSafetyService {
                     .authorize(context, method, None, Some(Permission::Administrator))
                     .await
             }
+        }
+    }
+
+    async fn authorize_content_policy_scope(
+        &self,
+        context: &v2::RequestContext,
+        method: &str,
+        scope: &PolicyScope,
+    ) -> Result<(), Status> {
+        match scope.authority {
+            ContentAuthority::Global => {
+                self.authorizer
+                    .authorize_staff_permission(
+                        context,
+                        method,
+                        MANAGE_GLOBAL_CONTENT_POLICY_PERMISSION,
+                    )
+                    .await
+            }
+            ContentAuthority::Hub => {
+                self.authorizer
+                    .authorize(
+                        context,
+                        method,
+                        Some(&scope.id),
+                        Some(Permission::ManageRules),
+                    )
+                    .await
+            }
+            ContentAuthority::Server => self.authorizer.authorize_user_submission(context, method),
         }
     }
 
@@ -558,6 +599,59 @@ impl TrustAndSafetyServiceApi for TrustAndSafetyService {
         Ok(Response::new(v2::CompleteCommandResponse {
             result: Some(completion_result_to_proto(command_id, &completion)),
             version: completion.version.max(0) as u64,
+        }))
+    }
+
+    async fn get_content_policy(
+        &self,
+        request: Request<v2::GetContentPolicyRequest>,
+    ) -> Result<Response<v2::GetContentPolicyResponse>, Status> {
+        authenticate_request!(self, request, context, false);
+        let scope = content_policy_scope_from_proto(
+            request
+                .scope
+                .ok_or_else(|| Status::invalid_argument("scope is required"))?,
+        )?;
+        self.authorize_content_policy_scope(context, "GetContentPolicy", &scope)
+            .await?;
+        let limits = PolicyLimits::default();
+        let policy = self
+            .content_policy_repository
+            .load_scope(&scope)
+            .await
+            .map_err(internal)?;
+        Ok(Response::new(v2::GetContentPolicyResponse {
+            policy: policy.as_ref().map(content_policy_to_proto),
+            pattern_limit: limits.maximum_patterns(scope.authority) as u32,
+        }))
+    }
+
+    async fn replace_content_policy(
+        &self,
+        request: Request<v2::ReplaceContentPolicyRequest>,
+    ) -> Result<Response<v2::ReplaceContentPolicyResponse>, Status> {
+        authenticate_request!(self, request, context, true);
+        let mut policy = content_policy_from_proto(
+            request
+                .policy
+                .ok_or_else(|| Status::invalid_argument("policy is required"))?,
+            &context.actor_id,
+        )?;
+        self.authorize_content_policy_scope(context, "ReplaceContentPolicy", &policy.scope)
+            .await?;
+        policy.version = request
+            .expected_version
+            .checked_add(1)
+            .ok_or_else(|| Status::invalid_argument("expected_version is out of range"))?;
+        let limits = PolicyLimits::default();
+        let policy = self
+            .content_policy_repository
+            .replace_policy(&policy, request.expected_version, limits, context)
+            .await
+            .map_err(content_policy_error)?;
+        Ok(Response::new(v2::ReplaceContentPolicyResponse {
+            policy: Some(content_policy_to_proto(&policy)),
+            pattern_limit: limits.maximum_patterns(policy.scope.authority) as u32,
         }))
     }
 
@@ -4860,10 +4954,311 @@ fn completion_result_to_proto(
     }
 }
 
+fn content_policy_scope_from_proto(scope: v2::ContentPolicyScope) -> Result<PolicyScope, Status> {
+    let authority = match v2::ContentPolicyAuthority::try_from(scope.authority)
+        .map_err(|_| Status::invalid_argument("invalid content policy authority"))?
+    {
+        v2::ContentPolicyAuthority::Global => ContentAuthority::Global,
+        v2::ContentPolicyAuthority::Hub => ContentAuthority::Hub,
+        v2::ContentPolicyAuthority::Server => ContentAuthority::Server,
+        v2::ContentPolicyAuthority::Unspecified => {
+            return Err(Status::invalid_argument(
+                "content policy authority is required",
+            ));
+        }
+    };
+    let scope = PolicyScope {
+        authority,
+        id: scope.id,
+    };
+    scope.validate().map_err(Status::invalid_argument)?;
+    Ok(scope)
+}
+
+fn content_policy_from_proto(
+    policy: v2::NativeContentPolicy,
+    actor_id: &str,
+) -> Result<ContentPolicy, Status> {
+    let scope = content_policy_scope_from_proto(
+        policy
+            .scope
+            .ok_or_else(|| Status::invalid_argument("policy scope is required"))?,
+    )?;
+    Ok(ContentPolicy {
+        id: parse_uuid(&policy.id, "policy.id")?,
+        scope,
+        enabled: policy.enabled,
+        version: policy.version,
+        rules: policy
+            .rules
+            .into_iter()
+            .map(|rule| content_rule_from_proto(rule, actor_id))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn content_rule_from_proto(
+    rule: v2::NativeContentRule,
+    actor_id: &str,
+) -> Result<PolicyRule, Status> {
+    let surfaces = rule
+        .surfaces
+        .into_iter()
+        .map(content_surface_from_proto)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(PolicyRule {
+        id: parse_uuid(&rule.id, "rule.id")?,
+        name: rule.name,
+        description: rule.description,
+        enabled: rule.enabled,
+        custom_reason: (!rule.custom_reason.trim().is_empty()).then_some(rule.custom_reason),
+        created_by: if rule.created_by.trim().is_empty() {
+            actor_id.to_owned()
+        } else {
+            rule.created_by
+        },
+        patterns: rule
+            .patterns
+            .into_iter()
+            .map(|pattern| {
+                Ok(RulePattern {
+                    id: parse_uuid(&pattern.id, "pattern.id")?,
+                    pattern: pattern.pattern,
+                    // The repository validates and atomically reclassifies authored syntax.
+                    pattern_type: WildcardPatternType::ExactWord,
+                })
+            })
+            .collect::<Result<_, Status>>()?,
+        surfaces,
+        actions: rule
+            .actions
+            .into_iter()
+            .map(content_action_from_proto)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn content_action_from_proto(action: v2::NativeContentAction) -> Result<PolicyAction, Status> {
+    let action_type = match v2::ContentPolicyActionType::try_from(action.r#type)
+        .map_err(|_| Status::invalid_argument("invalid content policy action"))?
+    {
+        v2::ContentPolicyActionType::Allow => PolicyActionType::Allow,
+        v2::ContentPolicyActionType::Block => PolicyActionType::Block,
+        v2::ContentPolicyActionType::CensorMatch => PolicyActionType::CensorMatch,
+        v2::ContentPolicyActionType::StripLink => PolicyActionType::StripLink,
+        v2::ContentPolicyActionType::SuppressLinks => PolicyActionType::SuppressLinks,
+        v2::ContentPolicyActionType::ReplaceName => PolicyActionType::ReplaceName,
+        v2::ContentPolicyActionType::Log => PolicyActionType::Log,
+        v2::ContentPolicyActionType::LobbyWarn => PolicyActionType::LobbyWarn,
+        v2::ContentPolicyActionType::LobbyBan => PolicyActionType::LobbyBan,
+        v2::ContentPolicyActionType::Blacklist => PolicyActionType::Blacklist,
+        v2::ContentPolicyActionType::HubWarn => PolicyActionType::HubWarn,
+        v2::ContentPolicyActionType::HubMute => PolicyActionType::HubMute,
+        v2::ContentPolicyActionType::HubBan => PolicyActionType::HubBan,
+        v2::ContentPolicyActionType::Unspecified => {
+            return Err(Status::invalid_argument(
+                "content policy action is required",
+            ));
+        }
+    };
+    let duration_seconds = action
+        .duration
+        .map(|duration| {
+            if duration.seconds <= 0 || duration.nanos != 0 {
+                return Err(Status::invalid_argument(
+                    "content policy action duration must be positive whole seconds",
+                ));
+            }
+            u64::try_from(duration.seconds)
+                .map_err(|_| Status::invalid_argument("action duration is out of range"))
+        })
+        .transpose()?;
+    Ok(PolicyAction {
+        id: parse_uuid(&action.id, "action.id")?,
+        action_type,
+        duration_seconds,
+        replacement: (!action.replacement.trim().is_empty()).then_some(action.replacement),
+    })
+}
+
+fn content_surface_from_proto(value: i32) -> Result<ContentSurface, Status> {
+    match v2::ContentPolicySurface::try_from(value)
+        .map_err(|_| Status::invalid_argument("invalid content policy surface"))?
+    {
+        v2::ContentPolicySurface::MessageContent => Ok(ContentSurface::MessageContent),
+        v2::ContentPolicySurface::DisplayName => Ok(ContentSurface::DisplayName),
+        v2::ContentPolicySurface::Username => Ok(ContentSurface::Username),
+        v2::ContentPolicySurface::ServerName => Ok(ContentSurface::ServerName),
+        v2::ContentPolicySurface::HubName => Ok(ContentSurface::HubName),
+        v2::ContentPolicySurface::UrlDomain => Ok(ContentSurface::UrlDomain),
+        v2::ContentPolicySurface::Unspecified => Err(Status::invalid_argument(
+            "content policy surface is required",
+        )),
+    }
+}
+
+fn content_policy_to_proto(policy: &ContentPolicy) -> v2::NativeContentPolicy {
+    v2::NativeContentPolicy {
+        id: policy.id.to_string(),
+        scope: Some(v2::ContentPolicyScope {
+            authority: match policy.scope.authority {
+                ContentAuthority::Global => v2::ContentPolicyAuthority::Global,
+                ContentAuthority::Hub => v2::ContentPolicyAuthority::Hub,
+                ContentAuthority::Server => v2::ContentPolicyAuthority::Server,
+            } as i32,
+            id: policy.scope.id.clone(),
+        }),
+        enabled: policy.enabled,
+        version: policy.version,
+        rules: policy.rules.iter().map(content_rule_to_proto).collect(),
+    }
+}
+
+fn content_rule_to_proto(rule: &PolicyRule) -> v2::NativeContentRule {
+    v2::NativeContentRule {
+        id: rule.id.to_string(),
+        name: rule.name.clone(),
+        description: rule.description.clone(),
+        enabled: rule.enabled,
+        custom_reason: rule.custom_reason.clone().unwrap_or_default(),
+        created_by: rule.created_by.clone(),
+        patterns: rule
+            .patterns
+            .iter()
+            .map(|pattern| v2::NativeContentPattern {
+                id: pattern.id.to_string(),
+                pattern: pattern.pattern.clone(),
+                pattern_type: match pattern.pattern_type {
+                    WildcardPatternType::ExactWord => v2::ContentPatternType::ExactWord,
+                    WildcardPatternType::Prefix => v2::ContentPatternType::Prefix,
+                    WildcardPatternType::Suffix => v2::ContentPatternType::Suffix,
+                    WildcardPatternType::Contains => v2::ContentPatternType::Contains,
+                    WildcardPatternType::Phrase => v2::ContentPatternType::Phrase,
+                } as i32,
+            })
+            .collect(),
+        surfaces: rule
+            .surfaces
+            .iter()
+            .map(|surface| match surface {
+                ContentSurface::MessageContent => v2::ContentPolicySurface::MessageContent,
+                ContentSurface::DisplayName => v2::ContentPolicySurface::DisplayName,
+                ContentSurface::Username => v2::ContentPolicySurface::Username,
+                ContentSurface::ServerName => v2::ContentPolicySurface::ServerName,
+                ContentSurface::HubName => v2::ContentPolicySurface::HubName,
+                ContentSurface::UrlDomain => v2::ContentPolicySurface::UrlDomain,
+            } as i32)
+            .collect(),
+        actions: rule
+            .actions
+            .iter()
+            .map(|action| v2::NativeContentAction {
+                id: action.id.to_string(),
+                r#type: match action.action_type {
+                    PolicyActionType::Allow => v2::ContentPolicyActionType::Allow,
+                    PolicyActionType::Block => v2::ContentPolicyActionType::Block,
+                    PolicyActionType::CensorMatch => v2::ContentPolicyActionType::CensorMatch,
+                    PolicyActionType::StripLink => v2::ContentPolicyActionType::StripLink,
+                    PolicyActionType::SuppressLinks => v2::ContentPolicyActionType::SuppressLinks,
+                    PolicyActionType::ReplaceName => v2::ContentPolicyActionType::ReplaceName,
+                    PolicyActionType::Log => v2::ContentPolicyActionType::Log,
+                    PolicyActionType::LobbyWarn => v2::ContentPolicyActionType::LobbyWarn,
+                    PolicyActionType::LobbyBan => v2::ContentPolicyActionType::LobbyBan,
+                    PolicyActionType::Blacklist => v2::ContentPolicyActionType::Blacklist,
+                    PolicyActionType::HubWarn => v2::ContentPolicyActionType::HubWarn,
+                    PolicyActionType::HubMute => v2::ContentPolicyActionType::HubMute,
+                    PolicyActionType::HubBan => v2::ContentPolicyActionType::HubBan,
+                } as i32,
+                duration: action
+                    .duration_seconds
+                    .map(|seconds| prost_types::Duration {
+                        seconds: seconds.min(i64::MAX as u64) as i64,
+                        nanos: 0,
+                    }),
+                replacement: action.replacement.clone().unwrap_or_default(),
+            })
+            .collect(),
+    }
+}
+
+fn content_policy_error(error: anyhow::Error) -> Status {
+    let message = error.to_string();
+    if message.contains("conflict") || message.contains("already exists") {
+        Status::aborted("content policy changed while it was being edited")
+    } else if message.contains("does not exist") || message.contains("immutable") {
+        Status::failed_precondition(message)
+    } else if message.contains("pattern")
+        || message.contains("rule")
+        || message.contains("action")
+        || message.contains("scope")
+        || message.contains("duration")
+        || message.contains("replacement")
+        || message.contains("version")
+    {
+        Status::invalid_argument(message)
+    } else {
+        internal(error)
+    }
+}
+
 #[cfg(test)]
 mod command_service_tests {
     use super::*;
     use tonic::Code;
+
+    #[test]
+    fn native_content_policy_conversion_preserves_authored_rule_data() {
+        let policy_id = Uuid::new_v4();
+        let rule_id = Uuid::new_v4();
+        let pattern_id = Uuid::new_v4();
+        let action_id = Uuid::new_v4();
+        let policy = v2::NativeContentPolicy {
+            id: policy_id.to_string(),
+            scope: Some(v2::ContentPolicyScope {
+                authority: v2::ContentPolicyAuthority::Hub as i32,
+                id: "hub-1".to_owned(),
+            }),
+            enabled: true,
+            version: 7,
+            rules: vec![v2::NativeContentRule {
+                id: rule_id.to_string(),
+                name: "Invites".to_owned(),
+                description: "Blocks invite domains".to_owned(),
+                enabled: false,
+                custom_reason: "No invites".to_owned(),
+                created_by: String::new(),
+                patterns: vec![v2::NativeContentPattern {
+                    id: pattern_id.to_string(),
+                    pattern: "discord.gg/*".to_owned(),
+                    pattern_type: v2::ContentPatternType::Contains as i32,
+                }],
+                surfaces: vec![v2::ContentPolicySurface::UrlDomain as i32],
+                actions: vec![v2::NativeContentAction {
+                    id: action_id.to_string(),
+                    r#type: v2::ContentPolicyActionType::Block as i32,
+                    duration: None,
+                    replacement: String::new(),
+                }],
+            }],
+        };
+
+        let domain = content_policy_from_proto(policy, "actor-1").expect("valid policy");
+        assert_eq!(domain.rules[0].created_by, "actor-1");
+        assert_eq!(domain.rules[0].patterns[0].pattern, "discord.gg/*");
+        let round_trip = content_policy_to_proto(&domain);
+        assert_eq!(round_trip.id, policy_id.to_string());
+        assert_eq!(round_trip.version, 7);
+        assert_eq!(round_trip.rules[0].name, "Invites");
+        assert_eq!(round_trip.rules[0].custom_reason, "No invites");
+    }
+
+    #[test]
+    fn content_policy_conflicts_have_aborted_status() {
+        assert_eq!(
+            content_policy_error(anyhow::anyhow!("content policy version conflict")).code(),
+            Code::Aborted
+        );
+    }
 
     #[test]
     fn command_repository_states_have_safe_rpc_codes() {

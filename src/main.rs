@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         db.clone(),
         config.content_policy_invalidation_topic.clone(),
     ));
-    let content_policy_source: Arc<dyn ContentPolicySource> = content_policy_repository;
+    let content_policy_source: Arc<dyn ContentPolicySource> = content_policy_repository.clone();
     let content_policy_snapshots = Arc::new(PolicySnapshotStore::new());
     let content_policy_runtime = Arc::new(ContentPolicyRuntime::new(
         content_policy_source,
@@ -126,7 +126,14 @@ async fn main() -> anyhow::Result<()> {
         let cancel = cancel.clone();
         async move {
             grpc::serve(
-                &config, engine, repository, authorizer, moderation, commands, cancel,
+                &config,
+                engine,
+                repository,
+                content_policy_repository,
+                authorizer,
+                moderation,
+                commands,
+                cancel,
             )
             .await
         }

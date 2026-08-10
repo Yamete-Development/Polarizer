@@ -10,6 +10,7 @@ use crate::{
     auth::Authorizer,
     command::CommandRepository,
     config::AppConfig,
+    content_policy::repository::PostgresContentPolicyRepository,
     contract::v2::trust_and_safety_service_server::TrustAndSafetyServiceServer,
     moderation::ModerationRepository,
     policy::{engine::PolicyEngine, repository::PostgresPolicyRepository},
@@ -22,6 +23,7 @@ pub async fn serve(
     config: &AppConfig,
     engine: Arc<PolicyEngine>,
     repository: Arc<PostgresPolicyRepository>,
+    content_policy_repository: Arc<PostgresContentPolicyRepository>,
     authorizer: Arc<Authorizer>,
     moderation: Arc<ModerationRepository>,
     commands: Arc<CommandRepository>,
@@ -38,8 +40,15 @@ pub async fn serve(
         .identity(Identity::from_pem(cert, key))
         .client_ca_root(Certificate::from_pem(client_ca));
     let address = SocketAddr::new(config.grpc_host, config.grpc_port);
-    let service =
-        TrustAndSafetyService::new(engine, repository, authorizer, moderation, commands, config);
+    let service = TrustAndSafetyService::new(
+        engine,
+        repository,
+        content_policy_repository,
+        authorizer,
+        moderation,
+        commands,
+        config,
+    );
     info!(%address, "mTLS gRPC server starting");
     Server::builder()
         .tls_config(tls)?

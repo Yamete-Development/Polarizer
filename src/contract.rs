@@ -6,6 +6,7 @@ pub mod interchat {
     pub mod trust_and_safety {
         pub mod v2 {
             include!("generated/interchat.trust_and_safety.v2.rs");
+            include!("generated/interchat.trust_and_safety.v2.tonic.rs");
         }
     }
 }

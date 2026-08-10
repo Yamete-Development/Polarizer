@@ -18,7 +18,8 @@ use crate::{
     contract::{
         authz::v1::{CheckPermissionRequest, auth_z_service_client::AuthZServiceClient},
         authz::v2::{
-            AuthorizationDecision, AuthorizeStaffOperationRequest, RequestMetadata, StaffOperation,
+            AuthorizationDecision, AuthorizeStaffOperationRequest,
+            GetEffectiveStaffAuthorizationRequest, RequestMetadata, StaffOperation,
             staff_authorization_service_client::StaffAuthorizationServiceClient,
         },
         v2,
@@ -38,6 +39,8 @@ pub enum Permission {
     Administrator = 2048,
 }
 
+pub const MANAGE_GLOBAL_CONTENT_POLICY_PERMISSION: u64 = 1 << 31;
+
 #[derive(Clone)]
 pub struct Authorizer {
     iris: AuthZServiceClient<Channel>,
@@ -48,6 +51,48 @@ pub struct Authorizer {
 }
 
 impl Authorizer {
+    pub async fn authorize_staff_permission(
+        &self,
+        context: &v2::RequestContext,
+        method: &str,
+        required_permission: u64,
+    ) -> Result<(), Status> {
+        self.authorize_service_principal(context, method)?;
+        if v2::ActorType::try_from(context.actor_type)
+            .map_err(|_| Status::unauthenticated("invalid actor type"))?
+            != v2::ActorType::Human
+        {
+            return Err(Status::permission_denied(
+                "staff permissions require an authenticated human actor",
+            ));
+        }
+        let mut client = self.staff_iris.clone();
+        let response = tokio::time::timeout(
+            self.timeout,
+            client.get_effective_staff_authorization(tonic::Request::new(
+                GetEffectiveStaffAuthorizationRequest {
+                    metadata: Some(RequestMetadata {
+                        request_id: context.request_id.clone(),
+                        service_principal: "polarizer".to_owned(),
+                        actor_id: context.actor_id.clone(),
+                        idempotency_key: context.idempotency_key.clone(),
+                        trace_id: context.trace_id.clone(),
+                    }),
+                    user_id: context.actor_id.clone(),
+                },
+            )),
+        )
+        .await
+        .map_err(|_| Status::unavailable("Iris staff authorization timed out"))?
+        .map_err(|_| Status::unavailable("Iris staff authorization is unavailable"))?
+        .into_inner();
+        if response.effective_permissions & required_permission == required_permission {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("staff authorization denied"))
+        }
+    }
+
     pub async fn connect(config: &AppConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.iris_tls_is_complete(),
@@ -253,6 +298,29 @@ fn certificate_principal(
 mod tests {
     use super::*;
 
+    fn test_authorizer(methods: &[&str]) -> Authorizer {
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Authorizer {
+            iris: AuthZServiceClient::new(channel.clone()),
+            staff_iris: StaffAuthorizationServiceClient::new(channel),
+            timeout: Duration::from_millis(10),
+            service_principals: Arc::new(BTreeMap::from([(
+                "interchat-bot".to_owned(),
+                methods.iter().map(|method| (*method).to_owned()).collect(),
+            )])),
+            certificate_principals: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    fn human_context() -> v2::RequestContext {
+        v2::RequestContext {
+            actor_id: "123".to_owned(),
+            actor_type: v2::ActorType::Human as i32,
+            service_principal: "interchat-bot".to_owned(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn certificate_fingerprint_selects_exact_principal() {
         let certificate = b"client certificate DER";
@@ -267,5 +335,29 @@ mod tests {
             certificate_principal(&principals, b"different certificate"),
             None
         );
+    }
+
+    #[test]
+    fn server_content_policy_requires_an_explicit_trusted_method() {
+        let context = human_context();
+        assert!(
+            test_authorizer(&["ReplaceContentPolicy"])
+                .authorize_user_submission(&context, "ReplaceContentPolicy")
+                .is_ok()
+        );
+        let denied = test_authorizer(&["EvaluateAction"])
+            .authorize_user_submission(&context, "ReplaceContentPolicy")
+            .expect_err("method must be allowlisted");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn content_policy_mutation_rejects_non_human_actor() {
+        let mut context = human_context();
+        context.actor_type = v2::ActorType::Service as i32;
+        let denied = test_authorizer(&["ReplaceContentPolicy"])
+            .authorize_user_submission(&context, "ReplaceContentPolicy")
+            .expect_err("service actors cannot edit server policy");
+        assert_eq!(denied.code(), Code::PermissionDenied);
     }
 }
