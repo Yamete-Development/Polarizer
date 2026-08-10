@@ -337,8 +337,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn server_content_policy_requires_an_explicit_trusted_method() {
+    #[tokio::test]
+    async fn server_content_policy_requires_an_explicit_trusted_method() {
         let context = human_context();
         assert!(
             test_authorizer(&["ReplaceContentPolicy"])
@@ -351,8 +351,8 @@ mod tests {
         assert_eq!(denied.code(), Code::PermissionDenied);
     }
 
-    #[test]
-    fn content_policy_mutation_rejects_non_human_actor() {
+    #[tokio::test]
+    async fn content_policy_mutation_rejects_non_human_actor() {
         let mut context = human_context();
         context.actor_type = v2::ActorType::Service as i32;
         let denied = test_authorizer(&["ReplaceContentPolicy"])
