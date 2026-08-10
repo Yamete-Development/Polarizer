@@ -851,9 +851,9 @@ fn representative_transformed_content(plan: &ContentPolicyPlan) -> String {
             let Some(first) = variants.next() else {
                 return String::new();
             };
-            if variants.all(|variant| {
-                variant.message_content.as_ref() == first.message_content.as_ref()
-            }) {
+            if variants
+                .all(|variant| variant.message_content.as_ref() == first.message_content.as_ref())
+            {
                 first.message_content.to_string()
             } else {
                 "<varies by destination policy>".to_owned()
