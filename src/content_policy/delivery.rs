@@ -308,7 +308,7 @@ pub fn group_destinations_by_profile<T>(
 pub fn group_destinations_by_variant<T>(
     destinations: impl IntoIterator<Item = (DeliveryVariant, T)>,
 ) -> BTreeMap<[u8; 32], (DeliveryVariant, Vec<T>)> {
-    let mut groups = BTreeMap::new();
+    let mut groups: BTreeMap<[u8; 32], (DeliveryVariant, Vec<T>)> = BTreeMap::new();
     for (variant, destination) in destinations {
         match groups.entry(variant.fingerprint) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
