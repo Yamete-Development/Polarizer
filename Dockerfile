@@ -24,6 +24,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY migrations/ migrations/
+COPY benches/ benches/
 COPY src/ src/
 
 # Cache registries, compiled dependencies, and the downloaded static ONNX
@@ -32,7 +33,9 @@ RUN --mount=type=cache,id=polarizer-cargo-registry,target=/root/.cargo/registry,
     --mount=type=cache,id=polarizer-cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=polarizer-target,target=/app/target,sharing=locked \
     --mount=type=cache,id=polarizer-ort,target=/root/.cache/ort.pyke.io,sharing=locked \
-    cargo build --locked --release --bins && \
+    cargo build --locked --release \
+        --bin polarizer \
+        --bin polarizer-policy-worker && \
     install -D -m 0755 target/release/polarizer /app/out/polarizer && \
     install -D -m 0755 target/release/polarizer-policy-worker /app/out/polarizer-policy-worker
 
