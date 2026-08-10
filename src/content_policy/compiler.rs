@@ -42,6 +42,20 @@ impl CompiledPolicySnapshot {
     /// Compile an already-validated database definition. Validation and
     /// normalization happen on the policy-change path, never during messages.
     pub fn compile(policy: &ContentPolicy) -> Result<Self, PolicyMatchError> {
+        Self::compile_with_match_details(policy, false)
+    }
+
+    /// Compile a cold-path diagnostic snapshot that retains pattern/span
+    /// attribution for every matched rule. Production snapshots deliberately
+    /// collect this richer data only for actions that require it.
+    pub fn compile_diagnostic(policy: &ContentPolicy) -> Result<Self, PolicyMatchError> {
+        Self::compile_with_match_details(policy, true)
+    }
+
+    fn compile_with_match_details(
+        policy: &ContentPolicy,
+        all_match_details: bool,
+    ) -> Result<Self, PolicyMatchError> {
         let rules = policy
             .rules
             .iter()
@@ -69,7 +83,7 @@ impl CompiledPolicySnapshot {
             });
             let detailed_rules = surface_rules
                 .iter()
-                .filter(|rule| rule_needs_match_details(rule))
+                .filter(|rule| all_match_details || rule_needs_match_details(rule))
                 .map(|rule| rule.id)
                 .collect();
             surfaces.insert(
@@ -368,6 +382,21 @@ mod tests {
                 .spans
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn diagnostic_snapshot_collects_details_for_block_rules() {
+        let snapshot =
+            CompiledPolicySnapshot::compile_diagnostic(&policy(vec![PolicyActionType::Block]))
+                .unwrap();
+        let input = BTreeMap::from([(Surface::MessageContent, NormalizedText::new("BAD"))]);
+        let matched = snapshot.evaluate_normalized(&input).unwrap();
+
+        assert_eq!(
+            matched[0].surfaces[0].spans,
+            vec![ByteSpan { start: 0, end: 3 }]
+        );
+        assert_eq!(matched[0].surfaces[0].pattern_ids, vec![Uuid::from_u128(3)]);
     }
 
     #[test]
