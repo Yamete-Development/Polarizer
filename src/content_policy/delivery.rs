@@ -349,8 +349,8 @@ mod tests {
     #[test]
     fn censor_uses_utf8_byte_spans_without_corrupting_text() {
         assert_eq!(
-            censor_spans("xÃ©clair!", &[ByteSpan { start: 1, end: 8 }]).unwrap(),
-            "xÃ©####r!"
+            censor_spans("xéclair!", &[ByteSpan { start: 1, end: 8 }]).unwrap(),
+            "xé####r!"
         );
     }
 

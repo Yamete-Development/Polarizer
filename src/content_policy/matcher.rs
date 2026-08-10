@@ -287,11 +287,21 @@ mod tests {
         ])
         .unwrap();
 
+        // `*ad*` is unanchored, so it also matches inside the exact word "bad".
         assert_eq!(
             matcher.matched_rule_ids("bad prelude suffix"),
-            vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+            vec![
+                Uuid::from_u128(1),
+                Uuid::from_u128(4),
+                Uuid::from_u128(2),
+                Uuid::from_u128(3)
+            ]
         );
-        assert_eq!(matcher.matched_rule_ids("prefix"), vec![Uuid::from_u128(3)]);
+        // `pre*` anchors left and `*fix` anchors right; "prefix" satisfies both.
+        assert_eq!(
+            matcher.matched_rule_ids("prefix"),
+            vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
         assert_eq!(matcher.matched_rule_ids("badly"), vec![Uuid::from_u128(4)]);
         assert!(
             !matcher

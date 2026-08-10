@@ -18,6 +18,16 @@ pub struct NormalizedText {
     spans: Vec<NormalizedCharSpan>,
 }
 
+/// One extracted source range: `text` is normalized into the surface, while
+/// `attributed` is the full original range the surface reports for it. The two
+/// differ when a fragment carries bytes that should not be matchable, such as
+/// the `www.` prefix of a domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SurfaceSpan {
+    pub attributed: ByteSpan,
+    pub text: ByteSpan,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NormalizedCharSpan {
     normalized: ByteSpan,
@@ -50,39 +60,51 @@ impl NormalizedText {
     /// Normalize selected, non-overlapping source ranges while retaining their
     /// coordinates in `input`. A single mapped space is inserted between
     /// ranges so several extracted surfaces remain independently matchable.
-    pub(crate) fn from_original_spans(input: &str, original_spans: &[ByteSpan]) -> Self {
+    pub(crate) fn from_original_spans(input: &str, original_spans: &[SurfaceSpan]) -> Self {
         let mut mapped = Vec::new();
         let mut previous: Option<ByteSpan> = None;
 
-        for &source_span in original_spans {
-            if source_span.start >= source_span.end
-                || source_span.end > input.len()
-                || !input.is_char_boundary(source_span.start)
-                || !input.is_char_boundary(source_span.end)
+        for &surface_span in original_spans {
+            let SurfaceSpan { attributed, text } = surface_span;
+            if text.start >= text.end
+                || attributed.start > text.start
+                || attributed.end < text.end
+                || attributed.end > input.len()
+                || !input.is_char_boundary(attributed.start)
+                || !input.is_char_boundary(attributed.end)
+                || !input.is_char_boundary(text.start)
+                || !input.is_char_boundary(text.end)
             {
                 continue;
             }
 
             if let Some(previous) = previous
-                && previous.end < source_span.start
+                && previous.end < attributed.start
             {
-                mapped.push((' ', span(previous.end, source_span.start)));
+                mapped.push((' ', span(previous.end, attributed.start)));
             }
 
-            let fragment = &input[source_span.start..source_span.end];
+            let first = mapped.len();
+            let fragment = &input[text.start..text.end];
             let source = source_chars(fragment);
             mapped.extend(mapped_nfkc_segments(fragment, &source).into_iter().map(
                 |(character, original)| {
                     (
                         character,
-                        span(
-                            original.start + source_span.start,
-                            original.end + source_span.start,
-                        ),
+                        span(original.start + text.start, original.end + text.start),
                     )
                 },
             ));
-            previous = Some(source_span);
+
+            // Bytes trimmed from the matchable text still belong to this
+            // surface, so they stay inside the reported original span.
+            if mapped.len() > first {
+                mapped[first].1.start = attributed.start;
+                if let Some(last) = mapped.last_mut() {
+                    last.1.end = attributed.end;
+                }
+            }
+            previous = Some(attributed);
         }
 
         Self::from_mapped(mapped)

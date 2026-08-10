@@ -7,7 +7,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
-    delivery::Presentation, model::Surface, normalization::NormalizedText, resolver::ByteSpan,
+    delivery::Presentation,
+    model::Surface,
+    normalization::{NormalizedText, SurfaceSpan},
+    resolver::ByteSpan,
 };
 
 /// Immutable normalized content and original-coordinate link metadata shared
@@ -72,10 +75,10 @@ impl AnalyzedContent {
 #[derive(Debug, Clone, Copy)]
 struct UrlCandidate {
     url: ByteSpan,
-    domain: ByteSpan,
+    domain: SurfaceSpan,
 }
 
-fn extract_urls(input: &str) -> (Vec<ByteSpan>, Vec<ByteSpan>) {
+fn extract_urls(input: &str) -> (Vec<ByteSpan>, Vec<SurfaceSpan>) {
     let bytes = input.as_bytes();
     let mut candidates = Vec::new();
     let mut cursor = 0;
@@ -137,10 +140,13 @@ fn parse_http_url(bytes: &[u8], start: usize) -> Option<UrlCandidate> {
             start,
             end: url_end,
         },
-        domain: ByteSpan {
-            start: authority_start,
-            end: domain_end,
-        },
+        domain: domain_span(
+            bytes,
+            ByteSpan {
+                start: authority_start,
+                end: domain_end,
+            },
+        ),
     })
 }
 
@@ -156,11 +162,35 @@ fn parse_domain_url(bytes: &[u8], start: usize) -> Option<UrlCandidate> {
             start,
             end: url_end,
         },
-        domain: ByteSpan {
-            start,
-            end: domain_end,
-        },
+        domain: domain_span(
+            bytes,
+            ByteSpan {
+                start,
+                end: domain_end,
+            },
+        ),
     })
+}
+
+/// Keep every domain byte attributed to the URL_DOMAIN surface, but leave a
+/// leading `www.` out of the matchable text: it is a routing label, not part
+/// of the administrator-visible site name.
+fn domain_span(bytes: &[u8], domain: ByteSpan) -> SurfaceSpan {
+    let text_start = domain.start + 4;
+    let strips_www = starts_with_ignore_ascii_case(bytes, domain.start, b"www.")
+        && text_start < domain.end
+        && bytes[text_start..domain.end].contains(&b'.');
+    SurfaceSpan {
+        attributed: domain,
+        text: if strips_www {
+            ByteSpan {
+                start: text_start,
+                end: domain.end,
+            }
+        } else {
+            domain
+        },
+    }
 }
 
 fn parse_domain_at(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {

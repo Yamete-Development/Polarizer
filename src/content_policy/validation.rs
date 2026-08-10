@@ -622,6 +622,12 @@ fn pattern_error(code: PatternErrorCode, pattern: &str) -> PatternError {
 }
 
 fn contains_unsupported_syntax(value: &str) -> bool {
+    // `.*` and `*.` read as regular expressions rather than as the supported
+    // wildcard forms, so they are rejected instead of silently matching a
+    // literal dot next to the wildcard.
+    if value.contains(".*") || value.contains("*.") {
+        return true;
+    }
     value.chars().any(|character| {
         matches!(
             character,
