@@ -5,8 +5,9 @@ pub mod prism {
 pub mod interchat {
     pub mod trust_and_safety {
         pub mod v2 {
+            // The message module already ends with an `include!` of the
+            // generated client/server file, so don't pull it in a second time.
             include!("generated/interchat.trust_and_safety.v2.rs");
-            include!("generated/interchat.trust_and_safety.v2.tonic.rs");
         }
     }
 }

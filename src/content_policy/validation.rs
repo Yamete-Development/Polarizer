@@ -549,17 +549,17 @@ fn validate_action(
             format!("action {:?} does not accept a duration", action.action_type),
         ));
     }
-    if let Some(duration) = action.duration_seconds {
-        if duration == 0 || duration > limits.maximum_duration_seconds {
-            errors.push(error(
-                ValidationErrorCode::DurationOutOfRange,
-                path.clone(),
-                format!(
-                    "duration must be between 1 and {} seconds",
-                    limits.maximum_duration_seconds
-                ),
-            ));
-        }
+    if let Some(duration) = action.duration_seconds
+        && (duration == 0 || duration > limits.maximum_duration_seconds)
+    {
+        errors.push(error(
+            ValidationErrorCode::DurationOutOfRange,
+            path.clone(),
+            format!(
+                "duration must be between 1 and {} seconds",
+                limits.maximum_duration_seconds
+            ),
+        ));
     }
     if let Some(replacement) = &action.replacement {
         check_limit(

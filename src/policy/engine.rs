@@ -243,33 +243,33 @@ impl PolicyEngine {
                 configuration: serde_json::Value::Null,
             }];
             let snapshot = resolved_features.runtime_snapshot(&reqs);
-            if let Some(val) = snapshot.get("restrictions.active") {
-                if let Some(arr) = val.value.as_ref().and_then(|v| v.as_array()) {
-                    for r in arr {
-                        if let Some(rtype) = r.get("restriction_type").and_then(|v| v.as_str()) {
-                            if rtype == "BAN" || rtype == "MUTE" || rtype == "BLACKLIST" {
-                                terminal_global_block = true;
-                                emitted.push(EmittedEffect {
-                                    origin: EffectOrigin {
-                                        policy_bundle_id: Uuid::nil(),
-                                        policy_version_id: Uuid::nil(),
-                                        rule_id: "builtin.moderation".into(),
-                                        scope: action.scope.clone(),
-                                        priority: 1000,
-                                        mandatory: true,
-                                    },
-                                    effect: Effect::Block {
-                                        effect_id: Uuid::new_v4().to_string(),
-                                        reason_codes: vec![format!("ACTIVE_{}", rtype)],
-                                        public_reason: Some(format!(
-                                            "You have an active {}.",
-                                            rtype.to_lowercase()
-                                        )),
-                                    },
-                                });
-                                break;
-                            }
-                        }
+            if let Some(val) = snapshot.get("restrictions.active")
+                && let Some(arr) = val.value.as_ref().and_then(|v| v.as_array())
+            {
+                for r in arr {
+                    if let Some(rtype) = r.get("restriction_type").and_then(|v| v.as_str())
+                        && (rtype == "BAN" || rtype == "MUTE" || rtype == "BLACKLIST")
+                    {
+                        terminal_global_block = true;
+                        emitted.push(EmittedEffect {
+                            origin: EffectOrigin {
+                                policy_bundle_id: Uuid::nil(),
+                                policy_version_id: Uuid::nil(),
+                                rule_id: "builtin.moderation".into(),
+                                scope: action.scope.clone(),
+                                priority: 1000,
+                                mandatory: true,
+                            },
+                            effect: Effect::Block {
+                                effect_id: Uuid::new_v4().to_string(),
+                                reason_codes: vec![format!("ACTIVE_{}", rtype)],
+                                public_reason: Some(format!(
+                                    "You have an active {}.",
+                                    rtype.to_lowercase()
+                                )),
+                            },
+                        });
+                        break;
                     }
                 }
             }

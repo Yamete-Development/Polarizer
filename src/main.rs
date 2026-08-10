@@ -127,12 +127,14 @@ async fn main() -> anyhow::Result<()> {
         async move {
             grpc::serve(
                 &config,
-                engine,
-                repository,
-                content_policy_repository,
-                authorizer,
-                moderation,
-                commands,
+                grpc::GrpcDependencies {
+                    engine,
+                    repository,
+                    content_policy_repository,
+                    authorizer,
+                    moderation,
+                    commands,
+                },
                 cancel,
             )
             .await

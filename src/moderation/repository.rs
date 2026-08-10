@@ -1082,8 +1082,8 @@ impl ModerationRepository {
                 }
             }
             v2::ModerationResourceType::Infraction => {
-                if let Some(enforcement_id) = target.enforcement_restriction_id {
-                    if let Some(row) = sqlx::query(
+                if let Some(enforcement_id) = target.enforcement_restriction_id
+                    && let Some(row) = sqlx::query(
                         "SELECT id, subject_type, subject_id, scope_type::text, scope_id, \
                          restriction_type, NULL::text AS infraction_type, status::text, reason, \
                          created_by, created_at, expires_at, version, NULL::uuid AS enforcement_restriction_id, \
@@ -1093,12 +1093,11 @@ impl ModerationRepository {
                     .bind(enforcement_id)
                     .fetch_optional(&mut *tx)
                     .await?
-                    {
-                        paired.push(moderation_link_target_from_row(
-                            &row,
-                            v2::ModerationResourceType::Restriction,
-                        )?);
-                    }
+                {
+                    paired.push(moderation_link_target_from_row(
+                        &row,
+                        v2::ModerationResourceType::Restriction,
+                    )?);
                 }
             }
             v2::ModerationResourceType::Unspecified => unreachable!(),

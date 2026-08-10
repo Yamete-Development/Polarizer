@@ -19,14 +19,19 @@ use crate::{
 pub use service::TrustAndSafetyService;
 pub(crate) use service::action_from_proto;
 
+/// Everything the gRPC surface needs from the rest of the process.
+pub struct GrpcDependencies {
+    pub engine: Arc<PolicyEngine>,
+    pub repository: Arc<PostgresPolicyRepository>,
+    pub content_policy_repository: Arc<PostgresContentPolicyRepository>,
+    pub authorizer: Arc<Authorizer>,
+    pub moderation: Arc<ModerationRepository>,
+    pub commands: Arc<CommandRepository>,
+}
+
 pub async fn serve(
     config: &AppConfig,
-    engine: Arc<PolicyEngine>,
-    repository: Arc<PostgresPolicyRepository>,
-    content_policy_repository: Arc<PostgresContentPolicyRepository>,
-    authorizer: Arc<Authorizer>,
-    moderation: Arc<ModerationRepository>,
-    commands: Arc<CommandRepository>,
+    deps: GrpcDependencies,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -41,12 +46,12 @@ pub async fn serve(
         .client_ca_root(Certificate::from_pem(client_ca));
     let address = SocketAddr::new(config.grpc_host, config.grpc_port);
     let service = TrustAndSafetyService::new(
-        engine,
-        repository,
-        content_policy_repository,
-        authorizer,
-        moderation,
-        commands,
+        deps.engine,
+        deps.repository,
+        deps.content_policy_repository,
+        deps.authorizer,
+        deps.moderation,
+        deps.commands,
         config,
     );
     info!(%address, "mTLS gRPC server starting");

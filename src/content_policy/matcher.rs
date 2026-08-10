@@ -44,16 +44,11 @@ impl PatternDefinition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatchDetails {
+    #[default]
     None,
     PatternsAndSpans,
-}
-
-impl Default for MatchDetails {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
