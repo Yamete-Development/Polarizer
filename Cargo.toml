@@ -63,3 +63,7 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[[bench]]
+name = "content_policy"
+harness = false
