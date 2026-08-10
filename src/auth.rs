@@ -84,7 +84,7 @@ impl Authorizer {
         )
         .await
         .map_err(|_| Status::unavailable("Iris staff authorization timed out"))?
-        .map_err(|_| Status::unavailable("Iris staff authorization is unavailable"))?
+        .map_err(staff_authorization_error)?
         .into_inner();
         if response.effective_permissions & required_permission == required_permission {
             Ok(())
@@ -169,13 +169,7 @@ impl Authorizer {
         )
         .await
         .map_err(|_| Status::unavailable("Iris staff authorization timed out"))?
-        .map_err(|status| {
-            if status.code() == Code::PermissionDenied {
-                Status::permission_denied("staff authorization denied")
-            } else {
-                Status::unavailable("Iris staff authorization is unavailable")
-            }
-        })?
+        .map_err(staff_authorization_error)?
         .into_inner();
         AuthorizationDecision::try_from(response.decision)
             .map_err(|_| Status::unavailable("Iris returned an invalid staff decision"))
@@ -283,6 +277,38 @@ impl Authorizer {
                 "service principal is not allowed to call this method",
             ))
         }
+    }
+}
+
+/// Translate an Iris staff-authorization failure without erasing why it failed.
+///
+/// Collapsing everything into `UNAVAILABLE` made a deployment misconfiguration
+/// (Polarizer's service principal not allowlisted for an Iris method, which Iris
+/// answers with HTTP 403 -> `PERMISSION_DENIED`) indistinguishable from Iris being
+/// down, so it read as a transient outage forever. Rejections stay rejections;
+/// only genuine transport-level failures report `UNAVAILABLE`.
+fn staff_authorization_error(status: Status) -> Status {
+    match status.code() {
+        Code::PermissionDenied => Status::permission_denied(format!(
+            "Iris denied staff authorization: {}",
+            status.message()
+        )),
+        Code::Unauthenticated => Status::unauthenticated(format!(
+            "Iris rejected the staff authorization identity: {}",
+            status.message()
+        )),
+        Code::InvalidArgument => Status::internal(format!(
+            "Iris rejected the staff authorization request: {}",
+            status.message()
+        )),
+        Code::Unimplemented | Code::NotFound => Status::internal(format!(
+            "Iris does not expose the staff authorization method: {}",
+            status.message()
+        )),
+        _ => Status::unavailable(format!(
+            "Iris staff authorization is unavailable: {}",
+            status.message()
+        )),
     }
 }
 
