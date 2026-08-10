@@ -9,7 +9,7 @@ use super::{
     delivery::{DeliveryVariant, Presentation, materialize_variant},
     model::PolicyScope,
     resolver::{
-        EffectAttribution, MatchedRule, ResolvedScopeDecision, SideEffectRequest, compose_delivery,
+        EffectAttribution, ResolvedScopeDecision, SideEffectRequest, compose_delivery,
         resolve_scope,
     },
     snapshot::PolicySnapshotStore,
@@ -202,7 +202,7 @@ impl ContentPolicyEvaluator {
 
         let evaluated_server_profiles = profiles.len();
         for members in profiles.into_values() {
-            let representative = &members[0].1;
+            let representative = Arc::clone(&members[0].1);
             let representative_matches =
                 representative.evaluate_normalized(analyzed.normalized_surfaces())?;
             let representative_scope =

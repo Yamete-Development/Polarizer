@@ -310,10 +310,14 @@ pub fn group_destinations_by_variant<T>(
 ) -> BTreeMap<[u8; 32], (DeliveryVariant, Vec<T>)> {
     let mut groups = BTreeMap::new();
     for (variant, destination) in destinations {
-        groups
-            .entry(variant.fingerprint)
-            .and_modify(|(_, targets): &mut (DeliveryVariant, Vec<T>)| targets.push(destination))
-            .or_insert_with(|| (variant, vec![destination]));
+        match groups.entry(variant.fingerprint) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().1.push(destination);
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((variant, vec![destination]));
+            }
+        }
     }
     groups
 }

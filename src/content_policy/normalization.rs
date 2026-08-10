@@ -52,7 +52,7 @@ impl NormalizedText {
     /// ranges so several extracted surfaces remain independently matchable.
     pub(crate) fn from_original_spans(input: &str, original_spans: &[ByteSpan]) -> Self {
         let mut mapped = Vec::new();
-        let mut previous = None;
+        let mut previous: Option<ByteSpan> = None;
 
         for &source_span in original_spans {
             if source_span.start >= source_span.end

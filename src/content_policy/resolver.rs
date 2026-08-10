@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
@@ -294,6 +294,8 @@ fn merge_spans(mut spans: Vec<ByteSpan>) -> Vec<ByteSpan> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::content_policy::model::{Authority, PolicyAction};
 

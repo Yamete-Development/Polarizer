@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -7,7 +7,7 @@ use super::{
     matcher::{CompiledMatcher, MatchDetails, MatchOptions, MatcherBuildError, PatternDefinition},
     model::{ContentPolicy, PolicyActionType, PolicyRule, Surface},
     normalization::{NormalizedText, normalize_pattern},
-    resolver::{ByteSpan, MatchedRule, MatchedSurface},
+    resolver::{MatchedRule, MatchedSurface},
 };
 
 #[derive(Debug)]
@@ -301,10 +301,13 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::content_policy::model::{
         PolicyAction, PolicyScope, RulePattern, WildcardPatternType,
     };
+    use crate::content_policy::resolver::ByteSpan;
 
     fn policy(actions: Vec<PolicyActionType>) -> ContentPolicy {
         ContentPolicy {

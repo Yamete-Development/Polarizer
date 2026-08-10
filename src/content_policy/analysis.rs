@@ -166,8 +166,8 @@ fn parse_domain_url(bytes: &[u8], start: usize) -> Option<UrlCandidate> {
 fn parse_domain_at(bytes: &[u8], start: usize, limit: usize) -> Option<usize> {
     let mut cursor = start;
     let mut labels = 0;
-    let mut last_label_start = start;
-    let mut last_label_end = start;
+    let mut last_label_start;
+    let mut last_label_end;
 
     loop {
         let label_start = cursor;
