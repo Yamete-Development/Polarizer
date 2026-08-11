@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 
 use uuid::Uuid;
 
-use super::model::{PolicyAction, PolicyActionType, PolicyScope, Surface};
+use super::{
+    delivery::DEFAULT_SAFE_NAME,
+    model::{PolicyAction, PolicyActionType, PolicyScope, Surface},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ByteSpan {
@@ -127,7 +130,8 @@ pub fn resolve_scope(
                     let replacement = action
                         .replacement
                         .clone()
-                        .unwrap_or_else(|| "InterChat User".to_owned());
+                        .filter(|_| scope.authority == super::model::Authority::Global)
+                        .unwrap_or_else(|| DEFAULT_SAFE_NAME.to_owned());
                     for matched in rule.surfaces.iter().filter(|item| item.surface.is_name()) {
                         // Rules are sorted by UUID, so first insertion is a
                         // deterministic tie-break independent of DB row order.
@@ -170,7 +174,8 @@ pub fn resolve_scope(
 
 /// Compose compatible authority layers without allowing a lower layer to
 /// weaken a higher one. The caller controls which layers apply to a path (for
-/// Calls: GLOBAL only; for Hub delivery: GLOBAL, HUB, optional SERVER).
+/// Calls: GLOBAL, optional SERVER; for Hub delivery: GLOBAL, HUB, optional
+/// SERVER).
 pub fn compose_delivery<'a>(
     layers: impl IntoIterator<Item = &'a DeliveryEffects>,
 ) -> DeliveryEffects {
@@ -430,6 +435,49 @@ mod tests {
         );
         assert!(compose_delivery([&block.delivery, &allow.delivery]).is_blocked());
         assert_eq!(block.scope.authority, Authority::Global);
+    }
+
+    #[test]
+    fn only_global_name_replacements_honor_configured_values() {
+        let replacement_rule = |scope: PolicyScope| MatchedRule {
+            policy_id: Uuid::from_u128(1),
+            policy_version: 1,
+            scope,
+            rule_id: Uuid::from_u128(2),
+            rule_name: "replace".into(),
+            custom_reason: None,
+            surfaces: vec![MatchedSurface {
+                surface: Surface::DisplayName,
+                spans: vec![ByteSpan { start: 0, end: 5 }],
+                pattern_ids: Vec::new(),
+            }],
+            actions: vec![PolicyAction {
+                id: Uuid::from_u128(3),
+                action_type: PolicyActionType::ReplaceName,
+                duration_seconds: None,
+                replacement: Some("Configured name".into()),
+            }],
+        };
+
+        assert_eq!(
+            resolve_scope(
+                PolicyScope::global(),
+                vec![replacement_rule(PolicyScope::global())]
+            )
+            .delivery
+            .name_replacements[&Surface::DisplayName]
+                .replacement,
+            "Configured name"
+        );
+        for scope in [PolicyScope::hub("hub"), PolicyScope::server("server")] {
+            assert_eq!(
+                resolve_scope(scope.clone(), vec![replacement_rule(scope)])
+                    .delivery
+                    .name_replacements[&Surface::DisplayName]
+                    .replacement,
+                DEFAULT_SAFE_NAME
+            );
+        }
     }
 
     #[test]

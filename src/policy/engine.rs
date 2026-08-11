@@ -541,14 +541,6 @@ impl PolicyEngine {
         let presentation = presentation_from_action(action);
         let analyzed = AnalyzedContent::from_presentation(&presentation);
         let subject_id = action.subject.user_id.as_deref().unwrap_or("anonymous");
-        if is_call_message {
-            return Ok(Some(ContentPolicyPlan::Call(evaluator.evaluate_call(
-                subject_id,
-                &presentation,
-                &analyzed,
-            )?)));
-        }
-
         let destinations = action
             .prism_payload
             .as_deref()
@@ -566,6 +558,17 @@ impl PolicyEngine {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        if is_call_message {
+            return Ok(Some(ContentPolicyPlan::Call(
+                evaluator.evaluate_call_for_destinations(
+                    subject_id,
+                    &presentation,
+                    &analyzed,
+                    &destinations,
+                )?,
+            )));
+        }
+
         Ok(Some(ContentPolicyPlan::Hub(evaluator.evaluate_hub(
             subject_id,
             &action.scope.id,
@@ -597,7 +600,7 @@ fn presentation_from_action(action: &Action) -> Presentation {
 }
 
 fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<EmittedEffect> {
-    let (blocked_by, side_effects, feedback, feedback_attribution) = match plan {
+    let (blocked_by, side_effects, feedback_attribution) = match plan {
         ContentPolicyPlan::Hub(plan) => {
             let blocked_by = if plan.global.delivery.is_blocked() {
                 &plan.global.delivery.blocked_by
@@ -612,16 +615,22 @@ fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<Emit
             (
                 blocked_by.as_slice(),
                 plan.side_effects.as_slice(),
-                plan.sender_feedback.as_ref(),
                 feedback_attribution,
             )
         }
-        ContentPolicyPlan::Call(plan) => (
-            plan.global.delivery.blocked_by.as_slice(),
-            plan.side_effects.as_slice(),
-            plan.sender_feedback.as_ref(),
-            plan.global.delivery.blocked_by.first(),
-        ),
+        ContentPolicyPlan::Call(plan) => {
+            let blocked_by = plan.global.delivery.blocked_by.as_slice();
+            let feedback_attribution = blocked_by.first().or_else(|| {
+                plan.destinations
+                    .iter()
+                    .find_map(|destination| destination.blocked_by.first())
+            });
+            (
+                blocked_by,
+                plan.side_effects.as_slice(),
+                feedback_attribution,
+            )
+        }
     };
 
     let mut emitted = Vec::new();
@@ -639,11 +648,11 @@ fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<Emit
             },
         ));
     }
-    if let ContentPolicyPlan::Hub(plan) = plan
-        && matches!(
-            plan.sender_feedback,
-            Some(SenderFeedback::ServerFilters { .. })
-        )
+    let server_filtered = match plan {
+        ContentPolicyPlan::Hub(plan) => plan.sender_feedback.as_ref(),
+        ContentPolicyPlan::Call(plan) => plan.sender_feedback.as_ref(),
+    };
+    if matches!(server_filtered, Some(SenderFeedback::ServerFilters { .. }))
         && let Some(attribution) = feedback_attribution
     {
         emitted.push(native_emitted(
@@ -657,26 +666,6 @@ fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<Emit
     }
     for request in side_effects {
         emitted.extend(native_side_effects(action, request, plan));
-    }
-    if let (Some(feedback), Some(user_id)) = (feedback, action.subject.user_id.as_deref()) {
-        let (template, reason, parameters) = sender_feedback(feedback);
-        let attribution =
-            feedback_attribution.or_else(|| side_effects.first().map(|item| &item.attribution));
-        if let Some(attribution) = attribution {
-            emitted.push(native_emitted(
-                attribution,
-                action.scope.clone(),
-                Effect::Notify {
-                    effect_id: format!("content-policy:notify:{}", action.id),
-                    recipient: user_id.to_owned(),
-                    template: template.to_owned(),
-                    parameters: serde_json::json!({
-                        "reason": reason,
-                        "filtered_destinations": parameters,
-                    }),
-                },
-            ));
-        }
     }
     emitted
 }
@@ -842,8 +831,9 @@ fn native_side_effects(
 fn representative_transformed_content(plan: &ContentPolicyPlan) -> String {
     match plan {
         ContentPolicyPlan::Call(plan) => plan
-            .variant
-            .as_ref()
+            .variants
+            .values()
+            .next()
             .map(|variant| variant.message_content.to_string())
             .unwrap_or_default(),
         ContentPolicyPlan::Hub(plan) => {
@@ -926,35 +916,6 @@ fn authority_name(authority: crate::content_policy::Authority) -> &'static str {
     }
 }
 
-fn sender_feedback(feedback: &SenderFeedback) -> (&'static str, String, String) {
-    match feedback {
-        SenderFeedback::GlobalSafetyBlock => (
-            "Message blocked by InterChat safety",
-            "Your message was blocked by an InterChat safety policy.".into(),
-            String::new(),
-        ),
-        SenderFeedback::CallSafetyBlock => (
-            "Call message blocked by InterChat safety",
-            "Your call message was blocked by an InterChat safety policy.".into(),
-            String::new(),
-        ),
-        SenderFeedback::HubModerationBlock { custom_reason } => (
-            "Message blocked by hub moderation",
-            custom_reason.clone().unwrap_or_else(|| {
-                "Your message was blocked by this hub's moderation policy.".into()
-            }),
-            String::new(),
-        ),
-        SenderFeedback::ServerFilters { destination_count } => (
-            "Message filtered by destination servers",
-            format!(
-                "Your message was withheld from {destination_count} destination server(s) by their local filters."
-            ),
-            destination_count.to_string(),
-        ),
-    }
-}
-
 fn origin(policy: &super::repository::ActivePolicy, rule_id: &str) -> EffectOrigin {
     EffectOrigin {
         policy_bundle_id: policy.bundle.id,
@@ -1002,6 +963,7 @@ fn elapsed_micros(started: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content_policy::DestinationDecision;
     use crate::policy::{
         features::{
             FeatureProvider, FeatureRegistry, ProviderCategory, ProviderOutput,
@@ -1020,6 +982,74 @@ mod tests {
 
     struct ActiveRestrictionProvider {
         restriction_type: &'static str,
+    }
+
+    #[test]
+    fn native_content_feedback_has_no_notify_or_destination_details() {
+        let attribution = crate::content_policy::resolver::EffectAttribution {
+            policy_id: Uuid::from_u128(1),
+            policy_version: 1,
+            scope: crate::content_policy::PolicyScope::server("server-a"),
+            rule_id: Uuid::from_u128(2),
+            rule_name: "server-block".into(),
+            custom_reason: None,
+        };
+        let plan = ContentPolicyPlan::Call(crate::content_policy::CallPolicyPlan {
+            global: crate::content_policy::ResolvedScopeDecision {
+                scope: crate::content_policy::PolicyScope::global(),
+                matched_rules: Vec::new(),
+                delivery: crate::content_policy::DeliveryEffects::default(),
+                side_effects: Vec::new(),
+            },
+            variant: None,
+            destinations: vec![DestinationDecision {
+                target_index: 0,
+                server_id: "server-a".into(),
+                policy_id: Some(attribution.policy_id),
+                policy_version: Some(attribution.policy_version),
+                matched_rule_ids: vec![attribution.rule_id],
+                blocked_by: vec![attribution],
+                variant_fingerprint: None,
+            }],
+            variants: std::collections::BTreeMap::new(),
+            side_effects: Vec::new(),
+            sender_feedback: Some(SenderFeedback::ServerFilters {
+                destination_count: 1,
+            }),
+            evaluated_server_profiles: 1,
+        });
+        let action = Action {
+            id: Uuid::now_v7(),
+            action_type: "lobby.message.created".into(),
+            schema_version: 1,
+            scope: Scope {
+                scope_type: ScopeType::Lobby,
+                id: "lobby-1".into(),
+                product: Some(Product::Lobby),
+            },
+            subject: Subject {
+                user_id: Some("user-1".into()),
+                ..Subject::default()
+            },
+            occurred_at: Utc::now(),
+            attributes: serde_json::json!({}),
+            data_handling: DataHandlingClass::Sensitive,
+            prism_payload: None,
+        };
+
+        let effects = content_policy_effects(&action, &plan);
+        assert!(
+            effects
+                .iter()
+                .any(|item| matches!(item.effect, Effect::Allow { .. }))
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|item| matches!(item.effect, Effect::Notify { .. }))
+        );
+        let serialized = serde_json::to_string(&effects).unwrap();
+        assert!(!serialized.contains("filtered_destinations"));
     }
 
     #[async_trait::async_trait]

@@ -33,6 +33,12 @@ pub struct DestinationDecision {
     pub variant_fingerprint: Option<[u8; 32]>,
 }
 
+type ServerDestinationEvaluation = (
+    Vec<DestinationDecision>,
+    BTreeMap<[u8; 32], DeliveryVariant>,
+    usize,
+);
+
 impl DestinationDecision {
     pub fn is_blocked(&self) -> bool {
         !self.blocked_by.is_empty()
@@ -62,9 +68,14 @@ pub struct HubPolicyPlan {
 #[derive(Debug, Clone)]
 pub struct CallPolicyPlan {
     pub global: ResolvedScopeDecision,
+    /// Representative variant retained for legacy simulator/API consumers.
     pub variant: Option<DeliveryVariant>,
+    pub destinations: Vec<DestinationDecision>,
+    /// One materialized presentation per unique transformation result.
+    pub variants: BTreeMap<[u8; 32], DeliveryVariant>,
     pub side_effects: Vec<SideEffectRequest>,
     pub sender_feedback: Option<SenderFeedback>,
+    pub evaluated_server_profiles: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -100,24 +111,46 @@ impl ContentPolicyEvaluator {
         canonical: &Presentation,
         analyzed: &AnalyzedContent,
     ) -> Result<CallPolicyPlan, EvaluationError> {
+        let mut plan = self.evaluate_call_for_destinations(subject_id, canonical, analyzed, &[])?;
+        if plan.variant.is_none() && !plan.global.delivery.is_blocked() {
+            let presentation = with_analyzed_urls(canonical, analyzed);
+            let variant = materialize_variant(&presentation, &plan.global.delivery)?;
+            plan.variants.insert(variant.fingerprint, variant.clone());
+            plan.variant = Some(variant);
+        }
+        Ok(plan)
+    }
+
+    pub fn evaluate_call_for_destinations(
+        &self,
+        subject_id: &str,
+        canonical: &Presentation,
+        analyzed: &AnalyzedContent,
+        destinations: &[Destination],
+    ) -> Result<CallPolicyPlan, EvaluationError> {
         let global = evaluate_snapshot(PolicyScope::global(), self.snapshots.global(), analyzed)?;
-        let side_effects = self.cooldown_side_effects(subject_id, &global.side_effects);
         if global.delivery.is_blocked() {
-            return Ok(CallPolicyPlan {
-                global,
-                variant: None,
-                side_effects,
-                sender_feedback: Some(SenderFeedback::CallSafetyBlock),
-            });
+            let side_effects = self.cooldown_side_effects(subject_id, &global.side_effects);
+            return Ok(terminal_call_plan(global, destinations, side_effects));
         }
 
-        let presentation = with_analyzed_urls(canonical, analyzed);
-        let delivery = compose_delivery([&global.delivery]);
+        let (destinations, variants, evaluated_server_profiles) =
+            self.evaluate_server_destinations(&global.delivery, canonical, analyzed, destinations)?;
+        let side_effects = self.cooldown_side_effects(subject_id, &global.side_effects);
+        let filtered = destinations
+            .iter()
+            .filter(|destination| destination.is_blocked())
+            .count();
         Ok(CallPolicyPlan {
             global,
-            variant: Some(materialize_variant(&presentation, &delivery)?),
+            variant: variants.values().next().cloned(),
+            destinations,
+            variants,
             side_effects,
-            sender_feedback: None,
+            sender_feedback: (filtered > 0).then_some(SenderFeedback::ServerFilters {
+                destination_count: filtered,
+            }),
+            evaluated_server_profiles,
         })
     }
 
@@ -164,6 +197,33 @@ impl ContentPolicyEvaluator {
         }
 
         let shared_delivery = compose_delivery([&global.delivery, &hub.delivery]);
+        let (decisions, variants, evaluated_server_profiles) =
+            self.evaluate_server_destinations(&shared_delivery, canonical, analyzed, destinations)?;
+
+        let filtered = decisions
+            .iter()
+            .filter(|decision| decision.is_blocked())
+            .count();
+        Ok(HubPolicyPlan {
+            global,
+            hub,
+            destinations: decisions,
+            variants,
+            side_effects,
+            sender_feedback: (filtered > 0).then_some(SenderFeedback::ServerFilters {
+                destination_count: filtered,
+            }),
+            evaluated_server_profiles,
+        })
+    }
+
+    fn evaluate_server_destinations(
+        &self,
+        shared_delivery: &super::resolver::DeliveryEffects,
+        canonical: &Presentation,
+        analyzed: &AnalyzedContent,
+        destinations: &[Destination],
+    ) -> Result<ServerDestinationEvaluation, EvaluationError> {
         let presentation = with_analyzed_urls(canonical, analyzed);
         let mut profiles =
             BTreeMap::<[u8; 32], Vec<(Destination, Arc<CompiledPolicySnapshot>)>>::new();
@@ -182,7 +242,7 @@ impl ContentPolicyEvaluator {
         let mut decisions = Vec::with_capacity(destinations.len());
         let mut variants = BTreeMap::new();
         if !without_policy.is_empty() {
-            let variant = materialize_variant(&presentation, &shared_delivery)?;
+            let variant = materialize_variant(&presentation, shared_delivery)?;
             let fingerprint = variant.fingerprint;
             variants.insert(fingerprint, variant);
             decisions.extend(
@@ -207,7 +267,7 @@ impl ContentPolicyEvaluator {
                 representative.evaluate_normalized(analyzed.normalized_surfaces())?;
             let representative_scope =
                 resolve_scope(representative.scope.clone(), representative_matches.clone());
-            let composed = compose_delivery([&shared_delivery, &representative_scope.delivery]);
+            let composed = compose_delivery([shared_delivery, &representative_scope.delivery]);
             let variant = if composed.is_blocked() {
                 None
             } else {
@@ -247,21 +307,7 @@ impl ContentPolicyEvaluator {
         }
 
         decisions.sort_by_key(|decision| decision.target_index);
-        let filtered = decisions
-            .iter()
-            .filter(|decision| decision.is_blocked())
-            .count();
-        Ok(HubPolicyPlan {
-            global,
-            hub,
-            destinations: decisions,
-            variants,
-            side_effects,
-            sender_feedback: (filtered > 0).then_some(SenderFeedback::ServerFilters {
-                destination_count: filtered,
-            }),
-            evaluated_server_profiles,
-        })
+        Ok((decisions, variants, evaluated_server_profiles))
     }
 
     fn cooldown_side_effects(
@@ -281,6 +327,34 @@ impl ContentPolicyEvaluator {
             })
             .cloned()
             .collect()
+    }
+}
+
+fn terminal_call_plan(
+    global: ResolvedScopeDecision,
+    destinations: &[Destination],
+    side_effects: Vec<SideEffectRequest>,
+) -> CallPolicyPlan {
+    let blocked_by = global.delivery.blocked_by.clone();
+    CallPolicyPlan {
+        global,
+        variant: None,
+        destinations: destinations
+            .iter()
+            .map(|destination| DestinationDecision {
+                target_index: destination.target_index,
+                server_id: destination.server_id.clone(),
+                policy_id: None,
+                policy_version: None,
+                matched_rule_ids: Vec::new(),
+                blocked_by: blocked_by.clone(),
+                variant_fingerprint: None,
+            })
+            .collect(),
+        variants: BTreeMap::new(),
+        side_effects,
+        sender_feedback: Some(SenderFeedback::CallSafetyBlock),
+        evaluated_server_profiles: 0,
     }
 }
 

@@ -122,6 +122,8 @@ fn evaluate(
         return classify_error(&error);
     }
 
+    configure_execution_limits(&lua, limits);
+
     let returned: Value = match lua.load(bytecode).set_name("policy").eval() {
         Ok(value) => value,
         Err(error) => return classify_error(&error),
@@ -162,6 +164,10 @@ fn configure_sandbox(lua: &Lua, limits: &WorkerLimits) -> mlua::Result<()> {
     ] {
         lua.globals().set(forbidden, Value::Nil)?;
     }
+    Ok(())
+}
+
+fn configure_execution_limits(lua: &Lua, limits: &WorkerLimits) {
     let started = Instant::now();
     let interrupt_count = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&interrupt_count);
@@ -175,7 +181,6 @@ fn configure_sandbox(lua: &Lua, limits: &WorkerLimits) -> mlua::Result<()> {
         }
         Ok(VmState::Continue)
     });
-    Ok(())
 }
 
 fn sandbox_compiler() -> mlua::Compiler {

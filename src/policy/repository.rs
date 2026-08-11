@@ -2009,14 +2009,42 @@ fn apply_content_policy_plan(
         .unwrap_or_default();
     match plan {
         crate::content_policy::ContentPolicyPlan::Call(plan) => {
-            let Some(variant) = plan.variant.as_ref() else {
-                payload.targets.clear();
-                return Ok(());
-            };
-            let mut body: serde_json::Value = serde_json::from_str(&payload.payload)
-                .map_err(|_| anyhow::anyhow!("Prism content payload is not valid JSON"))?;
-            apply_delivery_variant(action, &mut body, structured_prefix, variant);
-            payload.payload = serde_json::to_string(&body)?;
+            let decisions = plan
+                .destinations
+                .iter()
+                .map(|decision| (decision.target_index, decision))
+                .collect::<HashMap<_, _>>();
+            let mut retained = Vec::with_capacity(payload.targets.len());
+            for (target_index, mut target) in payload.targets.drain(..).enumerate() {
+                let Some(decision) = decisions.get(&target_index) else {
+                    continue;
+                };
+                if decision.is_blocked() {
+                    continue;
+                }
+                let fingerprint = decision.variant_fingerprint.ok_or_else(|| {
+                    anyhow::anyhow!("allowed content-policy destination has no delivery variant")
+                })?;
+                let variant = plan
+                    .variants
+                    .get(&fingerprint)
+                    .ok_or_else(|| anyhow::anyhow!("content-policy delivery variant is missing"))?;
+                let mut overrides = target
+                    .overrides
+                    .as_deref()
+                    .map(serde_json::from_str::<serde_json::Value>)
+                    .transpose()
+                    .map_err(|_| anyhow::anyhow!("Prism target overrides are not valid JSON"))?
+                    .unwrap_or_else(|| serde_json::json!({}));
+                anyhow::ensure!(
+                    overrides.is_object(),
+                    "Prism target overrides must be a JSON object"
+                );
+                apply_delivery_variant(action, &mut overrides, structured_prefix, variant);
+                target.overrides = Some(serde_json::to_string(&overrides)?);
+                retained.push(target);
+            }
+            payload.targets = retained;
         }
         crate::content_policy::ContentPolicyPlan::Hub(plan) => {
             let decisions = plan
@@ -3274,10 +3302,14 @@ fn timestamp(value: chrono::DateTime<Utc>) -> prost_types::Timestamp {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActionCipher, HeldActionResolution, apply_censors_to_content, build_approved_content,
-        build_approved_prism_payload, cloud_event_headers, held_resolution_values, hold_deadline,
-        is_legal_bundle_transition, scope_partition_key, validate_bundle_fields,
-        validate_effect_for_action,
+        ActionCipher, HeldActionResolution, apply_censors_to_content, apply_content_policy_plan,
+        build_approved_content, build_approved_prism_payload, cloud_event_headers,
+        held_resolution_values, hold_deadline, is_legal_bundle_transition, scope_partition_key,
+        validate_bundle_fields, validate_effect_for_action,
+    };
+    use crate::content_policy::{
+        CallPolicyPlan, ContentPolicyPlan, DeliveryEffects, DeliveryVariant, DestinationDecision,
+        PolicyScope, ResolvedScopeDecision,
     };
     use crate::contract::prism;
     use crate::policy::model::{
@@ -3437,6 +3469,88 @@ mod tests {
             body["content"],
             "-# <:staff_badge:1>\nhello ██████\n-# <:developer_badge:2>"
         );
+    }
+
+    #[test]
+    fn call_variants_apply_after_existing_target_overrides() {
+        let mut action = action();
+        action.action_type = "lobby.message.created".into();
+        action.scope = Scope {
+            scope_type: ScopeType::Lobby,
+            id: "lobby-1".into(),
+            product: Some(Product::Lobby),
+        };
+        action.attributes = serde_json::json!({
+            "content": "canonical",
+            "display_name": "Alice",
+            "username": "alice",
+            "content_prefix": "prefix: "
+        });
+
+        let fingerprint = [7; 32];
+        let mut variants = std::collections::BTreeMap::new();
+        variants.insert(
+            fingerprint,
+            DeliveryVariant {
+                message_content: "safe content".into(),
+                display_name: "Alice".into(),
+                username: "InterChat User".into(),
+                server_name: "Server".into(),
+                hub_name: "".into(),
+                suppress_links: false,
+                fingerprint,
+            },
+        );
+        let mut payload = prism::PrismStreamPayload {
+            payload: "{}".into(),
+            targets: vec![prism::PrismTarget {
+                guild_id: Some("server-1".into()),
+                overrides: Some(
+                    serde_json::json!({
+                        "username": "target override",
+                        "keep": "existing"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = ContentPolicyPlan::Call(CallPolicyPlan {
+            global: ResolvedScopeDecision {
+                scope: PolicyScope::global(),
+                matched_rules: Vec::new(),
+                delivery: DeliveryEffects::default(),
+                side_effects: Vec::new(),
+            },
+            variant: None,
+            destinations: vec![DestinationDecision {
+                target_index: 0,
+                server_id: "server-1".into(),
+                policy_id: None,
+                policy_version: None,
+                matched_rule_ids: Vec::new(),
+                blocked_by: Vec::new(),
+                variant_fingerprint: Some(fingerprint),
+            }],
+            variants,
+            side_effects: Vec::new(),
+            sender_feedback: None,
+            evaluated_server_profiles: 0,
+        });
+
+        apply_content_policy_plan(&action, &mut payload, &plan).expect("call plan applies");
+
+        let overrides: serde_json::Value = serde_json::from_str(
+            payload.targets[0]
+                .overrides
+                .as_deref()
+                .expect("target overrides"),
+        )
+        .unwrap();
+        assert_eq!(overrides["content"], "prefix: safe content");
+        assert_eq!(overrides["username"], "InterChat User");
+        assert_eq!(overrides["keep"], "existing");
     }
 
     #[test]

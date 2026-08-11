@@ -5,8 +5,9 @@ use uuid::Uuid;
 use super::delivery::Presentation;
 use super::{
     AnalyzedContent, Authority, CompiledPolicySnapshot, ContentPolicy, ContentPolicyEvaluator,
-    Destination, PolicyAction, PolicyActionType, PolicyRule, PolicyScope, PolicySnapshotStore,
-    RulePattern, SenderFeedback, SideEffectCooldown, Surface, WildcardPatternType,
+    Destination, DestinationDecision, PolicyAction, PolicyActionType, PolicyRule, PolicyScope,
+    PolicySnapshotStore, RulePattern, SenderFeedback, SideEffectCooldown, Surface,
+    WildcardPatternType,
 };
 
 fn policy(id: u128, scope: PolicyScope, version: u64, rules: Vec<PolicyRule>) -> ContentPolicy {
@@ -99,7 +100,7 @@ fn destination(target_index: usize, server_id: &str) -> Destination {
 }
 
 #[tokio::test]
-async fn calls_evaluate_global_only() {
+async fn calls_without_destinations_evaluate_global_policy() {
     let evaluator = evaluator([
         policy(
             1,
@@ -143,13 +144,235 @@ async fn calls_evaluate_global_only() {
     let analyzed = AnalyzedContent::from_presentation(&canonical);
 
     let result = evaluator
-        .evaluate_call("subject", &canonical, &analyzed)
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-2")],
+        )
         .unwrap();
 
     assert_eq!(result.global.scope.authority, Authority::Global);
     assert_eq!(result.global.matched_rules.len(), 1);
-    assert_eq!(&*result.variant.unwrap().message_content, "b#d");
+    assert_eq!(
+        &*result.variants.values().next().unwrap().message_content,
+        "b#d"
+    );
     assert!(result.sender_feedback.is_none());
+}
+
+#[tokio::test]
+async fn call_server_censor_applies_only_to_matching_destination() {
+    let evaluator = evaluator([policy(
+        90,
+        PolicyScope::server("server-a"),
+        1,
+        vec![rule(
+            91,
+            "server-censor",
+            "bad",
+            Surface::MessageContent,
+            vec![action(92, PolicyActionType::CensorMatch)],
+        )],
+    )])
+    .await;
+    let canonical = presentation("bad");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-a"), destination(1, "server-b")],
+        )
+        .unwrap();
+
+    let variants = &result.variants;
+    let server_a = &result.destinations[0];
+    let server_b = &result.destinations[1];
+    assert_eq!(
+        &*variants[&server_a.variant_fingerprint.unwrap()].message_content,
+        "b#d"
+    );
+    assert_eq!(
+        &*variants[&server_b.variant_fingerprint.unwrap()].message_content,
+        "bad"
+    );
+    assert!(result.sender_feedback.is_none());
+}
+
+#[tokio::test]
+async fn call_server_block_withholds_only_matching_destination() {
+    let evaluator = evaluator([policy(
+        100,
+        PolicyScope::server("blocked-server"),
+        1,
+        vec![rule(
+            101,
+            "server-block",
+            "bad",
+            Surface::MessageContent,
+            vec![action(102, PolicyActionType::Block)],
+        )],
+    )])
+    .await;
+    let canonical = presentation("bad");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[
+                destination(0, "blocked-server"),
+                destination(1, "allowed-server"),
+            ],
+        )
+        .unwrap();
+
+    assert!(result.destinations[0].is_blocked());
+    assert!(result.destinations[0].variant_fingerprint.is_none());
+    assert!(!result.destinations[1].is_blocked());
+    assert_eq!(result.variants.len(), 1);
+    assert_eq!(
+        result.sender_feedback,
+        Some(SenderFeedback::ServerFilters {
+            destination_count: 1,
+        })
+    );
+}
+
+#[tokio::test]
+async fn call_global_block_is_terminal_for_every_destination_with_attribution() {
+    let evaluator = evaluator([policy(
+        105,
+        PolicyScope::global(),
+        1,
+        vec![rule_with_reason(
+            106,
+            "global-block",
+            "bad",
+            Surface::MessageContent,
+            Some("global reason"),
+            vec![action(107, PolicyActionType::Block)],
+        )],
+    )])
+    .await;
+    let canonical = presentation("bad");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-a"), destination(1, "server-b")],
+        )
+        .unwrap();
+
+    assert!(result.variants.is_empty());
+    assert!(
+        result
+            .destinations
+            .iter()
+            .all(DestinationDecision::is_blocked)
+    );
+    assert!(result.destinations.iter().all(|destination| {
+        destination.blocked_by[0].custom_reason.as_deref() == Some("global reason")
+    }));
+    assert_eq!(result.evaluated_server_profiles, 0);
+    assert_eq!(
+        result.sender_feedback,
+        Some(SenderFeedback::CallSafetyBlock)
+    );
+}
+
+#[tokio::test]
+async fn call_server_name_replacement_uses_safe_legacy_compatibility_value() {
+    let evaluator = evaluator([policy(
+        110,
+        PolicyScope::server("server-a"),
+        1,
+        vec![rule(
+            111,
+            "server-replace-name",
+            "Alice",
+            Surface::DisplayName,
+            vec![action_with_replacement(
+                112,
+                PolicyActionType::ReplaceName,
+                Some("Legacy replacement"),
+            )],
+        )],
+    )])
+    .await;
+    let canonical = presentation("hello");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-a"), destination(1, "server-b")],
+        )
+        .unwrap();
+    let server_a = &result.destinations[0];
+    let server_b = &result.destinations[1];
+
+    let server_a_variant = &result.variants[&server_a.variant_fingerprint.unwrap()];
+    assert_eq!(
+        &*server_a_variant.display_name,
+        crate::content_policy::delivery::DEFAULT_SAFE_NAME
+    );
+    assert_eq!(&*server_a_variant.username, "alice");
+    let server_b_variant = &result.variants[&server_b.variant_fingerprint.unwrap()];
+    assert_eq!(&*server_b_variant.display_name, "Alice");
+    assert_eq!(&*server_b_variant.username, "alice");
+}
+
+#[tokio::test]
+async fn hub_name_replacement_ignores_legacy_configured_custom_replacement() {
+    let evaluator = evaluator([
+        policy(115, PolicyScope::global(), 1, Vec::new()),
+        policy(
+            116,
+            PolicyScope::hub("hub-1"),
+            1,
+            vec![rule(
+                117,
+                "hub-replace-name",
+                "Alice",
+                Surface::DisplayName,
+                vec![action_with_replacement(
+                    118,
+                    PolicyActionType::ReplaceName,
+                    Some("Legacy replacement"),
+                )],
+            )],
+        ),
+    ])
+    .await;
+    let canonical = presentation("hello");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_hub(
+            "subject",
+            "hub-1",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-1")],
+        )
+        .unwrap();
+    let variant = &result.variants[&result.destinations[0].variant_fingerprint.unwrap()];
+
+    assert_eq!(
+        &*variant.display_name,
+        crate::content_policy::delivery::DEFAULT_SAFE_NAME
+    );
 }
 
 #[tokio::test]
@@ -460,7 +683,10 @@ async fn transforms_compose_across_global_hub_and_server_layers() {
     let variant = result.variants.values().next().unwrap();
 
     assert_eq!(&*variant.message_content, "b#d  a###l");
-    assert_eq!(&*variant.display_name, "Masked");
+    assert_eq!(
+        &*variant.display_name,
+        crate::content_policy::delivery::DEFAULT_SAFE_NAME
+    );
     assert!(variant.suppress_links);
     assert!(!result.destinations[0].is_blocked());
 }
@@ -487,14 +713,30 @@ async fn delivery_actions_are_not_suppressed_by_side_effect_cooldown() {
     let analyzed = AnalyzedContent::from_presentation(&canonical);
 
     let first = evaluator
-        .evaluate_call("subject", &canonical, &analyzed)
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-1")],
+        )
         .unwrap();
     let second = evaluator
-        .evaluate_call("subject", &canonical, &analyzed)
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-1")],
+        )
         .unwrap();
 
-    assert_eq!(&*first.variant.unwrap().message_content, "b#d");
-    assert_eq!(&*second.variant.unwrap().message_content, "b#d");
+    assert_eq!(
+        &*first.variants.values().next().unwrap().message_content,
+        "b#d"
+    );
+    assert_eq!(
+        &*second.variants.values().next().unwrap().message_content,
+        "b#d"
+    );
     assert_eq!(first.side_effects.len(), 1);
     assert!(second.side_effects.is_empty());
 }
