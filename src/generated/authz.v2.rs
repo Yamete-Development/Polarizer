@@ -442,7 +442,10 @@ pub struct RecordDiscordRoleSyncResultRequest {
     #[prost(uint64, tag = "5")]
     pub expected_version: u64,
 }
-/// Staff permissions are persisted as a positive 31-bit mask. Values are stable.
+/// Legacy named permissions that fit protobuf's signed int32 enum range.
+/// Permission masks are uint64; bit 31 is MANAGE_GLOBAL_CONTENT_POLICY and is
+/// defined by Iris/Python mask constants because +2147483648 is not a valid
+/// protobuf enum value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum StaffPermission {
