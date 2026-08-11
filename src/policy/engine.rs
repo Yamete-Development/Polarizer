@@ -309,10 +309,8 @@ impl PolicyEngine {
                     active_restriction: Some(restriction),
                 },
             });
-        } else if !terminal_restriction_hold {
-            if let Some(plan) = content_policy.as_ref() {
-                emitted.extend(content_policy_effects(action, plan));
-            }
+        } else if !terminal_restriction_hold && let Some(plan) = content_policy.as_ref() {
+            emitted.extend(content_policy_effects(action, plan));
         }
 
         for policy in policies {
@@ -690,7 +688,7 @@ fn active_restriction_from_snapshot(
                     "LOBBY" => Some(crate::policy::model::Product::Lobby),
                     _ => None,
                 })
-                .or_else(|| match scope_type {
+                .or(match scope_type {
                     ScopeType::Hub => Some(crate::policy::model::Product::Hub),
                     ScopeType::Lobby => Some(crate::policy::model::Product::Lobby),
                     _ => None,

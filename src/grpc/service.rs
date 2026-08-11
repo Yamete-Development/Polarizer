@@ -4526,7 +4526,7 @@ fn effect_from_proto(effect: v2::PolicyEffect) -> Result<Effect, Status> {
             enforcement: value
                 .enforcement
                 .map(|enforcement| {
-                    Ok(crate::policy::model::Enforcement {
+                    Ok::<_, Status>(crate::policy::model::Enforcement {
                         subject: subject_from_proto(enforcement.subject),
                         restriction_type: restriction_type_name(enforcement.r#type)?,
                         reason: enforcement.reason,
@@ -4938,6 +4938,7 @@ fn command_result_to_proto(
         Some(v2::command_envelope::Command::Notify(_)) => "NOTIFY",
         Some(v2::command_envelope::Command::Delete(_)) => "DELETE",
         Some(v2::command_envelope::Command::Kick(_)) => "KICK",
+        Some(v2::command_envelope::Command::ModerationNotice(_)) => "MODERATION_NOTICE",
         None => "UNSPECIFIED",
     };
     v2::CommandResult {

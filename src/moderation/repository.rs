@@ -689,7 +689,7 @@ impl ModerationRepository {
                     source_channel_id: String::new(),
                     source_message_id: String::new(),
                     source_user_id: user_id.to_owned(),
-                    record_version,
+                    record_version: u64::try_from(record_version)?,
                 },
             )),
         };

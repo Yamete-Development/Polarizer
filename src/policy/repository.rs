@@ -2899,6 +2899,7 @@ async fn insert_policy_audit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_moderation_notice_command(
     tx: &mut Transaction<'_, Postgres>,
     command_topic: &str,
@@ -2972,7 +2973,7 @@ pub(crate) async fn insert_moderation_notice_command(
         source_channel_id: action.subject.channel_id.clone().unwrap_or_default(),
         source_message_id: action.subject.message_id.clone().unwrap_or_default(),
         source_user_id: user_id.to_owned(),
-        record_version,
+        record_version: u64::try_from(record_version)?,
     };
     let command = v2::CommandEnvelope {
         id: Uuid::now_v7().to_string(),
