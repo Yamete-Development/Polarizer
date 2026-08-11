@@ -213,10 +213,10 @@ impl PolicyEngine {
 
         let is_message_action = action.action_type.starts_with("hub.message.")
             || action.action_type.starts_with("lobby.message.");
-        if is_message_action && content_policy.is_none() {
+        if is_message_action {
             requirements.push(crate::policy::model::FeatureRequirement {
                 name: "restrictions.active".into(),
-                error_behavior: crate::policy::model::ErrorBehavior::Continue,
+                error_behavior: crate::policy::model::ErrorBehavior::Hold,
                 deadline_ms: 500,
                 maximum_data_handling: action.data_handling,
                 configuration: serde_json::Value::Null,
@@ -228,50 +228,90 @@ impl PolicyEngine {
         let mut rule_traces = Vec::new();
         let mut policy_versions = Vec::new();
         let mut terminal_global_block = false;
+        let mut terminal_restriction_hold = false;
         let mut had_error = false;
 
-        if let Some(plan) = content_policy.as_ref() {
-            emitted.extend(content_policy_effects(action, plan));
-        }
-
-        if is_message_action && content_policy.is_none() {
+        let active_restriction = if is_message_action {
             let reqs = vec![crate::policy::model::FeatureRequirement {
                 name: "restrictions.active".into(),
-                error_behavior: crate::policy::model::ErrorBehavior::Continue,
+                error_behavior: crate::policy::model::ErrorBehavior::Hold,
                 deadline_ms: 500,
                 maximum_data_handling: action.data_handling,
                 configuration: serde_json::Value::Null,
             }];
             let snapshot = resolved_features.runtime_snapshot(&reqs);
-            if let Some(val) = snapshot.get("restrictions.active")
-                && let Some(arr) = val.value.as_ref().and_then(|v| v.as_array())
-            {
-                for r in arr {
-                    if let Some(rtype) = r.get("restriction_type").and_then(|v| v.as_str())
-                        && (rtype == "BAN" || rtype == "MUTE" || rtype == "BLACKLIST")
-                    {
-                        terminal_global_block = true;
-                        emitted.push(EmittedEffect {
-                            origin: EffectOrigin {
-                                policy_bundle_id: Uuid::nil(),
-                                policy_version_id: Uuid::nil(),
-                                rule_id: "builtin.moderation".into(),
-                                scope: action.scope.clone(),
-                                priority: 1000,
-                                mandatory: true,
-                            },
-                            effect: Effect::Block {
-                                effect_id: Uuid::new_v4().to_string(),
-                                reason_codes: vec![format!("ACTIVE_{}", rtype)],
-                                public_reason: Some(format!(
-                                    "You have an active {}.",
-                                    rtype.to_lowercase()
-                                )),
-                            },
-                        });
-                        break;
+            match snapshot.get("restrictions.active") {
+                Some(feature) if feature.error.is_none() => {
+                    match active_restriction_from_snapshot(&snapshot) {
+                        Ok(restriction) => restriction,
+                        Err(_) => {
+                            had_error = true;
+                            terminal_restriction_hold = true;
+                            emitted.push(EmittedEffect {
+                                origin: EffectOrigin {
+                                    policy_bundle_id: Uuid::nil(),
+                                    policy_version_id: Uuid::nil(),
+                                    rule_id: "builtin.moderation".into(),
+                                    scope: action.scope.clone(),
+                                    priority: 1_001,
+                                    mandatory: true,
+                                },
+                                effect: Effect::Hold {
+                                    effect_id: format!("{}:restrictions-active", action.id),
+                                    reason_codes: vec!["ACTIVE_RESTRICTIONS_UNAVAILABLE".into()],
+                                    maximum_duration_ms: None,
+                                },
+                            });
+                            None
+                        }
                     }
                 }
+                Some(_) | None => {
+                    had_error = true;
+                    terminal_restriction_hold = true;
+                    emitted.push(EmittedEffect {
+                        origin: EffectOrigin {
+                            policy_bundle_id: Uuid::nil(),
+                            policy_version_id: Uuid::nil(),
+                            rule_id: "builtin.moderation".into(),
+                            scope: action.scope.clone(),
+                            priority: 1_001,
+                            mandatory: true,
+                        },
+                        effect: Effect::Hold {
+                            effect_id: format!("{}:restrictions-active", action.id),
+                            reason_codes: vec!["ACTIVE_RESTRICTIONS_UNAVAILABLE".into()],
+                            maximum_duration_ms: None,
+                        },
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(restriction) = active_restriction.clone() {
+            terminal_global_block = true;
+            emitted.push(EmittedEffect {
+                origin: EffectOrigin {
+                    policy_bundle_id: Uuid::nil(),
+                    policy_version_id: Uuid::nil(),
+                    rule_id: "builtin.moderation".into(),
+                    scope: action.scope.clone(),
+                    priority: 1000,
+                    mandatory: true,
+                },
+                effect: Effect::Block {
+                    effect_id: Uuid::new_v4().to_string(),
+                    reason_codes: vec![format!("ACTIVE_{}", restriction.restriction_type)],
+                    public_reason: restriction.public_reason.clone(),
+                    active_restriction: Some(restriction),
+                },
+            });
+        } else if !terminal_restriction_hold {
+            if let Some(plan) = content_policy.as_ref() {
+                emitted.extend(content_policy_effects(action, plan));
             }
         }
 
@@ -283,12 +323,16 @@ impl PolicyEngine {
                 continue;
             }
             policy_versions.push(policy.version.id);
-            if terminal_global_block {
+            if terminal_global_block || terminal_restriction_hold {
                 rule_traces.push(RuleTrace {
                     policy_version_id: policy.version.id,
                     rule_id: "*".into(),
                     skipped: true,
-                    skip_reason: Some("terminal global mandatory block".into()),
+                    skip_reason: Some(if terminal_global_block {
+                        "terminal global mandatory block".into()
+                    } else {
+                        "active restriction state unavailable".into()
+                    }),
                     conditions: Vec::new(),
                     emitted_effects: Vec::new(),
                     error: None,
@@ -599,6 +643,103 @@ fn presentation_from_action(action: &Action) -> Presentation {
     }
 }
 
+fn active_restriction_from_snapshot(
+    snapshot: &crate::policy::model::FeatureSnapshot,
+) -> anyhow::Result<Option<crate::policy::model::ActiveRestriction>> {
+    let value = snapshot
+        .get("restrictions.active")
+        .and_then(|feature| feature.value.as_ref())
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("active restriction feature is malformed"))?;
+
+    let restrictions = value
+        .iter()
+        .map(|restriction| {
+            let restriction = restriction
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("active restriction entry is malformed"))?;
+            let restriction_type = restriction
+                .get("restriction_type")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("active restriction type is missing"))?;
+            if !matches!(restriction_type, "BAN" | "MUTE" | "BLACKLIST") {
+                return Ok(None);
+            }
+            let scope_type = restriction
+                .get("scope_type")
+                .or_else(|| restriction.get("scope").and_then(|scope| scope.get("type")))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("PLATFORM");
+            let scope_id = restriction
+                .get("scope_id")
+                .or_else(|| restriction.get("scope").and_then(|scope| scope.get("id")))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let scope_type = match scope_type {
+                "HUB" => ScopeType::Hub,
+                "LOBBY" => ScopeType::Lobby,
+                "PRODUCT" => ScopeType::Product,
+                "INCIDENT_OVERLAY" => ScopeType::IncidentOverlay,
+                _ => ScopeType::Platform,
+            };
+            let product = restriction
+                .get("scope_product")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| match value {
+                    "HUB" => Some(crate::policy::model::Product::Hub),
+                    "LOBBY" => Some(crate::policy::model::Product::Lobby),
+                    _ => None,
+                })
+                .or_else(|| match scope_type {
+                    ScopeType::Hub => Some(crate::policy::model::Product::Hub),
+                    ScopeType::Lobby => Some(crate::policy::model::Product::Lobby),
+                    _ => None,
+                });
+            let expires_at = restriction
+                .get("expires_at")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc));
+            Ok(Some(crate::policy::model::ActiveRestriction {
+                id: restriction
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                restriction_type: restriction_type.to_owned(),
+                scope: crate::policy::model::Scope {
+                    scope_type,
+                    id: scope_id.to_owned(),
+                    product,
+                },
+                public_reason: restriction
+                    .get("public_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                expires_at,
+            }))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .min_by_key(|restriction| {
+            let type_rank = match restriction.restriction_type.as_str() {
+                "BLACKLIST" => 0,
+                "BAN" => 1,
+                "MUTE" => 2,
+                _ => 3,
+            };
+            let scope_rank = match restriction.scope.scope_type {
+                ScopeType::Platform => 0,
+                ScopeType::Product => 1,
+                ScopeType::Hub | ScopeType::Lobby => 2,
+                ScopeType::IncidentOverlay => 3,
+            };
+            (type_rank, scope_rank, restriction.id.clone())
+        });
+    Ok(restrictions)
+}
+
 fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<EmittedEffect> {
     let (blocked_by, side_effects, feedback_attribution) = match plan {
         ContentPolicyPlan::Hub(plan) => {
@@ -645,6 +786,7 @@ fn content_policy_effects(action: &Action, plan: &ContentPolicyPlan) -> Vec<Emit
                     authority_name(attribution.scope.authority)
                 )],
                 public_reason: attribution.custom_reason.clone(),
+                active_restriction: None,
             },
         ));
     }
@@ -736,52 +878,41 @@ fn native_side_effects(
                 infraction_type: "WARNING".into(),
                 reason,
                 duration_ms,
+                enforcement: None,
             },
         )],
-        PolicyActionType::HubMute if action.scope.scope_type == ScopeType::Hub => vec![
-            make(
-                action_scope.clone(),
-                Effect::CreateInfraction {
-                    effect_id: id("hub-mute-infraction"),
-                    subject: subject.clone(),
-                    infraction_type: "MUTE".into(),
-                    reason: reason.clone(),
-                    duration_ms,
-                },
-            ),
-            make(
-                action_scope,
-                Effect::CreateRestriction {
-                    effect_id: id("hub-mute-restriction"),
+        PolicyActionType::HubMute if action.scope.scope_type == ScopeType::Hub => vec![make(
+            action_scope.clone(),
+            Effect::CreateInfraction {
+                effect_id: id("hub-mute-infraction"),
+                subject: subject.clone(),
+                infraction_type: "MUTE".into(),
+                reason: reason.clone(),
+                duration_ms,
+                enforcement: Some(crate::policy::model::Enforcement {
                     subject,
                     restriction_type: "MUTE".into(),
                     reason,
                     duration_ms,
-                },
-            ),
-        ],
-        PolicyActionType::HubBan if action.scope.scope_type == ScopeType::Hub => vec![
-            make(
-                action_scope.clone(),
-                Effect::CreateInfraction {
-                    effect_id: id("hub-ban-infraction"),
-                    subject: subject.clone(),
-                    infraction_type: "BAN".into(),
-                    reason: reason.clone(),
-                    duration_ms,
-                },
-            ),
-            make(
-                action_scope,
-                Effect::CreateRestriction {
-                    effect_id: id("hub-ban-restriction"),
+                }),
+            },
+        )],
+        PolicyActionType::HubBan if action.scope.scope_type == ScopeType::Hub => vec![make(
+            action_scope.clone(),
+            Effect::CreateInfraction {
+                effect_id: id("hub-ban-infraction"),
+                subject: subject.clone(),
+                infraction_type: "BAN".into(),
+                reason: reason.clone(),
+                duration_ms,
+                enforcement: Some(crate::policy::model::Enforcement {
                     subject,
                     restriction_type: "BAN".into(),
                     reason,
                     duration_ms,
-                },
-            ),
-        ],
+                }),
+            },
+        )],
         PolicyActionType::LobbyWarn if action.scope.scope_type == ScopeType::Lobby => vec![make(
             action_scope,
             Effect::CreateInfraction {
@@ -790,38 +921,39 @@ fn native_side_effects(
                 infraction_type: "WARNING".into(),
                 reason,
                 duration_ms,
+                enforcement: None,
             },
         )],
-        PolicyActionType::LobbyBan if action.scope.scope_type == ScopeType::Lobby => vec![
-            make(
-                action_scope.clone(),
-                Effect::CreateInfraction {
-                    effect_id: id("lobby-ban-infraction"),
-                    subject: subject.clone(),
-                    infraction_type: "BAN".into(),
-                    reason: reason.clone(),
-                    duration_ms,
-                },
-            ),
-            make(
-                action_scope,
-                Effect::CreateRestriction {
-                    effect_id: id("lobby-ban-restriction"),
+        PolicyActionType::LobbyBan if action.scope.scope_type == ScopeType::Lobby => vec![make(
+            action_scope.clone(),
+            Effect::CreateInfraction {
+                effect_id: id("lobby-ban-infraction"),
+                subject: subject.clone(),
+                infraction_type: "BAN".into(),
+                reason: reason.clone(),
+                duration_ms,
+                enforcement: Some(crate::policy::model::Enforcement {
                     subject,
                     restriction_type: "BAN".into(),
                     reason,
                     duration_ms,
-                },
-            ),
-        ],
+                }),
+            },
+        )],
         PolicyActionType::Blacklist => vec![make(
             platform_scope,
-            Effect::CreateRestriction {
-                effect_id: id("blacklist"),
-                subject,
-                restriction_type: "BLACKLIST".into(),
-                reason,
+            Effect::CreateInfraction {
+                effect_id: id("blacklist-infraction"),
+                subject: subject.clone(),
+                infraction_type: "BAN".into(),
+                reason: reason.clone(),
                 duration_ms,
+                enforcement: Some(crate::policy::model::Enforcement {
+                    subject,
+                    restriction_type: "BLACKLIST".into(),
+                    reason,
+                    duration_ms,
+                }),
             },
         )],
         _ => Vec::new(),
@@ -1128,6 +1260,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_actions_hold_when_active_restrictions_are_unavailable() {
+        let repo = Arc::new(InMemoryPolicyRepository::default());
+        let mut engine = PolicyEngine::new(repo, Arc::new(FeatureRegistry::default()), 0.0);
+        engine.register_runtime(Arc::new(PolicyIrRuntime));
+
+        let action = Action {
+            id: Uuid::now_v7(),
+            action_type: "lobby.message.created".into(),
+            schema_version: 1,
+            scope: Scope {
+                scope_type: ScopeType::Lobby,
+                id: "lobby-1".into(),
+                product: Some(Product::Lobby),
+            },
+            subject: Subject {
+                user_id: Some("user-1".into()),
+                ..Subject::default()
+            },
+            occurred_at: Utc::now(),
+            attributes: serde_json::json!({}),
+            data_handling: DataHandlingClass::Sensitive,
+            prism_payload: None,
+        };
+
+        let (result, _) = engine.evaluate(&action, false).await.unwrap();
+
+        assert_eq!(result.decision, Decision::Hold);
+        assert!(
+            result
+                .reason_codes
+                .contains(&"ACTIVE_RESTRICTIONS_UNAVAILABLE".to_owned())
+        );
+    }
+
+    #[test]
+    fn product_restriction_snapshot_preserves_lobby_product() {
+        let mut snapshot = crate::policy::model::FeatureSnapshot::new();
+        snapshot.insert(
+            "restrictions.active".into(),
+            crate::policy::model::FeatureValue {
+                provider: "postgres".into(),
+                provider_version: "postgres-v2".into(),
+                value: Some(serde_json::json!([{
+                    "id": "restriction-1",
+                    "restriction_type": "BAN",
+                    "scope_type": "PRODUCT",
+                    "scope_id": "",
+                    "scope_product": "LOBBY",
+                    "reason": "lobby ban",
+                    "expires_at": null
+                }])),
+                error: None,
+                latency_micros: 0,
+                cache_hit: false,
+                input_hash: None,
+            },
+        );
+
+        let restriction = active_restriction_from_snapshot(&snapshot)
+            .expect("valid restriction snapshot")
+            .expect("restriction exists");
+
+        assert_eq!(restriction.scope.scope_type, ScopeType::Product);
+        assert_eq!(
+            restriction.scope.product,
+            Some(crate::policy::model::Product::Lobby)
+        );
+    }
+
+    #[tokio::test]
     async fn engine_enforces_global_precedence_and_persists_once() {
         let repo = Arc::new(InMemoryPolicyRepository::default());
         let manifest = PolicyManifest {
@@ -1158,7 +1360,11 @@ mod tests {
                 &manifest,
             ),
         ]);
-        let mut engine = PolicyEngine::new(repo.clone(), Arc::new(FeatureRegistry::default()), 0.0);
+        let features = FeatureRegistry::from_providers([Arc::new(ActiveRestrictionProvider {
+            restriction_type: "",
+        }) as Arc<dyn FeatureProvider>])
+        .unwrap();
+        let mut engine = PolicyEngine::new(repo.clone(), Arc::new(features), 0.0);
         engine.register_runtime(runtime);
         let action = Action {
             id: Uuid::now_v7(),
@@ -1202,7 +1408,11 @@ mod tests {
             artifact.bytes,
             &manifest,
         ));
-        let mut engine = PolicyEngine::new(repo, Arc::new(FeatureRegistry::default()), 0.0);
+        let features = FeatureRegistry::from_providers([Arc::new(ActiveRestrictionProvider {
+            restriction_type: "",
+        }) as Arc<dyn FeatureProvider>])
+        .unwrap();
+        let mut engine = PolicyEngine::new(repo, Arc::new(features), 0.0);
         engine.register_runtime(runtime);
         let action = Action {
             id: Uuid::now_v7(),
@@ -1269,6 +1479,12 @@ mod tests {
         let features = Arc::new(FeatureRegistry::default());
         features
             .register(Arc::new(NormalizedTextProvider))
+            .await
+            .unwrap();
+        features
+            .register(Arc::new(ActiveRestrictionProvider {
+                restriction_type: "",
+            }))
             .await
             .unwrap();
         let mut engine = PolicyEngine::new(repo, features, 0.0);

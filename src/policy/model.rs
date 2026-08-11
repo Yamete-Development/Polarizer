@@ -208,6 +208,23 @@ pub struct TextSpan {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActiveRestriction {
+    pub id: String,
+    pub restriction_type: String,
+    pub scope: Scope,
+    pub public_reason: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Enforcement {
+    pub subject: Subject,
+    pub restriction_type: String,
+    pub reason: String,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Effect {
     Allow {
@@ -218,6 +235,7 @@ pub enum Effect {
         effect_id: String,
         reason_codes: Vec<String>,
         public_reason: Option<String>,
+        active_restriction: Option<ActiveRestriction>,
     },
     Hold {
         effect_id: String,
@@ -248,6 +266,7 @@ pub enum Effect {
         infraction_type: String,
         reason: String,
         duration_ms: Option<u64>,
+        enforcement: Option<Enforcement>,
     },
     CreateRestriction {
         effect_id: String,

@@ -76,7 +76,10 @@ async fn main() -> anyhow::Result<()> {
         loaded_content_policy_scopes,
         "native content policies compiled"
     );
-    let moderation = Arc::new(ModerationRepository::new(db.clone()));
+    let moderation = Arc::new(ModerationRepository::new(
+        db.clone(),
+        config.command_topic.clone(),
+    ));
     let commands = Arc::new(CommandRepository::new(
         db.clone(),
         config.command_result_topic.clone(),

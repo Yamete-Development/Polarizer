@@ -28,7 +28,7 @@ pub struct CommandOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandCompletion {
     pub outcome: CommandOutcome,
-    pub decision_id: Uuid,
+    pub decision_id: Option<Uuid>,
     pub idempotency_key: String,
     pub command_type: String,
     pub version: i64,
@@ -257,7 +257,7 @@ impl CommandRepository {
             return Err(CommandRepositoryError::VersionMismatch);
         }
 
-        let decision_id: Uuid = row.try_get("decision_id")?;
+        let decision_id: Option<Uuid> = row.try_get("decision_id")?;
         let command_type: String = row.try_get("command_type")?;
         let idempotency_key: String = row.try_get("idempotency_key")?;
         let updated = sqlx::query(
@@ -278,7 +278,9 @@ impl CommandRepository {
 
         let event = v2::CommandResult {
             command_id: command_id.to_string(),
-            decision_id: decision_id.to_string(),
+            decision_id: decision_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             idempotency_key,
             success: outcome.success,
             result_code: outcome.result_code.clone(),

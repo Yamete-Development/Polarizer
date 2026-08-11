@@ -4479,6 +4479,7 @@ fn effect_from_proto(effect: v2::PolicyEffect) -> Result<Effect, Status> {
             effect_id,
             reason_codes: value.reason_codes,
             public_reason: nonempty(value.public_reason),
+            active_restriction: None,
         }),
         ProtoEffect::Hold(value) => Ok(Effect::Hold {
             effect_id,
@@ -4522,6 +4523,17 @@ fn effect_from_proto(effect: v2::PolicyEffect) -> Result<Effect, Status> {
             infraction_type: infraction_type_name(value.r#type)?,
             reason: value.reason,
             duration_ms: value.duration.map(duration_to_millis).transpose()?,
+            enforcement: value
+                .enforcement
+                .map(|enforcement| {
+                    Ok(crate::policy::model::Enforcement {
+                        subject: subject_from_proto(enforcement.subject),
+                        restriction_type: restriction_type_name(enforcement.r#type)?,
+                        reason: enforcement.reason,
+                        duration_ms: enforcement.duration.map(duration_to_millis).transpose()?,
+                    })
+                })
+                .transpose()?,
         }),
         ProtoEffect::CreateRestriction(value) => Ok(Effect::CreateRestriction {
             effect_id,
@@ -4945,7 +4957,10 @@ fn completion_result_to_proto(
 ) -> v2::CommandResult {
     v2::CommandResult {
         command_id: command_id.to_string(),
-        decision_id: completion.decision_id.to_string(),
+        decision_id: completion
+            .decision_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
         idempotency_key: completion.idempotency_key.clone(),
         success: completion.outcome.success,
         result_code: completion.outcome.result_code.clone(),

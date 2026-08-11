@@ -38,7 +38,7 @@ Missing or malformed event types go to the restricted corresponding `.dlq` topic
 
 ### Durable command delivery
 
-Polarizer writes every `NOTIFY`, `DELETE`, or `KICK` command to `trust_safety.processed_command` in the same transaction that persists the decision and outbox record. Bot consumers must use `ClaimCommand` before a side effect and `CompleteCommand` afterward:
+Polarizer writes every `NOTIFY`, `MODERATION_NOTICE`, `DELETE`, or `KICK` command to `trust_safety.processed_command` in the same transaction that persists the decision/resource and outbox record. Bot consumers must use `ClaimCommand` before a side effect and `CompleteCommand` afterward:
 
 - Claims use a claimant ID and expiring lease token.
 - The claim returns Polarizer's stored canonical `CommandEnvelope`; consumers never execute a potentially altered Kafka body.
@@ -47,6 +47,9 @@ Polarizer writes every `NOTIFY`, `DELETE`, or `KICK` command to `trust_safety.pr
 - An expired retry-safe lease may be claimed again.
 - An expired non-retry-safe lease becomes `RECOVERY_REQUIRED`; it is never executed automatically again.
 - Completion requires the current lease token and stores success, result code, and typed result metadata durably.
+- `MODERATION_NOTICE` commands are the canonical user-facing feedback path for automod, manual moderation, reports, and restriction edits. Manual notices may have no decision record; their `decision_id` is therefore nullable.
+- A moderation notice attempts a direct message first. An automod notice may fall back only to a short-lived reply on the target user's own source message after verifying the message author; it never sends a sanction notice to a moderator or arbitrary report channel.
+- Moderation notices are non-retry-safe. An ambiguous Discord response is recorded as delivery-uncertain for operator recovery instead of risking a duplicate user notification.
 
 The Polarizer ledger and RPCs and the bot claim/complete consumer are implemented. Kafka acknowledgment happens only after `CompleteCommand` durably stores the outcome and enqueues its result event; a transient failure is deferred without being converted into a poison-message DLQ acknowledgment.
 

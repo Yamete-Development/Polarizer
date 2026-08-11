@@ -1720,7 +1720,7 @@ impl PolicyRepository for PostgresPolicyRepository {
         }
 
         for emitted in &result.accepted_effects {
-            apply_effect(&mut tx, result.id, action, emitted).await?;
+            apply_effect(&mut tx, result.id, action, emitted, &self.command_topic).await?;
             if let Some(command) = command_for_effect(result.id, &emitted.effect) {
                 register_command(&mut tx, &command).await?;
                 insert_outbox(
@@ -1729,7 +1729,7 @@ impl PolicyRepository for PostgresPolicyRepository {
                     result.id,
                     &self.command_topic,
                     "interchat.trust-safety.command.v2",
-                    &scope_partition_key(&action.scope),
+                    &command.id,
                     command.encode_to_vec(),
                 )
                 .await?;
@@ -2233,6 +2233,7 @@ async fn apply_effect(
     decision_id: Uuid,
     action: &Action,
     emitted: &EmittedEffect,
+    command_topic: &str,
 ) -> anyhow::Result<()> {
     let effect = &emitted.effect;
     validate_effect_for_action(effect, action)?;
@@ -2261,7 +2262,7 @@ async fn apply_effect(
                 .then_some(emitted.origin.policy_version_id);
             let expires_at = duration_ms
                 .map(|duration| Utc::now() + chrono::Duration::milliseconds(duration as i64));
-            let restriction_id: Uuid = sqlx::query_scalar(
+            let restriction_row = sqlx::query(
                 "INSERT INTO trust_safety.restriction \
                  (subject_type, subject_id, scope_type, scope_id, restriction_type, reason, source_action_id, source_policy_version_id, created_by, expires_at) \
                  VALUES ($1, $2, $3::trust_safety.scope_type, $4, $5, $6, $7, $8, $9, $10) \
@@ -2269,7 +2270,7 @@ async fn apply_effect(
                  DO UPDATE SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at, \
                    source_action_id = EXCLUDED.source_action_id, source_policy_version_id = EXCLUDED.source_policy_version_id, \
                    created_by = EXCLUDED.created_by, version = trust_safety.restriction.version + 1, updated_at = clock_timestamp() \
-                 RETURNING id",
+                 RETURNING id, version",
             )
             .bind(subject_type)
             .bind(subject_id)
@@ -2283,6 +2284,8 @@ async fn apply_effect(
             .bind(expires_at)
             .fetch_one(&mut **tx)
             .await?;
+            let restriction_id: Uuid = restriction_row.try_get("id")?;
+            let restriction_version: i64 = restriction_row.try_get("version")?;
             insert_policy_audit(
                 tx,
                 action,
@@ -2292,12 +2295,28 @@ async fn apply_effect(
                 &restriction_id.to_string(),
             )
             .await?;
+            if let Some(user_id) = subject.user_id.as_deref() {
+                insert_moderation_notice_command(
+                    tx,
+                    command_topic,
+                    decision_id,
+                    action,
+                    emitted,
+                    user_id,
+                    None,
+                    Some(restriction_id),
+                    expires_at,
+                    restriction_version,
+                )
+                .await?;
+            }
         }
         Effect::CreateInfraction {
             subject,
             infraction_type,
             reason,
             duration_ms,
+            enforcement,
             ..
         } => {
             let (subject_type, subject_id) = primary_subject(subject)?;
@@ -2307,10 +2326,51 @@ async fn apply_effect(
                 .then_some(emitted.origin.policy_version_id);
             let expires_at = duration_ms
                 .map(|duration| Utc::now() + chrono::Duration::milliseconds(duration as i64));
+            let enforcement_restriction_id = if let Some(enforcement) = enforcement {
+                let (enforcement_subject_type, enforcement_subject_id) =
+                    primary_subject(&enforcement.subject)?;
+                let restriction_expires_at = enforcement
+                    .duration_ms
+                    .map(|duration| Utc::now() + chrono::Duration::milliseconds(duration as i64));
+                let restriction_id: Uuid = sqlx::query_scalar(
+                    "INSERT INTO trust_safety.restriction \
+                     (subject_type, subject_id, scope_type, scope_id, restriction_type, reason, source_action_id, source_policy_version_id, created_by, expires_at) \
+                     VALUES ($1, $2, $3::trust_safety.scope_type, $4, $5, $6, $7, $8, $9, $10) \
+                     ON CONFLICT (subject_type, subject_id, scope_type, scope_id, restriction_type) WHERE status = 'ACTIVE' \
+                     DO UPDATE SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at, \
+                       source_action_id = EXCLUDED.source_action_id, source_policy_version_id = EXCLUDED.source_policy_version_id, \
+                       created_by = EXCLUDED.created_by, version = trust_safety.restriction.version + 1, updated_at = clock_timestamp() \
+                     RETURNING id",
+                )
+                .bind(enforcement_subject_type)
+                .bind(enforcement_subject_id)
+                .bind(effect_scope_type)
+                .bind(effect_scope_id)
+                .bind(&enforcement.restriction_type)
+                .bind(&enforcement.reason)
+                .bind(action.id)
+                .bind(source_policy_version_id)
+                .bind(&policy_actor)
+                .bind(restriction_expires_at)
+                .fetch_one(&mut **tx)
+                .await?;
+                insert_policy_audit(
+                    tx,
+                    action,
+                    emitted,
+                    "APPLY_CREATE_RESTRICTION",
+                    "RESTRICTION",
+                    &restriction_id.to_string(),
+                )
+                .await?;
+                Some(restriction_id)
+            } else {
+                None
+            };
             let infraction_id: Uuid = sqlx::query_scalar(
                 "INSERT INTO trust_safety.infraction \
-                 (subject_type, subject_id, scope_type, scope_id, infraction_type, reason, source_action_id, source_policy_version_id, created_by, expires_at) \
-                 VALUES ($1, $2, $3::trust_safety.scope_type, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+                 (subject_type, subject_id, scope_type, scope_id, infraction_type, reason, source_action_id, source_policy_version_id, created_by, expires_at, enforcement_restriction_id) \
+                 VALUES ($1, $2, $3::trust_safety.scope_type, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
             )
             .bind(subject_type)
             .bind(subject_id)
@@ -2322,6 +2382,7 @@ async fn apply_effect(
             .bind(source_policy_version_id)
             .bind(&policy_actor)
             .bind(expires_at)
+            .bind(enforcement_restriction_id)
             .fetch_one(&mut **tx)
             .await?;
             if matches!(subject_type, "USER" | "SERVER") {
@@ -2376,6 +2437,21 @@ async fn apply_effect(
                 &infraction_id.to_string(),
             )
             .await?;
+            if let Some(user_id) = subject.user_id.as_deref() {
+                insert_moderation_notice_command(
+                    tx,
+                    command_topic,
+                    decision_id,
+                    action,
+                    emitted,
+                    user_id,
+                    Some(infraction_id),
+                    enforcement_restriction_id,
+                    expires_at,
+                    1,
+                )
+                .await?;
+            }
         }
         Effect::Flag {
             flag_type,
@@ -2650,6 +2726,7 @@ pub(crate) fn validate_effect_for_action(effect: &Effect, action: &Action) -> an
             infraction_type,
             reason,
             duration_ms,
+            enforcement,
             ..
         } => {
             validate_subject(subject)?;
@@ -2665,6 +2742,21 @@ pub(crate) fn validate_effect_for_action(effect: &Effect, action: &Action) -> an
                 "infraction reason must be between 1 and 2000 characters"
             );
             validate_duration(*duration_ms)?;
+            if let Some(enforcement) = enforcement {
+                validate_subject(&enforcement.subject)?;
+                anyhow::ensure!(
+                    matches!(
+                        enforcement.restriction_type.as_str(),
+                        "MUTE" | "BAN" | "BLACKLIST" | "CONTENT_QUARANTINE"
+                    ),
+                    "invalid enforcement restriction type"
+                );
+                anyhow::ensure!(
+                    !enforcement.reason.trim().is_empty() && enforcement.reason.len() <= 2_000,
+                    "enforcement reason must be between 1 and 2000 characters"
+                );
+                validate_duration(enforcement.duration_ms)?;
+            }
         }
         Effect::CreateRestriction {
             subject,
@@ -2807,6 +2899,100 @@ async fn insert_policy_audit(
     Ok(())
 }
 
+pub(crate) async fn insert_moderation_notice_command(
+    tx: &mut Transaction<'_, Postgres>,
+    command_topic: &str,
+    decision_id: Uuid,
+    action: &Action,
+    emitted: &EmittedEffect,
+    user_id: &str,
+    infraction_id: Option<Uuid>,
+    restriction_id: Option<Uuid>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    record_version: i64,
+) -> anyhow::Result<()> {
+    let kind = match &emitted.effect {
+        Effect::CreateInfraction {
+            infraction_type,
+            enforcement,
+            ..
+        } => match (
+            enforcement
+                .as_ref()
+                .map(|value| value.restriction_type.as_str()),
+            emitted.origin.scope.scope_type,
+            infraction_type.as_str(),
+        ) {
+            (Some("BLACKLIST"), _, _) => v2::ModerationNoticeKind::GlobalBlacklist,
+            (_, ScopeType::Hub, "WARNING") => v2::ModerationNoticeKind::HubWarning,
+            (_, ScopeType::Hub, "MUTE") => v2::ModerationNoticeKind::HubMute,
+            (_, ScopeType::Hub, "BAN") => v2::ModerationNoticeKind::HubBan,
+            (_, ScopeType::Lobby, "WARNING") => v2::ModerationNoticeKind::LobbyWarning,
+            (_, ScopeType::Lobby, "BAN") => v2::ModerationNoticeKind::LobbyBan,
+            _ => return Ok(()),
+        },
+        Effect::CreateRestriction {
+            restriction_type, ..
+        } => match (restriction_type.as_str(), emitted.origin.scope.scope_type) {
+            ("BLACKLIST", _) => v2::ModerationNoticeKind::GlobalBlacklist,
+            ("MUTE", ScopeType::Hub) => v2::ModerationNoticeKind::HubMute,
+            ("BAN", ScopeType::Hub) => v2::ModerationNoticeKind::HubBan,
+            ("BAN", ScopeType::Lobby) => v2::ModerationNoticeKind::LobbyBan,
+            _ => return Ok(()),
+        },
+        _ => return Ok(()),
+    };
+    let (aggregate_type, aggregate_id, idempotency_key) = match (infraction_id, restriction_id) {
+        (Some(infraction_id), _) => (
+            "INFRACTION",
+            infraction_id,
+            format!("moderation-notice:{infraction_id}"),
+        ),
+        (None, Some(restriction_id)) => (
+            "RESTRICTION",
+            restriction_id,
+            format!("moderation-notice:restriction:{restriction_id}:{record_version}"),
+        ),
+        (None, None) => anyhow::bail!("moderation notice requires a persisted resource"),
+    };
+    let notice = v2::ModerationNoticeCommand {
+        user_id: user_id.to_owned(),
+        kind: kind as i32,
+        event: v2::ModerationNoticeEvent::Applied as i32,
+        scope: Some(scope_to_proto(&emitted.origin.scope)),
+        public_reason: String::new(),
+        expires_at: expires_at.map(timestamp),
+        infraction_id: infraction_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        restriction_id: restriction_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        source: "automod".into(),
+        source_channel_id: action.subject.channel_id.clone().unwrap_or_default(),
+        source_message_id: action.subject.message_id.clone().unwrap_or_default(),
+        source_user_id: user_id.to_owned(),
+        record_version,
+    };
+    let command = v2::CommandEnvelope {
+        id: Uuid::now_v7().to_string(),
+        decision_id: decision_id.to_string(),
+        idempotency_key,
+        command: Some(v2::command_envelope::Command::ModerationNotice(notice)),
+    };
+    register_command(tx, &command).await?;
+    insert_outbox(
+        tx,
+        aggregate_type,
+        aggregate_id,
+        command_topic,
+        "interchat.trust-safety.command.v2",
+        &command.id,
+        command.encode_to_vec(),
+    )
+    .await
+}
+
 fn command_for_effect(decision_id: Uuid, effect: &Effect) -> Option<v2::CommandEnvelope> {
     use v2::command_envelope::Command;
     let command = match effect {
@@ -2859,17 +3045,20 @@ fn command_for_effect(decision_id: Uuid, effect: &Effect) -> Option<v2::CommandE
     })
 }
 
-async fn register_command(
+pub(crate) async fn register_command(
     tx: &mut Transaction<'_, Postgres>,
     command: &v2::CommandEnvelope,
 ) -> anyhow::Result<()> {
     use v2::command_envelope::Command;
     let command_id = Uuid::parse_str(&command.id)?;
-    let decision_id = Uuid::parse_str(&command.decision_id)?;
+    let decision_id = (!command.decision_id.is_empty())
+        .then(|| Uuid::parse_str(&command.decision_id))
+        .transpose()?;
     let (command_type, retry_safe) = match command.command.as_ref() {
         Some(Command::Notify(_)) => ("NOTIFY", false),
         Some(Command::Delete(_)) => ("DELETE", true),
         Some(Command::Kick(_)) => ("KICK", true),
+        Some(Command::ModerationNotice(_)) => ("MODERATION_NOTICE", false),
         None => anyhow::bail!("command envelope has no typed command"),
     };
     sqlx::query(
@@ -3635,6 +3824,7 @@ mod tests {
             infraction_type: "WARNING".into(),
             reason: "policy decision".into(),
             duration_ms: Some(60_000),
+            enforcement: None,
         };
 
         validate_effect_for_action(&effect, &action).expect("valid effect");

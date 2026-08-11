@@ -109,6 +109,7 @@ mod tests {
                     effect_id: "global-block".into(),
                     reason_codes: vec!["GLOBAL".into()],
                     public_reason: None,
+                    active_restriction: None,
                 },
                 ScopeType::Platform,
                 true,

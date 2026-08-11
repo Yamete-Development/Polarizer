@@ -143,6 +143,8 @@ pub struct BlockEffect {
     pub reason_codes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, tag = "2")]
     pub public_reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub active_restriction: ::core::option::Option<ActiveRestrictionReference>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct HoldEffect {
@@ -231,6 +233,8 @@ pub struct CreateInfractionEffect {
     pub reason: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "4")]
     pub duration: ::core::option::Option<::prost_types::Duration>,
+    #[prost(message, optional, tag = "5")]
+    pub enforcement: ::core::option::Option<CreateRestrictionEffect>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateRestrictionEffect {
@@ -343,6 +347,19 @@ pub struct Infraction {
     pub is_active: bool,
     #[prost(string, tag = "13")]
     pub source_report_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ActiveRestrictionReference {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(enumeration = "RestrictionType", tag = "2")]
+    pub r#type: i32,
+    #[prost(message, optional, tag = "3")]
+    pub scope: ::core::option::Option<Scope>,
+    #[prost(string, tag = "4")]
+    pub public_reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
 }
 /// A moderation-history entry backed by its canonical resource. The oneof
 /// avoids copying report data or maintaining a second moderation ledger.
@@ -1198,7 +1215,7 @@ pub struct CommandEnvelope {
     pub decision_id: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub idempotency_key: ::prost::alloc::string::String,
-    #[prost(oneof = "command_envelope::Command", tags = "10, 11, 12")]
+    #[prost(oneof = "command_envelope::Command", tags = "10, 11, 12, 13")]
     pub command: ::core::option::Option<command_envelope::Command>,
 }
 /// Nested message and enum types in `CommandEnvelope`.
@@ -1211,6 +1228,8 @@ pub mod command_envelope {
         Delete(super::DeleteCommand),
         #[prost(message, tag = "12")]
         Kick(super::KickCommand),
+        #[prost(message, tag = "13")]
+        ModerationNotice(super::ModerationNoticeCommand),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1259,6 +1278,35 @@ pub struct KickCommand {
     pub server_id: ::prost::alloc::string::String,
     #[prost(string, repeated, tag = "3")]
     pub reason_codes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ModerationNoticeCommand {
+    #[prost(string, tag = "1")]
+    pub user_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "ModerationNoticeKind", tag = "2")]
+    pub kind: i32,
+    #[prost(enumeration = "ModerationNoticeEvent", tag = "3")]
+    pub event: i32,
+    #[prost(message, optional, tag = "4")]
+    pub scope: ::core::option::Option<Scope>,
+    #[prost(string, tag = "5")]
+    pub public_reason: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, tag = "7")]
+    pub infraction_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub restriction_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "10")]
+    pub source_channel_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "11")]
+    pub source_message_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "12")]
+    pub source_user_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "13")]
+    pub record_version: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PrismDeliveryCallback {
@@ -1319,6 +1367,76 @@ pub struct ReportCreated {
     pub context: ::core::option::Option<::prost_types::Struct>,
     #[prost(message, optional, tag = "8")]
     pub created_at: ::core::option::Option<::prost_types::Timestamp>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModerationNoticeKind {
+    Unspecified = 0,
+    HubWarning = 1,
+    HubMute = 2,
+    HubBan = 3,
+    LobbyWarning = 4,
+    LobbyBan = 5,
+    GlobalBlacklist = 6,
+}
+impl ModerationNoticeKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MODERATION_NOTICE_KIND_UNSPECIFIED",
+            Self::HubWarning => "MODERATION_NOTICE_KIND_HUB_WARNING",
+            Self::HubMute => "MODERATION_NOTICE_KIND_HUB_MUTE",
+            Self::HubBan => "MODERATION_NOTICE_KIND_HUB_BAN",
+            Self::LobbyWarning => "MODERATION_NOTICE_KIND_LOBBY_WARNING",
+            Self::LobbyBan => "MODERATION_NOTICE_KIND_LOBBY_BAN",
+            Self::GlobalBlacklist => "MODERATION_NOTICE_KIND_GLOBAL_BLACKLIST",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODERATION_NOTICE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MODERATION_NOTICE_KIND_HUB_WARNING" => Some(Self::HubWarning),
+            "MODERATION_NOTICE_KIND_HUB_MUTE" => Some(Self::HubMute),
+            "MODERATION_NOTICE_KIND_HUB_BAN" => Some(Self::HubBan),
+            "MODERATION_NOTICE_KIND_LOBBY_WARNING" => Some(Self::LobbyWarning),
+            "MODERATION_NOTICE_KIND_LOBBY_BAN" => Some(Self::LobbyBan),
+            "MODERATION_NOTICE_KIND_GLOBAL_BLACKLIST" => Some(Self::GlobalBlacklist),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ModerationNoticeEvent {
+    Unspecified = 0,
+    Applied = 1,
+    Updated = 2,
+}
+impl ModerationNoticeEvent {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MODERATION_NOTICE_EVENT_UNSPECIFIED",
+            Self::Applied => "MODERATION_NOTICE_EVENT_APPLIED",
+            Self::Updated => "MODERATION_NOTICE_EVENT_UPDATED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MODERATION_NOTICE_EVENT_UNSPECIFIED" => Some(Self::Unspecified),
+            "MODERATION_NOTICE_EVENT_APPLIED" => Some(Self::Applied),
+            "MODERATION_NOTICE_EVENT_UPDATED" => Some(Self::Updated),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

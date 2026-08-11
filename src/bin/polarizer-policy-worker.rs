@@ -206,7 +206,7 @@ fn install_effect_constructors(lua: &Lua) -> mlua::Result<()> {
         })?,
     )?;
     effects.set("block", lua.create_function(|lua, (effect_id, reason_codes, public_reason): (String, Vec<String>, Option<String>)| {
-        lua.to_value(&Effect::Block { effect_id, reason_codes, public_reason })
+        lua.to_value(&Effect::Block { effect_id, reason_codes, public_reason, active_restriction: None })
     })?)?;
     effects.set("hold", lua.create_function(|lua, (effect_id, reason_codes, maximum_duration_ms): (String, Vec<String>, Option<u64>)| {
         lua.to_value(&Effect::Hold { effect_id, reason_codes, maximum_duration_ms })
@@ -273,6 +273,7 @@ fn install_effect_constructors(lua: &Lua) -> mlua::Result<()> {
                     infraction_type,
                     reason,
                     duration_ms,
+                    enforcement: None,
                 })
             },
         )?,

@@ -1,11 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
-use crate::{contract::v2, policy::model::ExecutionTrace};
+use crate::{
+    contract::v2,
+    policy::{
+        model::ExecutionTrace,
+        repository::{insert_outbox, register_command},
+    },
+};
 
 pub struct Page<T> {
     pub items: Vec<T>,
@@ -78,11 +85,15 @@ struct EnforcementInsert {
 #[derive(Clone)]
 pub struct ModerationRepository {
     db: PgPool,
+    command_topic: String,
 }
 
 impl ModerationRepository {
-    pub fn new(db: PgPool) -> Self {
-        Self { db }
+    pub fn new(db: PgPool, command_topic: impl Into<String>) -> Self {
+        Self {
+            db,
+            command_topic: command_topic.into(),
+        }
     }
 
     pub async fn create_restriction(
@@ -102,6 +113,7 @@ impl ModerationRepository {
         let scope_type = scope_name(scope.r#type)?;
         let restriction_type = restriction_type_name(restriction.r#type)?;
         anyhow::ensure!(!restriction.reason.trim().is_empty(), "reason is required");
+        let expires_at = restriction.expires_at.map(datetime).transpose()?;
         let source_report_id = optional_uuid(&restriction.source_report_id, "source_report_id")?;
         let id = Uuid::now_v7();
         let mut tx = self.db.begin().await?;
@@ -125,11 +137,25 @@ impl ModerationRepository {
         .bind(restriction_type)
         .bind(restriction.reason.trim())
         .bind(&context.actor_id)
-        .bind(restriction.expires_at.map(datetime).transpose()?)
+        .bind(expires_at)
         .bind(source_report_id)
         .execute(&mut *tx)
         .await?;
         insert_audit(&mut tx, context, "CREATE_RESTRICTION", "RESTRICTION", id).await?;
+        if subject_type == "USER" {
+            self.insert_manual_restriction_notice(
+                &mut tx,
+                id,
+                subject_id,
+                scope,
+                restriction_type,
+                restriction.reason.trim(),
+                expires_at,
+                1,
+                v2::ModerationNoticeEvent::Applied,
+            )
+            .await?;
+        }
         tx.commit().await?;
         self.get_restriction(id).await
     }
@@ -216,6 +242,37 @@ impl ModerationRepository {
         .await?;
         anyhow::ensure!(updated.rows_affected() == 1, "restriction version conflict");
         insert_audit(&mut tx, context, "UPDATE_RESTRICTION", "RESTRICTION", id).await?;
+        let updated_record = sqlx::query(
+            "SELECT subject_type, subject_id, scope_type::text, scope_id, restriction_type, \
+                    reason, expires_at, version \
+             FROM trust_safety.restriction WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if updated_record.try_get::<String, _>("subject_type")? == "USER" {
+            let scope = scope_from_parts(
+                updated_record.try_get("scope_type")?,
+                updated_record.try_get("scope_id")?,
+            )?;
+            let subject_id: String = updated_record.try_get("subject_id")?;
+            let restriction_type: String = updated_record.try_get("restriction_type")?;
+            let reason: String = updated_record.try_get("reason")?;
+            let expires_at: Option<DateTime<Utc>> = updated_record.try_get("expires_at")?;
+            let record_version: i64 = updated_record.try_get("version")?;
+            self.insert_manual_restriction_notice(
+                &mut tx,
+                id,
+                &subject_id,
+                &scope,
+                &restriction_type,
+                &reason,
+                expires_at,
+                record_version,
+                v2::ModerationNoticeEvent::Updated,
+            )
+            .await?;
+        }
         tx.commit().await?;
         self.get_restriction(id).await
     }
@@ -515,8 +572,138 @@ impl ModerationRepository {
         )
         .await?;
         insert_audit(&mut tx, context, "CREATE_INFRACTION", "INFRACTION", id).await?;
+        if subject_type == "USER" {
+            self.insert_manual_moderation_notice(
+                &mut tx,
+                id,
+                subject_id,
+                scope,
+                infraction_type,
+                infraction.reason.trim(),
+                expires_at,
+                enforcement.as_ref().map(|value| value.id),
+            )
+            .await?;
+        }
         tx.commit().await?;
         self.get_infraction(id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_manual_moderation_notice(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        infraction_id: Uuid,
+        user_id: &str,
+        scope: &v2::Scope,
+        infraction_type: &str,
+        reason: &str,
+        expires_at: Option<DateTime<Utc>>,
+        restriction_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        let scope_type = scope_name(scope.r#type)?;
+        let kind = match (restriction_id.is_some(), infraction_type, scope_type) {
+            (true, "BAN", "PLATFORM") => v2::ModerationNoticeKind::GlobalBlacklist,
+            (_, "WARNING", "HUB") => v2::ModerationNoticeKind::HubWarning,
+            (_, "MUTE", "HUB") => v2::ModerationNoticeKind::HubMute,
+            (_, "BAN", "HUB") => v2::ModerationNoticeKind::HubBan,
+            (_, "WARNING", "LOBBY" | "PRODUCT") => v2::ModerationNoticeKind::LobbyWarning,
+            (_, "BAN", "LOBBY" | "PRODUCT") => v2::ModerationNoticeKind::LobbyBan,
+            _ => return Ok(()),
+        };
+        let command = v2::CommandEnvelope {
+            id: Uuid::now_v7().to_string(),
+            decision_id: String::new(),
+            idempotency_key: format!("moderation-notice:{infraction_id}"),
+            command: Some(v2::command_envelope::Command::ModerationNotice(
+                v2::ModerationNoticeCommand {
+                    user_id: user_id.to_owned(),
+                    kind: kind as i32,
+                    event: v2::ModerationNoticeEvent::Applied as i32,
+                    scope: Some(scope.clone()),
+                    public_reason: reason.to_owned(),
+                    expires_at: expires_at.map(timestamp),
+                    infraction_id: infraction_id.to_string(),
+                    restriction_id: restriction_id
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    source: "manual".into(),
+                    source_channel_id: String::new(),
+                    source_message_id: String::new(),
+                    source_user_id: user_id.to_owned(),
+                    record_version: 1,
+                },
+            )),
+        };
+        register_command(tx, &command).await?;
+        insert_outbox(
+            tx,
+            "INFRACTION",
+            infraction_id,
+            &self.command_topic,
+            "interchat.trust-safety.command.v2",
+            &command.id,
+            command.encode_to_vec(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_manual_restriction_notice(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        restriction_id: Uuid,
+        user_id: &str,
+        scope: &v2::Scope,
+        restriction_type: &str,
+        reason: &str,
+        expires_at: Option<DateTime<Utc>>,
+        record_version: i64,
+        event: v2::ModerationNoticeEvent,
+    ) -> anyhow::Result<()> {
+        let scope_type = scope_name(scope.r#type)?;
+        let kind = match (restriction_type, scope_type) {
+            ("BLACKLIST", "PLATFORM") => v2::ModerationNoticeKind::GlobalBlacklist,
+            ("MUTE", "HUB") => v2::ModerationNoticeKind::HubMute,
+            ("BAN", "HUB") => v2::ModerationNoticeKind::HubBan,
+            ("BAN", "LOBBY" | "PRODUCT") => v2::ModerationNoticeKind::LobbyBan,
+            _ => return Ok(()),
+        };
+        let command = v2::CommandEnvelope {
+            id: Uuid::now_v7().to_string(),
+            decision_id: String::new(),
+            idempotency_key: format!(
+                "moderation-notice:restriction:{restriction_id}:{record_version}"
+            ),
+            command: Some(v2::command_envelope::Command::ModerationNotice(
+                v2::ModerationNoticeCommand {
+                    user_id: user_id.to_owned(),
+                    kind: kind as i32,
+                    event: event as i32,
+                    scope: Some(scope.clone()),
+                    public_reason: reason.to_owned(),
+                    expires_at: expires_at.map(timestamp),
+                    infraction_id: String::new(),
+                    restriction_id: restriction_id.to_string(),
+                    source: "manual".into(),
+                    source_channel_id: String::new(),
+                    source_message_id: String::new(),
+                    source_user_id: user_id.to_owned(),
+                    record_version,
+                },
+            )),
+        };
+        register_command(tx, &command).await?;
+        insert_outbox(
+            tx,
+            "RESTRICTION",
+            restriction_id,
+            &self.command_topic,
+            "interchat.trust-safety.command.v2",
+            &command.id,
+            command.encode_to_vec(),
+        )
+        .await
     }
 
     pub async fn revoke_infraction(
@@ -1790,6 +1977,20 @@ impl ModerationRepository {
                 infraction_id,
             )
             .await?;
+            if subject_type == "USER" {
+                let notice_scope = scope_from_parts(scope_type.to_owned(), scope_id.to_owned())?;
+                self.insert_manual_moderation_notice(
+                    &mut tx,
+                    infraction_id,
+                    subject_id,
+                    &notice_scope,
+                    "BAN",
+                    requested_reason,
+                    requested_expires_at,
+                    Some(restriction_id),
+                )
+                .await?;
+            }
             executed_infraction_id = Some(infraction_id);
             executed_restriction_id = Some(restriction_id);
         }

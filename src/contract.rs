@@ -52,10 +52,12 @@ fn effect_body_to_proto(effect: &Effect) -> v2::policy_effect::Effect {
         Effect::Block {
             reason_codes,
             public_reason,
+            active_restriction,
             ..
         } => ProtoEffect::Block(v2::BlockEffect {
             reason_codes: reason_codes.clone(),
             public_reason: public_reason.clone().unwrap_or_default(),
+            active_restriction: active_restriction.as_ref().map(active_restriction_to_proto),
         }),
         Effect::Hold {
             reason_codes,
@@ -106,6 +108,7 @@ fn effect_body_to_proto(effect: &Effect) -> v2::policy_effect::Effect {
             infraction_type,
             reason,
             duration_ms,
+            enforcement,
             ..
         } => ProtoEffect::CreateInfraction(v2::CreateInfractionEffect {
             subject: Some(subject_to_proto(subject)),
@@ -118,6 +121,14 @@ fn effect_body_to_proto(effect: &Effect) -> v2::policy_effect::Effect {
             } as i32,
             reason: reason.clone(),
             duration: duration_ms.map(duration_from_millis),
+            enforcement: enforcement
+                .as_ref()
+                .map(|enforcement| v2::CreateRestrictionEffect {
+                    subject: Some(subject_to_proto(&enforcement.subject)),
+                    r#type: restriction_type_to_proto(&enforcement.restriction_type),
+                    reason: enforcement.reason.clone(),
+                    duration: enforcement.duration_ms.map(duration_from_millis),
+                }),
         }),
         Effect::CreateRestriction {
             subject,
@@ -228,6 +239,35 @@ fn duration_from_millis(value: u64) -> prost_types::Duration {
     prost_types::Duration {
         seconds: (value / 1_000).min(i64::MAX as u64) as i64,
         nanos: ((value % 1_000) * 1_000_000) as i32,
+    }
+}
+
+fn restriction_type_to_proto(value: &str) -> i32 {
+    (match value {
+        "MUTE" => v2::RestrictionType::Mute,
+        "BAN" => v2::RestrictionType::Ban,
+        "BLACKLIST" => v2::RestrictionType::Blacklist,
+        "CONTENT_QUARANTINE" => v2::RestrictionType::ContentQuarantine,
+        _ => v2::RestrictionType::Unspecified,
+    }) as i32
+}
+
+fn active_restriction_to_proto(
+    restriction: &crate::policy::model::ActiveRestriction,
+) -> v2::ActiveRestrictionReference {
+    v2::ActiveRestrictionReference {
+        id: restriction.id.clone(),
+        r#type: restriction_type_to_proto(&restriction.restriction_type),
+        scope: Some(scope_to_proto(&restriction.scope)),
+        public_reason: restriction.public_reason.clone().unwrap_or_default(),
+        expires_at: restriction.expires_at.map(timestamp),
+    }
+}
+
+fn timestamp(value: chrono::DateTime<chrono::Utc>) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: value.timestamp(),
+        nanos: value.timestamp_subsec_nanos() as i32,
     }
 }
 

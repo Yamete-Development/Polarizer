@@ -3,7 +3,7 @@ use serde_json::json;
 use sqlx::{PgPool, Row};
 
 use super::{FeatureProvider, ProviderCategory, ProviderError, ProviderOutput};
-use crate::policy::model::Action;
+use crate::policy::model::{Action, Product};
 
 pub struct RestrictionProvider {
     db: PgPool,
@@ -67,17 +67,26 @@ impl FeatureProvider for RestrictionProvider {
         _: &serde_json::Value,
     ) -> Result<ProviderOutput, ProviderError> {
         let mut restrictions = Vec::new();
+        let action_product = match action.scope.product {
+            Some(Product::Hub) => "HUB",
+            Some(Product::Lobby) => "LOBBY",
+            None => "",
+        };
         for (subject_type, subject_id) in subjects(action) {
             let rows = sqlx::query(
-                "SELECT id, restriction_type, scope_type::text, scope_id, reason, expires_at \
+                "SELECT id, restriction_type, scope_type::text, scope_id, reason, expires_at, \
+                        CASE WHEN scope_type = 'PRODUCT' AND scope_id = '' THEN 'LOBBY' ELSE NULL END AS scope_product \
                  FROM trust_safety.restriction \
                  WHERE subject_type = $1 AND subject_id = $2 AND status = 'ACTIVE' \
                    AND (expires_at IS NULL OR expires_at > clock_timestamp()) \
-                   AND (scope_type = 'PLATFORM' OR (scope_type = $3::trust_safety.scope_type AND scope_id = $4))"
+                   AND (scope_type = 'PLATFORM' \
+                        OR (scope_type = $3::trust_safety.scope_type AND scope_id = $4) \
+                        OR (scope_type = 'PRODUCT' AND scope_id = '' AND $5::text = 'LOBBY'))"
             )
             .bind(subject_type).bind(subject_id)
             .bind(format!("{:?}", action.scope.scope_type).to_uppercase())
             .bind(&action.scope.id)
+            .bind(action_product)
             .fetch_all(&self.db).await.map_err(|_| ProviderError::Unavailable)?;
             for row in rows {
                 restrictions.push(json!({
@@ -86,6 +95,7 @@ impl FeatureProvider for RestrictionProvider {
                     "restriction_type": row.try_get::<String, _>("restriction_type").map_err(|_| ProviderError::Internal)?,
                     "scope_type": row.try_get::<String, _>("scope_type").map_err(|_| ProviderError::Internal)?,
                     "scope_id": row.try_get::<String, _>("scope_id").map_err(|_| ProviderError::Internal)?,
+                    "scope_product": row.try_get::<Option<String>, _>("scope_product").map_err(|_| ProviderError::Internal)?,
                     "reason": row.try_get::<String, _>("reason").map_err(|_| ProviderError::Internal)?,
                     "expires_at": row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("expires_at").map_err(|_| ProviderError::Internal)?,
                 }));
