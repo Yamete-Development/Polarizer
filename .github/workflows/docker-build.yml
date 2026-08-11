@@ -61,11 +61,11 @@ jobs:
           if [[ "${{ github.event_name }}" == "release" ]]; then
             echo "environment=prod" >> $GITHUB_OUTPUT
             echo "float_tag=latest" >> $GITHUB_OUTPUT
-            echo "version_tag=ghcr.io/yamete-development/polarizer:${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.ref_name }}" >> $GITHUB_OUTPUT
           elif [[ "${{ github.event.inputs.version_tag }}" != "" ]]; then
             echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
             echo "float_tag=latest" >> $GITHUB_OUTPUT
-            echo "version_tag=ghcr.io/yamete-development/polarizer:${{ github.event.inputs.version_tag }}" >> $GITHUB_OUTPUT
+            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.event.inputs.version_tag }}" >> $GITHUB_OUTPUT
           else
             echo "environment=staging" >> $GITHUB_OUTPUT
             echo "float_tag=staging" >> $GITHUB_OUTPUT
@@ -79,8 +79,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/yamete-development/polarizer:${{ steps.vars.outputs.sha_tag }}
-            ghcr.io/yamete-development/polarizer:${{ steps.vars.outputs.float_tag }}
+            ghcr.io/maybesidequest/polarizer:${{ steps.vars.outputs.sha_tag }}
+            ghcr.io/maybesidequest/polarizer:${{ steps.vars.outputs.float_tag }}
             ${{ steps.vars.outputs.version_tag }}
           secrets: |
             "hf_token=${{ secrets.HF_TOKEN }}"
@@ -94,7 +94,7 @@ jobs:
           SHA="${{ steps.vars.outputs.sha_tag }}"
 
           git clone --depth 1 \
-            "https://x-access-token:${GITOPS_PAT}@github.com/yamete-development/interchat-kube-talos.git" \
+            "https://x-access-token:${GITOPS_PAT}@github.com/maybesidequest/interchat-kube-talos.git" \
             /tmp/gitops
 
           cd /tmp/gitops
