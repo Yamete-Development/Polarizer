@@ -193,8 +193,8 @@ impl NormalizedText {
 
 impl SecurityNormalizedText {
     /// Build the auxiliary security view. Whitespace and unapproved
-    /// punctuation remain visible; only approved separators and contextual
-    /// Latin joiners are removed.
+    /// punctuation remain visible; only approved separators and default-
+    /// ignorable code points inserted inside Latin tokens are removed.
     pub fn new(input: &str) -> Self {
         let mapped = security_mapped(input);
         let mut result = Self {
