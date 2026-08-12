@@ -63,17 +63,15 @@ jobs:
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
-        with:
-          version: latest
 
       - name: Restore Docker Rust cache
         id: rust-docker-cache
         uses: actions/cache@v6
         with:
           path: docker-cache
-          key: polarizer-docker-rust-v1-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'Dockerfile') }}
+          key: polarizer-docker-rust-v2-rust-1.88.0-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
           restore-keys: |
-            polarizer-docker-rust-v1-${{ runner.arch }}-
+            polarizer-docker-rust-v2-rust-1.88.0-${{ runner.arch }}-
 
       - name: Restore BuildKit cache mounts
         uses: reproducible-containers/buildkit-cache-dance@v3
@@ -85,17 +83,9 @@ jobs:
                 "target": "/root/.cargo/registry",
                 "id": "polarizer-cargo-registry"
               },
-              "docker-cache/cargo-git": {
-                "target": "/root/.cargo/git",
-                "id": "polarizer-cargo-git"
-              },
               "docker-cache/cargo-target": {
                 "target": "/app/target",
                 "id": "polarizer-target"
-              },
-              "docker-cache/ort-cache": {
-                "target": "/root/.cache/ort.pyke.io",
-                "id": "polarizer-ort"
               }
             }
           skip-extraction: ${{ steps.rust-docker-cache.outputs.cache-hit }}

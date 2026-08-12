@@ -19,19 +19,19 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs | \
     sh -s -- -y --profile minimal --default-toolchain 1.88.0
 
-ENV PATH="/root/.cargo/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    CARGO_BUILD_JOBS=6
+
 WORKDIR /app
 
-# Keep dependency metadata in an earlier layer so source-only changes do not
-# invalidate everything before Cargo gets a chance to reuse the target cache.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY migrations/ migrations/
 COPY benches/ benches/
 COPY src/ src/
 
-# These cache IDs are exported/imported by CI through buildkit-cache-dance.
-# That lets expensive native crates such as rdkafka-sys, zstd-sys, openssl-sys,
-# and bindgen artifacts survive across ephemeral ARC runner pods.
+# Persist the expensive Cargo registry and compiled target artifacts across
+# ephemeral ARC runners. Keep ORT and Cargo git caches local to the build;
+# neither needs to be hauled through actions/cache on every warm build.
 RUN --mount=type=cache,id=polarizer-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=polarizer-cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=polarizer-target,target=/app/target,sharing=locked \
