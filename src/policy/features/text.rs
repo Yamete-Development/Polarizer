@@ -673,11 +673,12 @@ mod tests {
         }
 
         for control in [
-            '\u{200b}', // zero-width space
-            '\u{2060}', // word joiner
-            '\u{feff}', // BOM
-            '\u{00ad}', // soft hyphen
-            '\u{202e}', // bidi override
+            '\u{200b}',  // zero-width space
+            '\u{2060}',  // word joiner
+            '\u{feff}',  // BOM
+            '\u{00ad}',  // soft hyphen
+            '\u{202e}',  // bidi override
+            '\u{e002e}', // tag full stop
         ] {
             let candidate = format!("wum{control}pus");
             let matches = matches_for(&candidate, &[("wumpus", "wumpus")], &[], &[])

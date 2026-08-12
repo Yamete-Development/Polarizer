@@ -550,7 +550,13 @@ mod tests {
             CompiledMatcher::compile([definition(1, 11, "wumpus", WildcardPatternType::ExactWord)])
                 .unwrap();
 
-        for candidate in ["wum.pus", "wum-pus", "wum_pus", "w.u.m.p.u.s"] {
+        for candidate in [
+            "wum.pus",
+            "wum-pus",
+            "wum_pus",
+            "w.u.m.p.u.s",
+            "w\u{e002e}u\u{e002e}m\u{e002e}p\u{e002e}u\u{e002e}s",
+        ] {
             let report = matcher.match_text(
                 candidate,
                 MatchOptions {

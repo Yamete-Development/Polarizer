@@ -812,7 +812,7 @@ async fn obfuscated_global_block_remains_terminal_for_all_destinations() {
         )],
     )])
     .await;
-    let canonical = presentation("wum_pus");
+    let canonical = presentation("w\u{e002e}u\u{e002e}m\u{e002e}p\u{e002e}u\u{e002e}s");
     let analyzed = AnalyzedContent::from_presentation(&canonical);
 
     let result = evaluator

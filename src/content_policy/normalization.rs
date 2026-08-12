@@ -7,7 +7,11 @@
 use std::{fmt, ops::Range};
 
 use icu_casemap::CaseMapper;
-use icu_properties::{props::Script, script::ScriptWithExtensionsBorrowed};
+use icu_properties::{
+    CodePointSetData,
+    props::{DefaultIgnorableCodePoint, Script},
+    script::ScriptWithExtensionsBorrowed,
+};
 use unicode_normalization::{
     UnicodeNormalization,
     char::{canonical_combining_class, compose, decompose_compatible, is_combining_mark},
@@ -18,7 +22,7 @@ pub use super::resolver::ByteSpan;
 /// Bump this whenever canonical or auxiliary security matching semantics
 /// change. Compiled policy fingerprints should include this value so a
 /// process restart cannot reuse a snapshot compiled with older Unicode data.
-pub const NORMALIZATION_SECURITY_VERSION: &str = "unicode17-icu2.2-security-v2";
+pub const NORMALIZATION_SECURITY_VERSION: &str = "unicode17-icu2.2-security-v3";
 
 /// Text after the policy normalization pipeline, with normalized-to-original
 /// byte provenance for every emitted UTF-8 scalar.
@@ -305,19 +309,21 @@ fn security_mapped(input: &str) -> Vec<(char, ByteSpan)> {
         .filter(|(character, _)| !is_ignored_format(*character))
         .collect();
 
-    // Remove contextual joiners before punctuation. Joiner adjacency skips
-    // combining marks, other joiners, and approved inserted punctuation to
-    // resolve the token base on each side. Thus case-fold expansions such as
-    // `İ` -> `i` + U+0307 and authored NFD text still expose their Latin base,
-    // while repeated forms such as `wum.\u{200d}_pus` reduce deterministically.
-    let without_contextual_joiners: Vec<_> = visible
+    // Remove default-ignorable code points only when they split a Latin token.
+    // This catches joiners, variation selectors, tag characters, and future
+    // Unicode additions without destroying legitimate emoji or non-Latin
+    // shaping sequences. Adjacency skips combining marks, other ignorables,
+    // and approved inserted punctuation to resolve the token base on each
+    // side. Thus repeated forms such as `wum.\u{e002e}_pus` reduce
+    // deterministically.
+    let without_contextual_ignorables: Vec<_> = visible
         .iter()
         .enumerate()
         .filter_map(|(index, &(character, original))| {
-            if is_joiner(character)
-                && neighboring_character(&visible, index, 1, is_joiner_neighbor_ignorable)
+            if is_default_ignorable(character)
+                && neighboring_character(&visible, index, 1, is_ignorable_neighbor)
                     .is_some_and(is_latin_character)
-                && neighboring_character(&visible, index, -1, is_joiner_neighbor_ignorable)
+                && neighboring_character(&visible, index, -1, is_ignorable_neighbor)
                     .is_some_and(is_latin_character)
             {
                 None
@@ -327,13 +333,18 @@ fn security_mapped(input: &str) -> Vec<(char, ByteSpan)> {
         })
         .collect();
 
-    let mut compacted = Vec::with_capacity(without_contextual_joiners.len());
-    for (index, &(character, original)) in without_contextual_joiners.iter().enumerate() {
+    let mut compacted = Vec::with_capacity(without_contextual_ignorables.len());
+    for (index, &(character, original)) in without_contextual_ignorables.iter().enumerate() {
         if is_security_separator(character)
-            && neighboring_character(&without_contextual_joiners, index, 1, is_security_separator)
-                .is_some_and(is_security_letter_or_mark)
             && neighboring_character(
-                &without_contextual_joiners,
+                &without_contextual_ignorables,
+                index,
+                1,
+                is_security_separator,
+            )
+            .is_some_and(is_security_letter_or_mark)
+            && neighboring_character(
+                &without_contextual_ignorables,
                 index,
                 -1,
                 is_security_separator,
@@ -468,12 +479,18 @@ fn is_security_letter_or_mark(character: char) -> bool {
     character.is_alphabetic() || is_combining_mark(character)
 }
 
-fn is_joiner_neighbor_ignorable(character: char) -> bool {
-    is_combining_mark(character) || is_joiner(character) || is_security_separator(character)
+fn is_ignorable_neighbor(character: char) -> bool {
+    is_combining_mark(character)
+        || is_default_ignorable(character)
+        || is_security_separator(character)
 }
 
 fn is_joiner(character: char) -> bool {
     matches!(character, '\u{200c}' | '\u{200d}')
+}
+
+fn is_default_ignorable(character: char) -> bool {
+    CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(character)
 }
 
 fn source_chars(input: &str) -> Vec<(char, ByteSpan)> {
@@ -927,6 +944,20 @@ mod tests {
             SecurityNormalizedText::new("q\u{301}.\u{200d}_x").as_str(),
             "q\u{301}x"
         );
+    }
+
+    #[test]
+    fn default_ignorables_inside_latin_tokens_cannot_split_literals() {
+        for invisible in ['\u{e002e}', '\u{fe0f}', '\u{e0100}', '\u{180b}'] {
+            let candidate =
+                format!("w{invisible}u{invisible}m{invisible}p{invisible}u{invisible}s");
+            assert_eq!(
+                SecurityNormalizedText::new(&candidate).as_str(),
+                "wumpus",
+                "invisible: U+{:04X}",
+                invisible as u32
+            );
+        }
     }
 
     #[test]
