@@ -740,3 +740,138 @@ async fn delivery_actions_are_not_suppressed_by_side_effect_cooldown() {
     assert_eq!(first.side_effects.len(), 1);
     assert!(second.side_effects.is_empty());
 }
+
+#[tokio::test]
+async fn obfuscated_native_censor_keeps_complete_span_and_server_destination_filtering() {
+    let evaluator = evaluator([
+        policy(
+            120,
+            PolicyScope::global(),
+            1,
+            vec![rule(
+                121,
+                "global-censor",
+                "wumpus",
+                Surface::MessageContent,
+                vec![action(122, PolicyActionType::CensorMatch)],
+            )],
+        ),
+        policy(
+            123,
+            PolicyScope::server("blocked-server"),
+            1,
+            vec![rule(
+                124,
+                "server-block",
+                "wumpus",
+                Surface::MessageContent,
+                vec![action(125, PolicyActionType::Block)],
+            )],
+        ),
+    ])
+    .await;
+    let canonical = presentation("wum-pus");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_hub(
+            "subject",
+            "hub-1",
+            &canonical,
+            &analyzed,
+            &[
+                destination(0, "blocked-server"),
+                destination(1, "allowed-server"),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(result.global.matched_rules.len(), 1);
+    assert_eq!(
+        result.global.matched_rules[0].surfaces[0].spans,
+        vec![crate::content_policy::ByteSpan { start: 0, end: 7 }]
+    );
+    assert!(result.destinations[0].is_blocked());
+    assert!(!result.destinations[1].is_blocked());
+    let allowed = &result.variants[&result.destinations[1].variant_fingerprint.unwrap()];
+    assert_eq!(&*allowed.message_content, "w#####s");
+}
+
+#[tokio::test]
+async fn obfuscated_global_block_remains_terminal_for_all_destinations() {
+    let evaluator = evaluator([policy(
+        130,
+        PolicyScope::global(),
+        1,
+        vec![rule(
+            131,
+            "global-block",
+            "wumpus",
+            Surface::MessageContent,
+            vec![action(132, PolicyActionType::Block)],
+        )],
+    )])
+    .await;
+    let canonical = presentation("wum_pus");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-a"), destination(1, "server-b")],
+        )
+        .unwrap();
+
+    assert_eq!(result.global.matched_rules.len(), 1);
+    assert!(
+        result
+            .destinations
+            .iter()
+            .all(DestinationDecision::is_blocked)
+    );
+    assert!(result.variants.is_empty());
+}
+
+#[tokio::test]
+async fn security_matching_applies_to_names_without_leaking_auxiliary_text() {
+    let evaluator = evaluator([policy(
+        140,
+        PolicyScope::global(),
+        1,
+        vec![
+            rule(
+                141,
+                "name-block",
+                "wumpus",
+                Surface::DisplayName,
+                vec![action(142, PolicyActionType::Block)],
+            ),
+            rule(
+                143,
+                "log-obfuscated",
+                "wumpus",
+                Surface::MessageContent,
+                vec![action(144, PolicyActionType::Log)],
+            ),
+        ],
+    )])
+    .await;
+    let mut canonical = presentation("wum-pus");
+    canonical.display_name = Arc::from("wum-pus");
+    let analyzed = AnalyzedContent::from_presentation(&canonical);
+
+    let result = evaluator
+        .evaluate_call_for_destinations(
+            "subject",
+            &canonical,
+            &analyzed,
+            &[destination(0, "server-a")],
+        )
+        .unwrap();
+
+    assert!(result.global.delivery.is_blocked());
+    assert_eq!(result.side_effects.len(), 1);
+    assert!(!format!("{:?}", result.side_effects).contains("wumpus"));
+}

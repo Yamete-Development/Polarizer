@@ -1097,7 +1097,7 @@ mod tests {
     use crate::policy::{
         features::{
             FeatureProvider, FeatureRegistry, ProviderCategory, ProviderOutput,
-            text::NormalizedTextProvider,
+            text::{AutomodMatchProvider, NormalizedTextProvider},
         },
         ir::{POLICY_IR_RUNTIME_VERSION, PolicyIrRuntime},
         model::{
@@ -1510,6 +1510,150 @@ mod tests {
         assert!(!persisted_trace.contains("Private Phrase"));
         assert!(!persisted_trace.contains("private phrase"));
         assert!(persisted_trace.contains("normalized_text_sha256"));
+    }
+
+    #[tokio::test]
+    async fn legacy_automod_literal_match_blocks_in_policy_engine() {
+        let result = evaluate_automod_policy(
+            serde_json::json!({
+                "literals": [{"id": "wumpus", "pattern": "wumpus"}],
+                "regexes": [],
+                "whitelist_pattern_ids": []
+            }),
+            "wum.pus",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.decision, Decision::Block);
+        assert!(result.reason_codes.contains(&"AUTOMOD_LITERAL".into()));
+    }
+
+    #[tokio::test]
+    async fn legacy_automod_whitelist_prevents_a_literal_block() {
+        let result = evaluate_automod_policy(
+            serde_json::json!({
+                "literals": [{"id": "wumpus", "pattern": "wumpus"}],
+                "regexes": [],
+                "whitelist_pattern_ids": ["wumpus"]
+            }),
+            "wum.pus",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.decision, Decision::Allow);
+        assert!(!result.reason_codes.contains(&"AUTOMOD_LITERAL".into()));
+    }
+
+    #[tokio::test]
+    async fn legacy_automod_provider_errors_follow_hold_behavior() {
+        let result = evaluate_automod_policy(
+            serde_json::json!({
+                "literals": [{"id": "invalid"}],
+                "regexes": [],
+                "whitelist_pattern_ids": []
+            }),
+            "ordinary message",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.decision, Decision::Hold);
+        assert!(
+            result
+                .reason_codes
+                .contains(&"POLICY_DEPENDENCY_UNAVAILABLE".into())
+        );
+        assert!(result.trace.rules.iter().any(|rule| {
+            rule.rule_id == "feature.error"
+                && rule
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("automod.matches"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn legacy_regex_remains_authored_and_independent_of_literal_security_matching() {
+        let authored_regex = evaluate_automod_policy(
+            serde_json::json!({
+                "literals": [],
+                "regexes": [{"id": "raw", "pattern": r"wum\.pus"}],
+                "whitelist_pattern_ids": []
+            }),
+            "wum.pus",
+        )
+        .await
+        .unwrap();
+        assert_eq!(authored_regex.decision, Decision::Block);
+
+        let security_only_spelling = evaluate_automod_policy(
+            serde_json::json!({
+                "literals": [],
+                "regexes": [{"id": "raw", "pattern": "wumpus"}],
+                "whitelist_pattern_ids": []
+            }),
+            "wum.pus",
+        )
+        .await
+        .unwrap();
+        assert_eq!(security_only_spelling.decision, Decision::Allow);
+    }
+
+    async fn evaluate_automod_policy(
+        configuration: serde_json::Value,
+        content: &str,
+    ) -> anyhow::Result<EvaluationResult> {
+        let repo = Arc::new(InMemoryPolicyRepository::default());
+        let manifest = PolicyManifest {
+            accepted_action_types: BTreeSet::from(["hub.message.created".into()]),
+            accepted_schema_versions: BTreeSet::from([1]),
+            required_features: vec![FeatureRequirement {
+                name: "automod.matches".into(),
+                error_behavior: ErrorBehavior::Hold,
+                deadline_ms: 100,
+                maximum_data_handling: DataHandlingClass::Sensitive,
+                configuration,
+            }],
+            capabilities: BTreeSet::new(),
+            runtime_error_behavior: ErrorBehavior::Hold,
+        };
+        let runtime = Arc::new(PolicyIrRuntime);
+        let source = r#"{"rules":[{"id":"automod-match","when":{"operator":"exists","value":{"source":"feature","name":"automod.matches","path":"0"}},"effects":[{"type":"BLOCK","effect_id":"automod-block","reason_codes":["AUTOMOD_LITERAL"],"public_reason":null}]}]}"#;
+        let artifact = runtime.compile(source, &manifest).await?;
+        repo.policies.write().await.push(active_policy(
+            ScopeType::Hub,
+            true,
+            source,
+            artifact.bytes,
+            &manifest,
+        ));
+
+        let features = FeatureRegistry::from_providers([
+            Arc::new(AutomodMatchProvider) as Arc<dyn FeatureProvider>,
+            Arc::new(ActiveRestrictionProvider {
+                restriction_type: "",
+            }) as Arc<dyn FeatureProvider>,
+        ])?;
+        let mut engine = PolicyEngine::new(repo, Arc::new(features), 0.0);
+        engine.register_runtime(runtime);
+        let action = Action {
+            id: Uuid::now_v7(),
+            action_type: "hub.message.created".into(),
+            schema_version: 1,
+            scope: Scope {
+                scope_type: ScopeType::Hub,
+                id: "hub".into(),
+                product: Some(Product::Hub),
+            },
+            subject: Subject::default(),
+            occurred_at: Utc::now(),
+            attributes: serde_json::json!({"content": content}),
+            data_handling: DataHandlingClass::Sensitive,
+            prism_payload: None,
+        };
+        Ok(engine.evaluate(&action, false).await?.0)
     }
 
     fn active_policy(

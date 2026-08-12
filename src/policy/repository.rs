@@ -3502,6 +3502,10 @@ mod tests {
         PolicyScope, ResolvedScopeDecision,
     };
     use crate::contract::prism;
+    use crate::policy::features::{
+        FeatureProvider,
+        text::{AutomodMatch, AutomodMatchProvider},
+    };
     use crate::policy::model::{
         Action, DataHandlingClass, Decision, Effect, EffectOrigin, EmittedEffect, EvaluationResult,
         ExecutionTrace, PolicyBundleState, Product, Scope, ScopeType, Subject, TextSpan,
@@ -3751,6 +3755,40 @@ mod tests {
         )
         .expect("valid character spans");
         assert_eq!(censored, "hi [wave] ******");
+    }
+
+    #[tokio::test]
+    async fn legacy_security_match_span_censors_inserted_punctuation_as_characters() {
+        let content = "wum.pus";
+        let mut action = action();
+        action.attributes = serde_json::json!({"content": content});
+        let output = AutomodMatchProvider
+            .resolve(
+                &action,
+                &serde_json::json!({
+                    "literals": [{"id": "wumpus", "pattern": "wumpus"}],
+                    "regexes": [],
+                    "whitelist_pattern_ids": []
+                }),
+            )
+            .await
+            .expect("legacy literal provider should resolve");
+        let matches: Vec<AutomodMatch> =
+            serde_json::from_value(output.value).expect("provider output should be matches");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].original_start_character, 0);
+        assert_eq!(matches[0].original_end_character, 7);
+
+        let censored = apply_censors_to_content(
+            content,
+            vec![(
+                matches[0].original_start_character as usize,
+                matches[0].original_end_character as usize,
+                "[redacted]".into(),
+            )],
+        )
+        .expect("legacy character span should be accepted by delivery");
+        assert_eq!(censored, "[redacted]");
     }
 
     #[test]

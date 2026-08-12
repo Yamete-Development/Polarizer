@@ -4,10 +4,13 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
+    analysis::AnalyzedSurfaces,
     matcher::{CompiledMatcher, MatchDetails, MatchOptions, MatcherBuildError, PatternDefinition},
     model::{ContentPolicy, PolicyActionType, PolicyRule, Surface},
-    normalization::{NormalizedText, normalize_pattern},
-    resolver::{MatchedRule, MatchedSurface},
+    normalization::{
+        NORMALIZATION_SECURITY_VERSION, NormalizedText, SecurityNormalizedText, normalize_pattern,
+    },
+    resolver::{ByteSpan, MatchedRule, MatchedSurface},
 };
 
 #[derive(Debug)]
@@ -112,19 +115,28 @@ impl CompiledPolicySnapshot {
 
     /// Match all supplied normalized surfaces. The same `NormalizedText`
     /// values can be reused for GLOBAL, HUB, and every unique SERVER profile.
-    pub fn evaluate_normalized(
+    pub fn evaluate_normalized<I: SurfaceInputs>(
         &self,
-        normalized: &BTreeMap<Surface, NormalizedText>,
+        surfaces: I,
     ) -> Result<Vec<MatchedRule>, PolicyMatchError> {
         let mut matched = BTreeMap::<Uuid, Vec<MatchedSurface>>::new();
 
         for (surface, surface_matcher) in &self.surfaces {
-            let Some(text) = normalized.get(surface) else {
+            let Some(text) = surfaces.normalized().get(surface) else {
                 continue;
             };
-            let fast = surface_matcher
-                .matcher
-                .match_normalized(text, MatchOptions::default());
+            let security = surfaces.security().and_then(|items| items.get(surface));
+            let security_excluded_spans = if *surface == Surface::MessageContent {
+                surfaces.security_excluded_spans()
+            } else {
+                &[]
+            };
+            let fast = surface_matcher.matcher.match_normalized_with_security(
+                text,
+                security,
+                security_excluded_spans,
+                MatchOptions::default(),
+            );
             if fast.is_empty() {
                 continue;
             }
@@ -133,8 +145,10 @@ impl CompiledPolicySnapshot {
                 .rule_ids()
                 .any(|rule_id| surface_matcher.detailed_rules.contains(&rule_id));
             let detailed = needs_details.then(|| {
-                surface_matcher.matcher.match_normalized(
+                surface_matcher.matcher.match_normalized_with_security(
                     text,
+                    security,
+                    security_excluded_spans,
                     MatchOptions {
                         details: MatchDetails::PatternsAndSpans,
                     },
@@ -237,6 +251,55 @@ impl CompiledPolicySnapshot {
     }
 }
 
+/// Input abstraction keeps the legacy canonical-only compiler tests and
+/// callers valid while allowing analyzed presentations to carry auxiliary
+/// security views and structural message exclusions.
+pub trait SurfaceInputs {
+    fn normalized(&self) -> &BTreeMap<Surface, NormalizedText>;
+
+    fn security(&self) -> Option<&BTreeMap<Surface, SecurityNormalizedText>> {
+        None
+    }
+
+    fn security_excluded_spans(&self) -> &[ByteSpan] {
+        &[]
+    }
+}
+
+impl SurfaceInputs for BTreeMap<Surface, NormalizedText> {
+    fn normalized(&self) -> &BTreeMap<Surface, NormalizedText> {
+        self
+    }
+}
+
+impl<T: SurfaceInputs + ?Sized> SurfaceInputs for &T {
+    fn normalized(&self) -> &BTreeMap<Surface, NormalizedText> {
+        (**self).normalized()
+    }
+
+    fn security(&self) -> Option<&BTreeMap<Surface, SecurityNormalizedText>> {
+        (**self).security()
+    }
+
+    fn security_excluded_spans(&self) -> &[ByteSpan] {
+        (**self).security_excluded_spans()
+    }
+}
+
+impl<'a> SurfaceInputs for AnalyzedSurfaces<'a> {
+    fn normalized(&self) -> &BTreeMap<Surface, NormalizedText> {
+        self.normalized
+    }
+
+    fn security(&self) -> Option<&BTreeMap<Surface, SecurityNormalizedText>> {
+        Some(self.security)
+    }
+
+    fn security_excluded_spans(&self) -> &[ByteSpan] {
+        self.security_excluded_spans
+    }
+}
+
 fn rule_needs_match_details(rule: &PolicyRule) -> bool {
     rule.actions.iter().any(|action| {
         matches!(
@@ -247,7 +310,17 @@ fn rule_needs_match_details(rule: &PolicyRule) -> bool {
 }
 
 fn profile_fingerprint(policy: &ContentPolicy) -> [u8; 32] {
+    profile_fingerprint_with_version(policy, Some(NORMALIZATION_SECURITY_VERSION))
+}
+
+fn profile_fingerprint_with_version(
+    policy: &ContentPolicy,
+    normalization_security_version: Option<&str>,
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
+    if let Some(version) = normalization_security_version {
+        hash_field(&mut hasher, version.as_bytes());
+    }
     let mut rules = policy
         .rules
         .iter()
@@ -301,13 +374,14 @@ fn hash_field(hasher: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, sync::Arc};
 
     use super::*;
     use crate::content_policy::model::{
         PolicyAction, PolicyScope, RulePattern, WildcardPatternType,
     };
     use crate::content_policy::resolver::ByteSpan;
+    use crate::content_policy::{AnalyzedContent, Presentation};
 
     fn policy(actions: Vec<PolicyActionType>) -> ContentPolicy {
         ContentPolicy {
@@ -340,6 +414,13 @@ mod tests {
                     .collect(),
             }],
         }
+    }
+
+    fn analyzed(message: &str) -> AnalyzedContent {
+        AnalyzedContent::from_presentation(&Presentation {
+            message_content: Arc::from(message),
+            ..Presentation::default()
+        })
     }
 
     #[test]
@@ -408,5 +489,115 @@ mod tests {
         definition.rules[0].enabled = false;
         let snapshot = CompiledPolicySnapshot::compile(&definition).unwrap();
         assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn native_security_matching_is_compiled_with_complete_original_spans() {
+        let mut definition = policy(vec![PolicyActionType::CensorMatch]);
+        definition.rules[0].patterns[0].pattern = "wumpus".into();
+        let snapshot = CompiledPolicySnapshot::compile(&definition).unwrap();
+
+        let matched = snapshot
+            .evaluate_normalized(analyzed("wum-pus").normalized_surfaces())
+            .unwrap();
+        assert_eq!(
+            matched[0].surfaces[0].spans,
+            vec![ByteSpan { start: 0, end: 7 }]
+        );
+
+        assert!(
+            snapshot
+                .evaluate_normalized(analyzed("wum pus").normalized_surfaces())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn security_matching_excludes_structural_urls_emails_versions_and_initials() {
+        for (pattern, message) in [
+            ("examplecom", "https://example.com"),
+            ("examplecom", "name@example.com"),
+            ("examplewumpus", "example.wumpus"),
+            ("v1234", "v1.2.3.4"),
+            ("abcd", "A.B.C.D."),
+            ("abcd", "a.b.c.d."),
+            ("cplusplus", "c++"),
+            ("wumpus", "wum/pus"),
+        ] {
+            let mut definition = policy(vec![PolicyActionType::Block]);
+            definition.rules[0].patterns[0].pattern = pattern.into();
+            let snapshot = CompiledPolicySnapshot::compile(&definition).unwrap();
+            assert!(
+                snapshot
+                    .evaluate_normalized(analyzed(message).normalized_surfaces())
+                    .unwrap()
+                    .is_empty(),
+                "{message:?}"
+            );
+        }
+
+        let mut definition = policy(vec![PolicyActionType::Block]);
+        definition.rules[0].patterns[0].pattern = "examplecom".into();
+        let mut domain_definition = definition.clone();
+        domain_definition.rules[0].patterns[0].pattern = "examplecom".into();
+        domain_definition.rules[0].surfaces = BTreeSet::from([Surface::UrlDomain]);
+        let domain_snapshot = CompiledPolicySnapshot::compile(&domain_definition).unwrap();
+        assert!(
+            domain_snapshot
+                .evaluate_normalized(analyzed("https://example.com").normalized_surfaces())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn profile_fingerprint_commits_to_the_normalization_security_version() {
+        let definition = policy(vec![PolicyActionType::Block]);
+        assert_eq!(
+            profile_fingerprint(&definition),
+            profile_fingerprint_with_version(&definition, Some(NORMALIZATION_SECURITY_VERSION))
+        );
+        assert_ne!(
+            profile_fingerprint(&definition),
+            profile_fingerprint_with_version(&definition, None)
+        );
+    }
+
+    #[test]
+    fn native_compiler_uses_full_casefold_and_combining_mark_boundaries() {
+        for (pattern, candidate) in [("ss", "ß"), ("ss", "ẞ"), ("σσσσ", "ΣσςΣ")] {
+            let mut definition = policy(vec![PolicyActionType::Block]);
+            definition.rules[0].patterns[0].pattern = pattern.into();
+            let snapshot = CompiledPolicySnapshot::compile(&definition).unwrap();
+            assert_eq!(
+                snapshot
+                    .evaluate_normalized(analyzed(candidate).normalized_surfaces())
+                    .unwrap()
+                    .len(),
+                1,
+                "pattern {pattern:?}, candidate {candidate:?}"
+            );
+        }
+
+        let mut definition = policy(vec![PolicyActionType::Block]);
+        definition.rules[0].patterns[0].pattern = "i".into();
+        let snapshot = CompiledPolicySnapshot::compile(&definition).unwrap();
+        assert!(
+            snapshot
+                .evaluate_normalized(analyzed("İ").normalized_surfaces())
+                .unwrap()
+                .is_empty()
+        );
+
+        definition.rules[0].patterns[0].pattern = "i\u{307}".into();
+        let snapshot = CompiledPolicySnapshot::compile(&definition).unwrap();
+        assert_eq!(
+            snapshot
+                .evaluate_normalized(analyzed("İ").normalized_surfaces())
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

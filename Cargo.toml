@@ -46,6 +46,8 @@ dashmap = "6"
 base64 = "0.22"
 regex = "1.10"
 unicode-normalization = "0.1"
+icu_casemap = { version = "2.2.0", default-features = false, features = ["compiled_data"] }
+icu_properties = { version = "2.2.0", default-features = false, features = ["compiled_data"] }
 rand = "0.8"
 bytes = "1"
 tokio-stream = "0.1"

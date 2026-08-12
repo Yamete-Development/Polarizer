@@ -87,6 +87,98 @@ fn main() {
         ));
     }
 
+    let security_snapshot = CompiledPolicySnapshot::compile(&security_workload_policy(1_000))
+        .expect("valid security matcher fixture");
+    let security_no_match = AnalyzedContent::from_presentation(&presentation(
+        "an ordinary message with no configured security pattern",
+    ));
+    results.push(run_benchmark(
+        "matcher/security_1000/no_match",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(security_no_match.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
+    let punctuation_match =
+        AnalyzedContent::from_presentation(&presentation("ordinary w.u.m.p.u.s message"));
+    results.push(run_benchmark(
+        "matcher/security/punctuation_match",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(punctuation_match.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
+    let invisible_match =
+        AnalyzedContent::from_presentation(&presentation("ordinary wum\u{200b}pus message"));
+    results.push(run_benchmark(
+        "matcher/security/invisible_match",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(invisible_match.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
+    let mixed_script_match =
+        AnalyzedContent::from_presentation(&presentation("ordinary pαypal message"));
+    results.push(run_benchmark(
+        "matcher/security/mixed_script_match",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(mixed_script_match.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
+    let genuine_non_latin_no_match =
+        AnalyzedContent::from_presentation(&presentation("مرحبا こんにちは привет мир"));
+    results.push(run_benchmark(
+        "matcher/security/genuine_non_latin_no_match",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(genuine_non_latin_no_match.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
+    let long_unicode_control_message = format!(
+        "{}{}",
+        "👩‍👩‍👧‍👦 👩‍💻 👍🏽 🇺🇳 ❤️ ".repeat(64),
+        "ordinary\u{200b} text\u{2060} with\u{feff} controls\u{202e}"
+    );
+    let long_unicode_control =
+        AnalyzedContent::from_presentation(&presentation(&long_unicode_control_message));
+    results.push(run_benchmark(
+        "matcher/security/long_unicode_control_message",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(long_unicode_control.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
     let maximum_message = "ordinary ".repeat(222);
     let maximum_snapshot = CompiledPolicySnapshot::compile(&single_rule_policy(
         PolicyScope::global(),
@@ -271,6 +363,43 @@ fn single_rule_policy(
             }],
         }],
     }
+}
+
+fn security_workload_policy(pattern_count: usize) -> ContentPolicy {
+    let mut policy = single_rule_policy(
+        PolicyScope::global(),
+        pattern_count,
+        777,
+        PolicyActionType::Block,
+    );
+    let mut patterns = ["wumpus", "paypal", "unicodeprobe"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, pattern)| RulePattern {
+            id: fixture_uuid(7_000, index as u128),
+            pattern: pattern.into(),
+            pattern_type: WildcardPatternType::ExactWord,
+        })
+        .collect::<Vec<_>>();
+    patterns.extend((patterns.len()..pattern_count).map(|index| RulePattern {
+        id: fixture_uuid(7_000, index as u128),
+        pattern: format!("term{}", alphabetic_suffix(index)),
+        pattern_type: WildcardPatternType::ExactWord,
+    }));
+    policy.rules[0].patterns = patterns;
+    policy
+}
+
+fn alphabetic_suffix(mut value: usize) -> String {
+    let mut result = Vec::new();
+    loop {
+        result.push((b'a' + (value % 26) as u8) as char);
+        if value < 26 {
+            break;
+        }
+        value = value / 26 - 1;
+    }
+    result.into_iter().rev().collect()
 }
 
 fn many_match_fixture(runtime: &Runtime, count: usize) -> EvaluatorFixture {

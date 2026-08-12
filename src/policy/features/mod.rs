@@ -536,6 +536,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automod_matches_trace_contains_metadata_not_content_or_security_views() {
+        use crate::policy::features::text::AutomodMatchProvider;
+
+        let registry = FeatureRegistry::default();
+        registry
+            .register(Arc::new(AutomodMatchProvider))
+            .await
+            .unwrap();
+        let requirement = requirement(
+            "automod.matches",
+            serde_json::json!({
+                "literals": [{"id": "wumpus", "pattern": "wumpus"}],
+                "regexes": [],
+                "whitelist_pattern_ids": []
+            }),
+        );
+        let source = "Wum.pus";
+        let resolved = registry
+            .resolve(&action(source), std::slice::from_ref(&requirement))
+            .await;
+
+        let runtime = resolved.runtime_snapshot(std::slice::from_ref(&requirement));
+        assert_eq!(
+            runtime["automod.matches"]
+                .value
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let trace = serde_json::to_string(&resolved.trace_snapshot()).unwrap();
+        assert!(trace.contains("match_count"));
+        assert!(!trace.contains(source));
+        assert!(!trace.contains("wum pus"));
+        assert!(!trace.contains("wumpus"));
+        assert!(!trace.contains("Wum"));
+    }
+
+    #[tokio::test]
     async fn duplicate_provider_names_are_rejected_instead_of_replaced() {
         let registry = FeatureRegistry::default();
         registry

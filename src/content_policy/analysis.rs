@@ -9,9 +9,25 @@ use std::{collections::BTreeMap, sync::Arc};
 use super::{
     delivery::Presentation,
     model::Surface,
-    normalization::{NormalizedText, SurfaceSpan},
+    normalization::{NormalizedText, SecurityNormalizedText, SurfaceSpan},
     resolver::ByteSpan,
 };
+
+/// The immutable surface views shared by every native policy profile for one
+/// presentation. Canonical text remains the source of truth; security text is
+/// an auxiliary view used only for eligible literal patterns.
+#[derive(Debug, Clone, Copy)]
+pub struct AnalyzedSurfaces<'a> {
+    pub normalized: &'a BTreeMap<Surface, NormalizedText>,
+    pub security: &'a BTreeMap<Surface, SecurityNormalizedText>,
+    pub security_excluded_spans: &'a [ByteSpan],
+}
+
+impl<'a> AnalyzedSurfaces<'a> {
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'a, Surface, NormalizedText> {
+        self.normalized.iter()
+    }
+}
 
 /// Immutable normalized content and original-coordinate link metadata shared
 /// by all policy profiles evaluating one presentation.
@@ -20,6 +36,12 @@ pub struct AnalyzedContent {
     /// Only non-empty surfaces are present. `URL_DOMAIN` contains extracted
     /// domains, while every other entry contains its presentation surface.
     pub normalized: BTreeMap<Surface, NormalizedText>,
+    /// Auxiliary security views for non-URL surfaces. These retain source-byte
+    /// provenance and keep ordinary whitespace as a hard separator.
+    pub security: BTreeMap<Surface, SecurityNormalizedText>,
+    /// Message ranges where punctuation is structural (URLs and email-like
+    /// addresses), so auxiliary matching cannot compact across them.
+    pub security_excluded_spans: Arc<[ByteSpan]>,
     /// Full original URL spans, including scheme and path, for STRIP_LINK.
     pub url_spans: Arc<[ByteSpan]>,
 }
@@ -31,7 +53,13 @@ impl AnalyzedContent {
 
     pub fn new(presentation: &Presentation) -> Self {
         let (url_spans, domain_spans) = extract_urls(&presentation.message_content);
+        let mut security_excluded_spans = url_spans.clone();
+        security_excluded_spans.extend(extract_email_spans(&presentation.message_content));
+        security_excluded_spans.extend(extract_dotted_initial_spans(&presentation.message_content));
+        security_excluded_spans.sort_unstable();
+        security_excluded_spans = merge_spans(security_excluded_spans);
         let mut normalized = BTreeMap::new();
+        let mut security = BTreeMap::new();
 
         for surface in Surface::ALL {
             if surface == Surface::UrlDomain {
@@ -50,11 +78,14 @@ impl AnalyzedContent {
             let value = presentation.surface(surface);
             if !value.is_empty() {
                 normalized.insert(surface, NormalizedText::new(value));
+                security.insert(surface, SecurityNormalizedText::new(value));
             }
         }
 
         Self {
             normalized,
+            security,
+            security_excluded_spans: Arc::from(security_excluded_spans),
             url_spans: Arc::from(url_spans),
         }
     }
@@ -63,13 +94,166 @@ impl AnalyzedContent {
         self.normalized.get(&surface)
     }
 
-    pub fn normalized_surfaces(&self) -> &BTreeMap<Surface, NormalizedText> {
+    pub fn normalized_surfaces(&self) -> AnalyzedSurfaces<'_> {
+        AnalyzedSurfaces {
+            normalized: &self.normalized,
+            security: &self.security,
+            security_excluded_spans: &self.security_excluded_spans,
+        }
+    }
+
+    pub fn canonical_surfaces(&self) -> &BTreeMap<Surface, NormalizedText> {
         &self.normalized
     }
 
     pub fn url_spans(&self) -> &[ByteSpan] {
         &self.url_spans
     }
+}
+
+fn extract_email_spans(input: &str) -> Vec<ByteSpan> {
+    let bytes = input.as_bytes();
+    let mut spans = Vec::new();
+
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != b'@' || at == 0 || at + 1 >= bytes.len() {
+            continue;
+        }
+
+        let mut local_start = at;
+        while local_start > 0 && is_email_local_byte(bytes[local_start - 1]) {
+            local_start -= 1;
+        }
+        if local_start == at || !is_start_boundary(input, local_start) {
+            continue;
+        }
+
+        let mut domain_end = at + 1;
+        while domain_end < bytes.len() && is_email_domain_byte(bytes[domain_end]) {
+            domain_end += 1;
+        }
+        if !valid_email_domain(&bytes[at + 1..domain_end]) {
+            continue;
+        }
+
+        let end = trim_terminal_punctuation(bytes, local_start, domain_end);
+        if end > at + 1 {
+            spans.push(ByteSpan {
+                start: local_start,
+                end,
+            });
+        }
+    }
+
+    spans
+}
+
+fn is_email_local_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'.' | b'!'
+                | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'/'
+                | b'='
+                | b'?'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+        )
+}
+
+fn is_email_domain_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
+}
+
+fn valid_email_domain(domain: &[u8]) -> bool {
+    let mut labels = domain.split(|byte| *byte == b'.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    if first.is_empty() {
+        return false;
+    }
+
+    let mut label_count = 1;
+    let mut last = first;
+    for label in labels {
+        if label.is_empty()
+            || label[0] == b'-'
+            || label[label.len() - 1] == b'-'
+            || !label.iter().all(u8::is_ascii_alphanumeric)
+        {
+            return false;
+        }
+        label_count += 1;
+        last = label;
+    }
+
+    label_count >= 2
+        && last.len() >= 2
+        && last.iter().all(u8::is_ascii_alphabetic)
+        && first
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
+fn extract_dotted_initial_spans(input: &str) -> Vec<ByteSpan> {
+    let bytes = input.as_bytes();
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if !bytes[cursor].is_ascii_alphabetic()
+            || !input.is_char_boundary(cursor)
+            || !is_start_boundary(input, cursor)
+        {
+            cursor += 1;
+            continue;
+        }
+
+        let start = cursor;
+        let mut initials = 1;
+        let mut end = cursor + 1;
+        while end + 1 < bytes.len() && bytes[end] == b'.' && bytes[end + 1].is_ascii_alphabetic() {
+            initials += 1;
+            end += 2;
+        }
+
+        if initials >= 4 {
+            spans.push(ByteSpan { start, end });
+            cursor = end;
+        } else {
+            cursor = start + 1;
+        }
+    }
+
+    spans
+}
+
+fn merge_spans(mut spans: Vec<ByteSpan>) -> Vec<ByteSpan> {
+    let mut merged: Vec<ByteSpan> = Vec::with_capacity(spans.len());
+    for span in spans.drain(..) {
+        if let Some(last) = merged.last_mut()
+            && span.start <= last.end
+        {
+            last.end = last.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -382,6 +566,58 @@ mod tests {
         assert_eq!(
             domains.original_span(two..two + "two example".len()),
             Some(ByteSpan { start: 24, end: 39 })
+        );
+    }
+
+    #[test]
+    fn security_views_cover_literal_surfaces_but_not_url_domains() {
+        let analyzed = AnalyzedContent::new(&Presentation {
+            message_content: Arc::from("wum.pus https://example.com name@example.com A.B.C.D."),
+            display_name: Arc::from("wum-pus"),
+            username: Arc::from("wum_pus"),
+            server_name: Arc::from("w.u.m.p.u.s"),
+            hub_name: Arc::from("wum\u{200b}pus"),
+            ..Presentation::default()
+        });
+
+        for surface in [
+            Surface::MessageContent,
+            Surface::DisplayName,
+            Surface::Username,
+            Surface::ServerName,
+            Surface::HubName,
+        ] {
+            assert!(analyzed.security.contains_key(&surface), "{surface:?}");
+        }
+        assert!(!analyzed.security.contains_key(&Surface::UrlDomain));
+        assert_eq!(analyzed.security[&Surface::DisplayName].as_str(), "wumpus");
+        assert!(analyzed.security_excluded_spans.iter().any(|span| {
+            &"wum.pus https://example.com name@example.com A.B.C.D."[span.start..span.end]
+                == "https://example.com"
+        }));
+        assert!(analyzed.security_excluded_spans.iter().any(|span| {
+            &"wum.pus https://example.com name@example.com A.B.C.D."[span.start..span.end]
+                == "name@example.com"
+        }));
+    }
+
+    #[test]
+    fn security_exclusions_cover_all_extracted_domains_and_dotted_initial_case() {
+        let message = "example.wumpus A.B.C.D. a.b.c.d.";
+        let analyzed = AnalyzedContent::new(&presentation(message));
+
+        for excluded in ["example.wumpus", "A.B.C.D", "a.b.c.d"] {
+            assert!(
+                analyzed
+                    .security_excluded_spans
+                    .iter()
+                    .any(|span| &message[span.start..span.end] == excluded),
+                "missing exclusion for {excluded:?}"
+            );
+        }
+        assert_eq!(
+            analyzed.surface(Surface::UrlDomain).unwrap().as_str(),
+            "example wumpus"
         );
     }
 }
