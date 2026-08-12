@@ -282,15 +282,16 @@ impl CompiledMatcher {
                 start: found.start(),
                 end: found.end(),
             };
-            if !matches_boundary(normalized.as_str(), span, pattern.pattern_type) {
+            if !matches_boundary(normalized, span, pattern.pattern_type) {
                 continue;
             }
             let Some(original_span) = normalized.span_for(span) else {
                 continue;
             };
-            if security_excluded_spans.iter().any(|excluded| {
-                original_span.start < excluded.end && excluded.start < original_span.end
-            }) {
+            if security_excluded_spans
+                .iter()
+                .any(|excluded| normalized.span_is_within_original(span, *excluded))
+            {
                 continue;
             }
 
@@ -328,6 +329,8 @@ impl CompiledMatcher {
 trait NormalizedInput {
     fn as_str(&self) -> &str;
     fn span_for(&self, normalized: ByteSpan) -> Option<ByteSpan>;
+    fn span_is_within_original(&self, normalized: ByteSpan, original: ByteSpan) -> bool;
+    fn is_token_character(character: char) -> bool;
 }
 
 impl NormalizedInput for NormalizedText {
@@ -338,6 +341,14 @@ impl NormalizedInput for NormalizedText {
     fn span_for(&self, normalized: ByteSpan) -> Option<ByteSpan> {
         self.span_for(normalized)
     }
+
+    fn span_is_within_original(&self, normalized: ByteSpan, original: ByteSpan) -> bool {
+        self.span_is_within_original(normalized, original)
+    }
+
+    fn is_token_character(character: char) -> bool {
+        is_token_character(character)
+    }
 }
 
 impl NormalizedInput for SecurityNormalizedText {
@@ -347,6 +358,17 @@ impl NormalizedInput for SecurityNormalizedText {
 
     fn span_for(&self, normalized: ByteSpan) -> Option<ByteSpan> {
         self.span_for(normalized)
+    }
+
+    fn span_is_within_original(&self, normalized: ByteSpan, original: ByteSpan) -> bool {
+        self.span_is_within_original(normalized, original)
+    }
+
+    fn is_token_character(character: char) -> bool {
+        // Underscores are compactable obfuscation separators in this view,
+        // including Discord's paired underline delimiters. Canonical matching
+        // still treats underscores as token characters for identifiers.
+        is_token_character(character) && character != '_'
     }
 }
 
@@ -421,17 +443,22 @@ fn merge_reports(
     primary
 }
 
-fn matches_boundary(text: &str, span: ByteSpan, pattern_type: WildcardPatternType) -> bool {
+fn matches_boundary<V: NormalizedInput>(
+    normalized: &V,
+    span: ByteSpan,
+    pattern_type: WildcardPatternType,
+) -> bool {
+    let text = normalized.as_str();
     let left_ok = span.start == 0
         || text[..span.start]
             .chars()
             .next_back()
-            .is_some_and(|character| !is_token_character(character));
+            .is_some_and(|character| !V::is_token_character(character));
     let right_ok = span.end == text.len()
         || text[span.end..]
             .chars()
             .next()
-            .is_some_and(|character| !is_token_character(character));
+            .is_some_and(|character| !V::is_token_character(character));
 
     match pattern_type {
         WildcardPatternType::ExactWord | WildcardPatternType::Phrase => left_ok && right_ok,
@@ -582,6 +609,65 @@ mod tests {
                 "{candidate:?}"
             );
         }
+    }
+
+    #[test]
+    fn security_view_matches_discord_markdown_split_literals() {
+        let matcher =
+            CompiledMatcher::compile([definition(1, 11, "wumpus", WildcardPatternType::ExactWord)])
+                .unwrap();
+
+        for candidate in [
+            "wu**m**p**us**",
+            "wu__m__p__us__",
+            "wu~~m~~p~~us~~",
+            "wu||m||p||us||",
+            "wu`m`p`us`",
+            "wu[m](https://example.com)pus",
+        ] {
+            let report = matcher.match_text(
+                candidate,
+                MatchOptions {
+                    details: MatchDetails::PatternsAndSpans,
+                },
+            );
+            assert_eq!(
+                report.rule_ids().collect::<Vec<_>>(),
+                vec![Uuid::from_u128(1)],
+                "candidate: {candidate:?}"
+            );
+            assert_eq!(
+                report.triggers[0].matches[0].original_span,
+                ByteSpan {
+                    start: 0,
+                    end: candidate.rfind("us").unwrap() + 2
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn masked_link_labels_match_across_excluded_destinations() {
+        let matcher =
+            CompiledMatcher::compile([definition(1, 11, "wumpus", WildcardPatternType::ExactWord)])
+                .unwrap();
+        let candidate = "wu[m](https://example.com)pus";
+        let url_start = candidate.find("https://").unwrap();
+        let url_end = candidate[url_start..].find(')').unwrap() + url_start;
+        let report = matcher.match_normalized_with_security(
+            &NormalizedText::new(candidate),
+            Some(&SecurityNormalizedText::new(candidate)),
+            &[ByteSpan {
+                start: url_start,
+                end: url_end,
+            }],
+            MatchOptions::default(),
+        );
+
+        assert_eq!(
+            report.rule_ids().collect::<Vec<_>>(),
+            vec![Uuid::from_u128(1)]
+        );
     }
 
     #[test]

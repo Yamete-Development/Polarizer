@@ -22,7 +22,7 @@ pub use super::resolver::ByteSpan;
 /// Bump this whenever canonical or auxiliary security matching semantics
 /// change. Compiled policy fingerprints should include this value so a
 /// process restart cannot reuse a snapshot compiled with older Unicode data.
-pub const NORMALIZATION_SECURITY_VERSION: &str = "unicode17-icu2.2-security-v3";
+pub const NORMALIZATION_SECURITY_VERSION: &str = "unicode17-icu2.2-security-v4";
 
 /// Text after the policy normalization pipeline, with normalized-to-original
 /// byte provenance for every emitted UTF-8 scalar.
@@ -181,6 +181,10 @@ impl NormalizedText {
         self.original_span(normalized.start..normalized.end)
     }
 
+    pub(crate) fn span_is_within_original(&self, normalized: ByteSpan, original: ByteSpan) -> bool {
+        span_is_within_original(&self.spans, normalized, original)
+    }
+
     fn push(&mut self, character: char, original: ByteSpan) {
         let start = self.text.len();
         self.text.push(character);
@@ -193,8 +197,8 @@ impl NormalizedText {
 
 impl SecurityNormalizedText {
     /// Build the auxiliary security view. Whitespace and unapproved
-    /// punctuation remain visible; only approved separators and default-
-    /// ignorable code points inserted inside Latin tokens are removed.
+    /// punctuation remain visible; only approved separators and
+    /// security-ignorable code points inside Latin tokens are removed.
     pub fn new(input: &str) -> Self {
         let mapped = security_mapped(input);
         let mut result = Self {
@@ -226,6 +230,10 @@ impl SecurityNormalizedText {
 
     pub fn span_for(&self, normalized: ByteSpan) -> Option<ByteSpan> {
         self.original_span(normalized.start..normalized.end)
+    }
+
+    pub(crate) fn span_is_within_original(&self, normalized: ByteSpan, original: ByteSpan) -> bool {
+        span_is_within_original(&self.spans, normalized, original)
     }
 
     fn push(&mut self, character: char, original: ByteSpan) {
@@ -303,24 +311,25 @@ fn fold_mapped(mapped: Vec<(char, ByteSpan)>) -> Vec<(char, ByteSpan)> {
 }
 
 fn security_mapped(input: &str) -> Vec<(char, ByteSpan)> {
-    let folded = fold_mapped(mapped_nfkc(input));
+    let folded = fold_mapped(mapped_nfkc_from_source(discord_markdown_visible_source(
+        input,
+    )));
     let visible: Vec<_> = folded
         .into_iter()
         .filter(|(character, _)| !is_ignored_format(*character))
         .collect();
 
-    // Remove default-ignorable code points only when they split a Latin token.
-    // This catches joiners, variation selectors, tag characters, and future
-    // Unicode additions without destroying legitimate emoji or non-Latin
-    // shaping sequences. Adjacency skips combining marks, other ignorables,
-    // and approved inserted punctuation to resolve the token base on each
-    // side. Thus repeated forms such as `wum.\u{e002e}_pus` reduce
-    // deterministically.
+    // Remove security-ignorable code points only when they split a Latin
+    // token. This catches Unicode default ignorables plus U+2800 BRAILLE
+    // PATTERN BLANK without destroying legitimate emoji or non-Latin shaping
+    // sequences. Adjacency skips combining marks, other ignorables, and
+    // approved inserted punctuation to resolve the token base on each side.
+    // Thus repeated forms such as `wum.\u{e002e}_pus` reduce deterministically.
     let without_contextual_ignorables: Vec<_> = visible
         .iter()
         .enumerate()
         .filter_map(|(index, &(character, original))| {
-            if is_default_ignorable(character)
+            if is_security_ignorable(character)
                 && neighboring_character(&visible, index, 1, is_ignorable_neighbor)
                     .is_some_and(is_latin_character)
                 && neighboring_character(&visible, index, -1, is_ignorable_neighbor)
@@ -472,7 +481,14 @@ fn is_token_component(character: char) -> bool {
 }
 
 fn is_security_separator(character: char) -> bool {
-    matches!(character, '.' | '-' | '_')
+    matches!(
+        character,
+        // Common inserted punctuation plus Discord's inline Markdown
+        // delimiters. Whitespace, slashes, brackets, and parentheses remain
+        // hard boundaries because they commonly separate real content or
+        // carry structural URL syntax.
+        '.' | '-' | '_' | '*' | '~' | '|' | '`'
+    )
 }
 
 fn is_security_letter_or_mark(character: char) -> bool {
@@ -481,7 +497,7 @@ fn is_security_letter_or_mark(character: char) -> bool {
 
 fn is_ignorable_neighbor(character: char) -> bool {
     is_combining_mark(character)
-        || is_default_ignorable(character)
+        || is_security_ignorable(character)
         || is_security_separator(character)
 }
 
@@ -491,6 +507,10 @@ fn is_joiner(character: char) -> bool {
 
 fn is_default_ignorable(character: char) -> bool {
     CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(character)
+}
+
+fn is_security_ignorable(character: char) -> bool {
+    is_default_ignorable(character) || character == '\u{2800}'
 }
 
 fn source_chars(input: &str) -> Vec<(char, ByteSpan)> {
@@ -504,13 +524,21 @@ fn source_chars(input: &str) -> Vec<(char, ByteSpan)> {
 }
 
 fn mapped_nfkc(input: &str) -> Vec<(char, ByteSpan)> {
+    mapped_nfkc_from_source(source_chars(input))
+}
+
+fn mapped_nfkc_from_source(source: Vec<(char, ByteSpan)>) -> Vec<(char, ByteSpan)> {
     // Implement NFKC as mapped compatibility decomposition, canonical
     // ordering, and canonical composition. Every decomposed scalar initially
     // retains its own source span. Composition unions only the spans of the
     // scalars it actually consumes, so adjacent unchanged marks and letters
     // keep narrow provenance without a whole-input fallback.
     let mut decomposed = Vec::new();
-    for (character, original) in source_chars(input) {
+    let expected_source = source
+        .iter()
+        .map(|(character, _)| *character)
+        .collect::<String>();
+    for (character, original) in source {
         decompose_compatible(character, |decomposed_character| {
             decomposed.push((decomposed_character, original));
         });
@@ -523,9 +551,88 @@ fn mapped_nfkc(input: &str) -> Vec<(char, ByteSpan)> {
             .iter()
             .map(|(character, _)| *character)
             .collect::<String>(),
-        input.nfkc().collect::<String>()
+        expected_source.nfkc().collect::<String>()
     );
     composed
+}
+
+/// Retain the rendered labels of Discord masked links while dropping their
+/// raw delimiters and hidden destinations. Every retained character keeps its
+/// original source span for moderation attribution and censoring.
+fn discord_markdown_visible_source(input: &str) -> Vec<(char, ByteSpan)> {
+    let source = source_chars(input);
+    let mut visible = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+
+    while cursor < source.len() {
+        let Some((label_end, destination_end)) = masked_link_at(&source, cursor) else {
+            visible.push(source[cursor]);
+            cursor += 1;
+            continue;
+        };
+
+        visible.extend_from_slice(&source[cursor + 1..label_end]);
+        cursor = destination_end + 1;
+    }
+
+    visible
+}
+
+fn masked_link_at(source: &[(char, ByteSpan)], start: usize) -> Option<(usize, usize)> {
+    if source.get(start)?.0 != '[' || is_markdown_escaped(source, start) {
+        return None;
+    }
+
+    let label_end = (start + 1..source.len())
+        .find(|&index| source[index].0 == ']' && !is_markdown_escaped(source, index))?;
+    if label_end == start + 1 || source.get(label_end + 1).map(|item| item.0) != Some('(') {
+        return None;
+    }
+
+    let destination_start = label_end + 2;
+    let mut depth = 1usize;
+    let mut destination_end = None;
+    for index in destination_start..source.len() {
+        if is_markdown_escaped(source, index) {
+            continue;
+        }
+        match source[index].0 {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    destination_end = Some(index);
+                    break;
+                }
+            }
+            '\n' | '\r' => return None,
+            _ => {}
+        }
+    }
+    let destination_end = destination_end?;
+
+    let destination = source[destination_start..destination_end]
+        .iter()
+        .map(|(character, _)| *character)
+        .collect::<String>();
+    let destination = destination.trim_matches(['<', '>']);
+    let is_http = destination
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || destination
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    is_http.then_some((label_end, destination_end))
+}
+
+fn is_markdown_escaped(source: &[(char, ByteSpan)], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut cursor = index;
+    while cursor > 0 && source[cursor - 1].0 == '\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
 }
 
 fn canonical_order_mapped(mapped: &mut [(char, ByteSpan)]) {
@@ -601,6 +708,27 @@ fn original_span(
         original = Some(merge_spans(original, entry.original));
     }
     original
+}
+
+fn span_is_within_original(
+    spans: &[NormalizedCharSpan],
+    normalized: ByteSpan,
+    original: ByteSpan,
+) -> bool {
+    let mut found = false;
+    for entry in spans {
+        if entry.normalized.end <= normalized.start {
+            continue;
+        }
+        if entry.normalized.start >= normalized.end {
+            break;
+        }
+        found = true;
+        if entry.original.start < original.start || entry.original.end > original.end {
+            return false;
+        }
+    }
+    found
 }
 
 const fn span(start: usize, end: usize) -> ByteSpan {
@@ -799,12 +927,26 @@ mod tests {
 
     #[test]
     fn security_view_compacts_only_approved_inserted_punctuation() {
-        for candidate in ["wum.pus", "wum-pus", "wum_pus", "w.u.m.p.u.s"] {
+        for candidate in [
+            "wum.pus",
+            "wum-pus",
+            "wum_pus",
+            "w.u.m.p.u.s",
+            "wu**m**p**us**",
+            "wu__m__p__us__",
+            "wu~~m~~p~~us~~",
+            "wu||m||p||us||",
+            "wu`m`p`us`",
+        ] {
             let text = SecurityNormalizedText::new(candidate);
-            assert_eq!(text.as_str(), "wumpus", "candidate: {candidate}");
+            assert!(
+                text.as_str().starts_with("wumpus"),
+                "candidate: {candidate}, normalized: {:?}",
+                text.as_str()
+            );
             assert_eq!(
-                text.original_span(0..text.len()),
-                Some(span(0, candidate.len()))
+                text.original_span(0.."wumpus".len()),
+                Some(span(0, candidate.rfind('s').unwrap() + 1))
             );
         }
 
@@ -835,6 +977,30 @@ mod tests {
                 mixed.original_span(0..mixed.len()),
                 Some(span(0, mixed_input.len()))
             );
+        }
+    }
+
+    #[test]
+    fn security_view_projects_discord_masked_link_labels() {
+        let candidate = "wu[m](https://example.com/a_(b))pus";
+        let text = SecurityNormalizedText::new(candidate);
+        assert_eq!(text.as_str(), "wumpus");
+        assert_eq!(
+            text.original_span(0..text.len()),
+            Some(span(0, candidate.len()))
+        );
+        assert_eq!(
+            SecurityNormalizedText::new("wu[m](HTTPS://example.com)pus").as_str(),
+            "wumpus"
+        );
+
+        for unchanged in [
+            "wu[m](not-a-url)pus",
+            "wu\\[m](https://example.com)pus",
+            "wu[m](https://example.com/pus",
+            "wu[](<https://example.com>)pus",
+        ] {
+            assert_ne!(SecurityNormalizedText::new(unchanged).as_str(), "wumpus");
         }
     }
 
@@ -956,6 +1122,39 @@ mod tests {
                 "wumpus",
                 "invisible: U+{:04X}",
                 invisible as u32
+            );
+        }
+    }
+
+    #[test]
+    fn visible_blank_compatibility_characters_cannot_split_literals() {
+        for invisible in ['\u{2800}', '\u{3164}', '\u{ffa0}'] {
+            let candidate = format!("wum{invisible}pus");
+            assert_eq!(
+                SecurityNormalizedText::new(&candidate).as_str(),
+                "wumpus",
+                "blank: U+{:04X}",
+                invisible as u32
+            );
+        }
+    }
+
+    #[test]
+    fn every_unicode_default_ignorable_is_covered_inside_latin_tokens() {
+        let default_ignorables = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+        for value in 0..=char::MAX as u32 {
+            let Some(invisible) = char::from_u32(value) else {
+                continue;
+            };
+            if !default_ignorables.contains(invisible) {
+                continue;
+            }
+
+            let candidate = format!("wum{invisible}pus");
+            assert_eq!(
+                SecurityNormalizedText::new(&candidate).as_str(),
+                "wumpus",
+                "default ignorable: U+{value:04X}"
             );
         }
     }

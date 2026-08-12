@@ -132,6 +132,21 @@ fn main() {
         },
     ));
 
+    let markdown_match = AnalyzedContent::from_presentation(&presentation(
+        "ordinary wu[m](https://example.com)pus message",
+    ));
+    results.push(run_benchmark(
+        "matcher/security/discord_markdown_match",
+        sample_duration,
+        || {
+            black_box(
+                security_snapshot
+                    .evaluate_normalized(markdown_match.normalized_surfaces())
+                    .unwrap(),
+            )
+        },
+    ));
+
     let mixed_script_match =
         AnalyzedContent::from_presentation(&presentation("ordinary pαypal message"));
     results.push(run_benchmark(

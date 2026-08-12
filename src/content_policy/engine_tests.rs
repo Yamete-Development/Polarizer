@@ -835,6 +835,49 @@ async fn obfuscated_global_block_remains_terminal_for_all_destinations() {
 }
 
 #[tokio::test]
+async fn discord_markdown_cannot_split_native_block_literals() {
+    let evaluator = evaluator([policy(
+        140,
+        PolicyScope::global(),
+        1,
+        vec![rule(
+            141,
+            "global-block",
+            "wumpus",
+            Surface::MessageContent,
+            vec![action(142, PolicyActionType::Block)],
+        )],
+    )])
+    .await;
+
+    for candidate in [
+        "wu**m**p**us**",
+        "wu__m__p__us__",
+        "wu~~m~~p~~us~~",
+        "wu||m||p||us||",
+        "wu`m`p`us`",
+        "wu[m](https://example.com)pus",
+    ] {
+        let canonical = presentation(candidate);
+        let analyzed = AnalyzedContent::from_presentation(&canonical);
+        let result = evaluator
+            .evaluate_call_for_destinations(
+                "subject",
+                &canonical,
+                &analyzed,
+                &[destination(0, "server-a")],
+            )
+            .unwrap();
+
+        assert!(
+            result.global.delivery.is_blocked(),
+            "candidate: {candidate:?}"
+        );
+        assert!(result.destinations[0].is_blocked());
+    }
+}
+
+#[tokio::test]
 async fn security_matching_applies_to_names_without_leaking_auxiliary_text() {
     let evaluator = evaluator([policy(
         140,

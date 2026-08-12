@@ -245,15 +245,15 @@ fn literal_matches(
         for found in security_matcher.find_iter(security.as_str()) {
             let (pattern_index, _) = security_patterns[found.pattern().as_usize()];
             let pattern = &config.literals[pattern_index];
-            let original_span = security.span_for(ByteSpan {
+            let normalized_span = ByteSpan {
                 start: found.start(),
                 end: found.end(),
-            });
-            if original_span.is_some_and(|matched| {
-                structural_spans
-                    .iter()
-                    .any(|structural| spans_intersect(matched, *structural))
-            }) {
+            };
+            let original_span = security.span_for(normalized_span);
+            if structural_spans
+                .iter()
+                .any(|structural| security.span_is_within_original(normalized_span, *structural))
+            {
                 continue;
             }
             if let Some(item) = mapped_view_match(
@@ -410,10 +410,6 @@ fn merge_byte_spans(spans: Vec<ByteSpan>) -> Vec<ByteSpan> {
         }
     }
     merged
-}
-
-fn spans_intersect(left: ByteSpan, right: ByteSpan) -> bool {
-    left.start < right.end && right.start < left.end
 }
 
 fn is_domain_byte(byte: u8) -> bool {
@@ -689,6 +685,29 @@ mod tests {
             assert_eq!(
                 matches[0].original_end_character,
                 candidate.chars().count() as u32
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn literals_match_discord_markdown_split_words() {
+        for candidate in [
+            "wu**m**p**us**",
+            "wu__m__p__us__",
+            "wu~~m~~p~~us~~",
+            "wu||m||p||us||",
+            "wu`m`p`us`",
+            "wu[m](https://example.com)pus",
+        ] {
+            let matches = matches_for(candidate, &[("wumpus", "wumpus")], &[], &[])
+                .await
+                .unwrap();
+            assert_eq!(matches.len(), 1, "candidate: {candidate:?}");
+            assert_eq!(matches[0].original_start_character, 0);
+            let rendered_end = candidate.rfind("us").unwrap() + 2;
+            assert_eq!(
+                matches[0].original_end_character,
+                candidate[..rendered_end].chars().count() as u32
             );
         }
     }
