@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       environment:
@@ -24,8 +22,10 @@ permissions:
   packages: write
 
 jobs:
+  # Verification and the production binary build intentionally run in parallel.
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     services:
       postgres:
         image: postgres:18
@@ -39,8 +39,10 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
@@ -60,13 +62,110 @@ jobs:
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features
 
-  build-and-push:
-    needs: verify
-    runs-on: arc-runner-set
+  compile-release:
+    name: Compile Release Binaries
+    runs-on: ubuntu-24.04
+
+    env:
+      CARGO_BUILD_JOBS: 4
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache release dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: polarizer-release
+
+      - name: Compile release binaries
+        run: |
+          cargo build --locked --release \
+            --bin polarizer \
+            --bin polarizer-policy-worker
+
+      # Tar the binaries so executable permissions survive the artifact hop.
+      - name: Pack release binaries
+        run: |
+          tar -C target/release -cf polarizer-binaries.tar \
+            polarizer \
+            polarizer-policy-worker
+
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v7
+        with:
+          path: polarizer-binaries.tar
+          archive: false
+          retention-days: 1
+
+  build-and-push:
+    needs:
+      - verify
+      - compile-release
+
+    runs-on: arc-runner-set
+
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@v8
+        with:
+          name: polarizer-binaries.tar
+          path: .
+
+      - name: Prepare Docker build context
+        shell: bash
+        run: |
+          mkdir -p ci-context/bin
+          tar -xf polarizer-binaries.tar -C ci-context/bin
+
+          cat > ci-context/Dockerfile <<'EOF'
+          # syntax=docker/dockerfile:1.7
+
+          FROM debian:trixie-slim AS runtime-tools
+
+          RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+              --mount=type=cache,target=/var/lib/apt,sharing=locked \
+              apt-get update && \
+              apt-get install -y --no-install-recommends busybox-static tini && \
+              install -D -m 0755 /bin/busybox /out/bin/busybox && \
+              install -D -m 0755 /usr/bin/tini /out/bin/tini
+
+          FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+
+          WORKDIR /app
+
+          COPY --from=runtime-tools /out/bin/ /usr/bin/
+          COPY --chown=65532:65532 bin/polarizer /app/polarizer
+          COPY --chown=65532:65532 bin/polarizer-policy-worker /app/polarizer-policy-worker
+
+          ENV POLARIZER_POLICY_WORKER_BIN=/app/polarizer-policy-worker
+
+          USER 65532:65532
+
+          EXPOSE 50051 9090
+          STOPSIGNAL SIGTERM
+
+          HEALTHCHECK --interval=10s --timeout=3s --start-period=40s --retries=6 \
+              CMD ["/usr/bin/busybox", "wget", "-q", "-T", "2", "-O", "/dev/null", "http://127.0.0.1:9090/ready"]
+
+          ENTRYPOINT ["/usr/bin/tini", "--", "/app/polarizer"]
+          EOF
 
       - name: Log in to the Container registry
         uses: docker/login-action@v4
@@ -76,72 +175,47 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Restore Docker Rust cache
-        id: rust-docker-cache
-        uses: actions/cache@v6
-        with:
-          path: docker-cache
-          key: polarizer-docker-rust-v2-rust-1.88.0-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
-          restore-keys: |
-            polarizer-docker-rust-v2-rust-1.88.0-${{ runner.arch }}-
-
-      - name: Restore BuildKit cache mounts
-        uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          cache-map: |
-            {
-              "docker-cache/cargo-registry": {
-                "target": "/root/.cargo/registry",
-                "id": "polarizer-cargo-registry"
-              },
-              "docker-cache/cargo-target": {
-                "target": "/app/target",
-                "id": "polarizer-target"
-              }
-            }
-          skip-extraction: ${{ steps.rust-docker-cache.outputs.cache-hit }}
 
       - name: Determine tags and environment
         id: vars
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "environment=prod" >> "$GITHUB_OUTPUT"
-            echo "float_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          elif [[ "${{ github.event.inputs.version_tag }}" != "" ]]; then
-            echo "environment=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
-            echo "float_tag=latest" >> "$GITHUB_OUTPUT"
-            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.event.inputs.version_tag }}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event.inputs.version_tag }}" != "" ]]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+
+            if [[ -z "$ENVIRONMENT" ]]; then
+              ENVIRONMENT="prod"
+            fi
+
+            FLOAT_TAG="latest"
+            VERSION_TAG="ghcr.io/maybesidequest/polarizer:${{ github.event.inputs.version_tag }}"
           else
-            echo "environment=staging" >> "$GITHUB_OUTPUT"
-            echo "float_tag=staging" >> "$GITHUB_OUTPUT"
-            echo "version_tag=" >> "$GITHUB_OUTPUT"
+            ENVIRONMENT="staging"
+            FLOAT_TAG="staging"
+            VERSION_TAG=""
           fi
 
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "float_tag=$FLOAT_TAG" >> "$GITHUB_OUTPUT"
+          echo "version_tag=$VERSION_TAG" >> "$GITHUB_OUTPUT"
           echo "sha_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
-          context: .
+          context: ci-context
+          file: ci-context/Dockerfile
           push: true
-          cache-from: type=gha,scope=polarizer
-          cache-to: type=gha,mode=max,scope=polarizer
           tags: |
             ghcr.io/maybesidequest/polarizer:${{ steps.vars.outputs.sha_tag }}
             ghcr.io/maybesidequest/polarizer:${{ steps.vars.outputs.float_tag }}
             ${{ steps.vars.outputs.version_tag }}
-          secrets: |
-            "hf_token=${{ secrets.HF_TOKEN }}"
 
       - name: Update GitOps repo
         env:
           GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+        shell: bash
         run: |
           APP_DIR="polarizer"
           ENV="${{ steps.vars.outputs.environment }}"
