@@ -22,13 +22,16 @@ RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rust
 ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /app
 
+# Keep dependency metadata in an earlier layer so source-only changes do not
+# invalidate everything before Cargo gets a chance to reuse the target cache.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY migrations/ migrations/
 COPY benches/ benches/
 COPY src/ src/
 
-# Cache registries, compiled dependencies, and the downloaded static ONNX
-# runtime outside image layers while copying only final binaries into /app/out.
+# These cache IDs are exported/imported by CI through buildkit-cache-dance.
+# That lets expensive native crates such as rdkafka-sys, zstd-sys, openssl-sys,
+# and bindgen artifacts survive across ephemeral ARC runner pods.
 RUN --mount=type=cache,id=polarizer-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=polarizer-cargo-git,target=/root/.cargo/git,sharing=locked \
     --mount=type=cache,id=polarizer-target,target=/app/target,sharing=locked \

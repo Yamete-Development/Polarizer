@@ -1,4 +1,5 @@
 name: Docker Build & Publish
+
 on:
   push:
     branches:
@@ -28,13 +29,16 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.88.0
           components: rustfmt, clippy
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+
       - name: Verify
         run: |
           cargo fmt --all -- --check
@@ -44,6 +48,7 @@ jobs:
   build-and-push:
     needs: verify
     runs-on: arc-runner-set
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -55,29 +60,73 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: latest
+
+      - name: Restore Docker Rust cache
+        id: rust-docker-cache
+        uses: actions/cache@v4
+        with:
+          path: docker-cache
+          key: polarizer-docker-rust-v1-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'Dockerfile') }}
+          restore-keys: |
+            polarizer-docker-rust-v1-${{ runner.arch }}-
+
+      - name: Restore BuildKit cache mounts
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "docker-cache/cargo-registry": {
+                "target": "/root/.cargo/registry",
+                "id": "polarizer-cargo-registry"
+              },
+              "docker-cache/cargo-git": {
+                "target": "/root/.cargo/git",
+                "id": "polarizer-cargo-git"
+              },
+              "docker-cache/cargo-target": {
+                "target": "/app/target",
+                "id": "polarizer-target"
+              },
+              "docker-cache/ort-cache": {
+                "target": "/root/.cache/ort.pyke.io",
+                "id": "polarizer-ort"
+              }
+            }
+          skip-extraction: ${{ steps.rust-docker-cache.outputs.cache-hit }}
+
       - name: Determine tags and environment
         id: vars
+        shell: bash
         run: |
           if [[ "${{ github.event_name }}" == "release" ]]; then
-            echo "environment=prod" >> $GITHUB_OUTPUT
-            echo "float_tag=latest" >> $GITHUB_OUTPUT
-            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "environment=prod" >> "$GITHUB_OUTPUT"
+            echo "float_tag=latest" >> "$GITHUB_OUTPUT"
+            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           elif [[ "${{ github.event.inputs.version_tag }}" != "" ]]; then
-            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
-            echo "float_tag=latest" >> $GITHUB_OUTPUT
-            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.event.inputs.version_tag }}" >> $GITHUB_OUTPUT
+            echo "environment=${{ github.event.inputs.environment }}" >> "$GITHUB_OUTPUT"
+            echo "float_tag=latest" >> "$GITHUB_OUTPUT"
+            echo "version_tag=ghcr.io/maybesidequest/polarizer:${{ github.event.inputs.version_tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "environment=staging" >> $GITHUB_OUTPUT
-            echo "float_tag=staging" >> $GITHUB_OUTPUT
-            echo "version_tag=" >> $GITHUB_OUTPUT
+            echo "environment=staging" >> "$GITHUB_OUTPUT"
+            echo "float_tag=staging" >> "$GITHUB_OUTPUT"
+            echo "version_tag=" >> "$GITHUB_OUTPUT"
           fi
-          echo "sha_tag=${{ github.sha }}" >> $GITHUB_OUTPUT
+
+          echo "sha_tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          cache-from: type=gha,scope=polarizer
+          cache-to: type=gha,mode=max,scope=polarizer
           tags: |
             ghcr.io/maybesidequest/polarizer:${{ steps.vars.outputs.sha_tag }}
             ghcr.io/maybesidequest/polarizer:${{ steps.vars.outputs.float_tag }}
