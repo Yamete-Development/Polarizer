@@ -1808,7 +1808,7 @@ impl ModerationRepository {
         expected_version: i64,
     ) -> anyhow::Result<v2::Report> {
         let mut tx = self.db.begin().await?;
-        let updated=sqlx::query("UPDATE trust_safety.report SET claimed_by=NULL,claimed_at=NULL,claim_expires_at=NULL,last_claim_change_at=clock_timestamp(),updated_at=clock_timestamp(),version=version+1 WHERE id=$1 AND version=$2 AND claimed_by=$3 AND claim_expires_at>clock_timestamp() RETURNING id").bind(id).bind(expected_version).bind(&context.actor_id).fetch_optional(&mut *tx).await?;
+        let updated=sqlx::query("UPDATE trust_safety.report SET claimed_by=NULL,claimed_at=NULL,claim_expires_at=NULL,last_claim_change_at=NULL,updated_at=clock_timestamp(),version=version+1 WHERE id=$1 AND version=$2 AND claimed_by=$3 AND claim_expires_at>clock_timestamp() RETURNING id").bind(id).bind(expected_version).bind(&context.actor_id).fetch_optional(&mut *tx).await?;
         anyhow::ensure!(
             updated.is_some(),
             "report claim ownership or version conflict"
