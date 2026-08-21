@@ -1038,7 +1038,9 @@ impl ModerationRepository {
                 }
                 records.push(
                     "(infraction.infraction_type = 'BAN' \
-                      AND infraction.scope_type = 'PRODUCT'::trust_safety.scope_type)",
+                      AND infraction.scope_type IN (\
+                          'PRODUCT'::trust_safety.scope_type,\
+                          'LOBBY'::trust_safety.scope_type))",
                 );
             }
             records.push(")");
@@ -3351,7 +3353,7 @@ fn classify_infraction_moderation_kind(
     match (infraction_type, scope_type) {
         ("WARNING", "LOBBY") => Some("LOBBY_WARNING"),
         ("WARNING", _) => Some("WARNING"),
-        ("BAN", "PRODUCT") => Some("LOBBY_BAN"),
+        ("BAN", "PRODUCT" | "LOBBY") => Some("LOBBY_BAN"),
         _ => None,
     }
 }
@@ -3706,7 +3708,10 @@ mod tests {
             classify_infraction_moderation_kind("BAN", "PRODUCT"),
             Some("LOBBY_BAN")
         );
-        assert_eq!(classify_infraction_moderation_kind("BAN", "LOBBY"), None);
+        assert_eq!(
+            classify_infraction_moderation_kind("BAN", "LOBBY"),
+            Some("LOBBY_BAN")
+        );
         assert_eq!(
             moderation_record_kind_from_values("INFRACTION", "WARNING", Some("BAN"), "PRODUCT")
                 .expect("product ban"),

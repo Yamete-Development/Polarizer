@@ -12,6 +12,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub(crate) fn automated_reason(reason: &str) -> String {
+    format!("Automated: {reason}")
+}
+
 use crate::{
     config::AppConfig,
     contract::{emitted_effect_to_proto, prism, scope_to_proto, subject_to_proto, v2},
@@ -2277,7 +2281,7 @@ async fn apply_effect(
             .bind(effect_scope_type)
             .bind(effect_scope_id)
             .bind(restriction_type)
-            .bind(reason)
+            .bind(automated_reason(reason))
             .bind(action.id)
             .bind(source_policy_version_id)
             .bind(&policy_actor)
@@ -2347,7 +2351,7 @@ async fn apply_effect(
                 .bind(effect_scope_type)
                 .bind(effect_scope_id)
                 .bind(&enforcement.restriction_type)
-                .bind(&enforcement.reason)
+                .bind(automated_reason(&enforcement.reason))
                 .bind(action.id)
                 .bind(source_policy_version_id)
                 .bind(&policy_actor)
@@ -2377,7 +2381,7 @@ async fn apply_effect(
             .bind(effect_scope_type)
             .bind(effect_scope_id)
             .bind(infraction_type)
-            .bind(reason)
+            .bind(automated_reason(reason))
             .bind(action.id)
             .bind(source_policy_version_id)
             .bind(&policy_actor)
@@ -3493,9 +3497,9 @@ fn timestamp(value: chrono::DateTime<Utc>) -> prost_types::Timestamp {
 mod tests {
     use super::{
         ActionCipher, HeldActionResolution, apply_censors_to_content, apply_content_policy_plan,
-        build_approved_content, build_approved_prism_payload, cloud_event_headers,
-        held_resolution_values, hold_deadline, is_legal_bundle_transition, scope_partition_key,
-        validate_bundle_fields, validate_effect_for_action,
+        automated_reason, build_approved_content, build_approved_prism_payload,
+        cloud_event_headers, held_resolution_values, hold_deadline, is_legal_bundle_transition,
+        scope_partition_key, validate_bundle_fields, validate_effect_for_action,
     };
     use crate::content_policy::{
         CallPolicyPlan, ContentPolicyPlan, DeliveryEffects, DeliveryVariant, DestinationDecision,
@@ -3535,6 +3539,14 @@ mod tests {
             data_handling: DataHandlingClass::Internal,
             prism_payload: None,
         }
+    }
+
+    #[test]
+    fn policy_reasons_are_marked_as_automated() {
+        assert_eq!(
+            automated_reason("Repeated prohibited content"),
+            "Automated: Repeated prohibited content"
+        );
     }
 
     fn allow_result(action_id: Uuid) -> EvaluationResult {
