@@ -2044,7 +2044,7 @@ fn apply_content_policy_plan(
                     overrides.is_object(),
                     "Prism target overrides must be a JSON object"
                 );
-                apply_delivery_variant(action, &mut overrides, structured_prefix, variant);
+                apply_call_delivery_variant(action, &mut overrides, structured_prefix, variant);
                 target.overrides = Some(serde_json::to_string(&overrides)?);
                 retained.push(target);
             }
@@ -2084,7 +2084,7 @@ fn apply_content_policy_plan(
                     overrides.is_object(),
                     "Prism target overrides must be a JSON object"
                 );
-                apply_delivery_variant(action, &mut overrides, structured_prefix, variant);
+                apply_hub_delivery_variant(action, &mut overrides, structured_prefix, variant);
                 target.overrides = Some(serde_json::to_string(&overrides)?);
                 retained.push(target);
             }
@@ -2094,7 +2094,7 @@ fn apply_content_policy_plan(
     Ok(())
 }
 
-fn apply_delivery_variant(
+fn apply_hub_delivery_variant(
     action: &Action,
     body: &mut serde_json::Value,
     prefix: &str,
@@ -2103,28 +2103,60 @@ fn apply_delivery_variant(
     body["content"] =
         serde_json::Value::String(compose_delivery_content(prefix, &variant.message_content));
 
-    let changed_name = [
-        ("display_name", variant.display_name.as_ref()),
-        ("username", variant.username.as_ref()),
-        ("server_name", variant.server_name.as_ref()),
-        ("hub_name", variant.hub_name.as_ref()),
-    ]
-    .into_iter()
-    .find_map(|(field, transformed)| {
-        let original = action
-            .attributes
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        (original != transformed).then_some(transformed)
-    });
-    if let Some(name) = changed_name {
-        body["username"] = serde_json::Value::String(if name.is_empty() {
-            crate::content_policy::delivery::DEFAULT_SAFE_NAME.to_owned()
+    let orig_display_name = action
+        .attributes
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let orig_username = action
+        .attributes
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let orig_server_name = action
+        .attributes
+        .get("server_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let use_nicknames = action
+        .attributes
+        .get("use_nicknames")
+        .and_then(serde_json::Value::as_bool);
+
+    let (user_part, orig_user_part) = match use_nicknames {
+        Some(false) => (variant.username.as_ref(), orig_username),
+        Some(true) => (variant.display_name.as_ref(), orig_display_name),
+        None => {
+            if variant.display_name.as_ref() != orig_display_name {
+                (variant.display_name.as_ref(), orig_display_name)
+            } else if variant.username.as_ref() != orig_username {
+                (variant.username.as_ref(), orig_username)
+            } else if !orig_display_name.is_empty() || !variant.display_name.is_empty() {
+                (variant.display_name.as_ref(), orig_display_name)
+            } else {
+                (variant.username.as_ref(), orig_username)
+            }
+        }
+    };
+
+    let user_changed = user_part != orig_user_part;
+    let server_changed = variant.server_name.as_ref() != orig_server_name;
+
+    if user_changed || server_changed {
+        let safe_user = if user_part.is_empty() {
+            crate::content_policy::delivery::DEFAULT_SAFE_NAME
         } else {
-            name.to_owned()
-        });
+            user_part
+        };
+        let safe_server = variant.server_name.as_ref();
+        let formatted = if safe_server.is_empty() {
+            safe_user.to_owned()
+        } else {
+            format!("{safe_user} | {safe_server}")
+        };
+        body["username"] = serde_json::Value::String(truncate_chars(&formatted, 80));
     }
+
     if variant.suppress_links {
         let flags = body
             .get("flags")
@@ -2132,6 +2164,95 @@ fn apply_delivery_variant(
             .unwrap_or_default();
         body["flags"] = serde_json::Value::from(flags | 4);
     }
+}
+
+fn apply_call_delivery_variant(
+    action: &Action,
+    body: &mut serde_json::Value,
+    prefix: &str,
+    variant: &crate::content_policy::DeliveryVariant,
+) {
+    body["content"] =
+        serde_json::Value::String(compose_delivery_content(prefix, &variant.message_content));
+
+    let orig_display_name = action
+        .attributes
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let orig_username = action
+        .attributes
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let orig_server_name = action
+        .attributes
+        .get("server_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let (user_part, orig_user_part) = if variant.display_name.as_ref() != orig_display_name {
+        (variant.display_name.as_ref(), orig_display_name)
+    } else if variant.username.as_ref() != orig_username {
+        (variant.username.as_ref(), orig_username)
+    } else if !orig_display_name.is_empty() || !variant.display_name.is_empty() {
+        (variant.display_name.as_ref(), orig_display_name)
+    } else {
+        (variant.username.as_ref(), orig_username)
+    };
+
+    let user_changed = (variant.display_name.as_ref() != orig_display_name)
+        || (variant.username.as_ref() != orig_username);
+    let server_changed = variant.server_name.as_ref() != orig_server_name;
+
+    let existing_username = body
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+
+    let shows_server_name = !orig_server_name.is_empty()
+        && (existing_username.ends_with(&format!("({orig_server_name})"))
+            || (existing_username.contains('(') && existing_username.ends_with(')')));
+
+    if shows_server_name {
+        if user_changed || server_changed {
+            let safe_user = if user_part.is_empty() {
+                crate::content_policy::delivery::DEFAULT_SAFE_NAME
+            } else {
+                user_part
+            };
+            let safe_server = variant.server_name.as_ref();
+            let formatted = if safe_server.is_empty() {
+                safe_user.to_owned()
+            } else {
+                format!("{safe_user} ({safe_server})")
+            };
+            body["username"] = serde_json::Value::String(truncate_chars(&formatted, 80));
+        }
+    } else {
+        // Server name is not shown in this call target.
+        // Only update the username if the user's name itself was modified.
+        if user_changed {
+            let safe_user = if user_part.is_empty() {
+                crate::content_policy::delivery::DEFAULT_SAFE_NAME
+            } else {
+                user_part
+            };
+            body["username"] = serde_json::Value::String(truncate_chars(safe_user, 80));
+        }
+    }
+
+    if variant.suppress_links {
+        let flags = body
+            .get("flags")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        body["flags"] = serde_json::Value::from(flags | 4);
+    }
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
 }
 
 fn compose_delivery_content(prefix: &str, canonical: &str) -> String {
@@ -3757,6 +3878,250 @@ mod tests {
         assert_eq!(overrides["content"], "prefix: safe content");
         assert_eq!(overrides["username"], "InterChat User");
         assert_eq!(overrides["keep"], "existing");
+    }
+
+    #[test]
+    fn hub_variants_preserve_username_pipe_servername_format_when_server_censored() {
+        let mut action = action();
+        action.action_type = "hub.message.created".into();
+        action.scope = Scope {
+            scope_type: ScopeType::Hub,
+            id: "hub-1".into(),
+            product: Some(Product::Hub),
+        };
+        action.attributes = serde_json::json!({
+            "content": "hello world",
+            "display_name": "Alice",
+            "username": "alice",
+            "server_name": "BadServer",
+            "content_prefix": ""
+        });
+
+        let fingerprint = [8; 32];
+        let mut variants = std::collections::BTreeMap::new();
+        variants.insert(
+            fingerprint,
+            DeliveryVariant {
+                message_content: "hello world".into(),
+                display_name: "Alice".into(),
+                username: "alice".into(),
+                server_name: "B#dServer".into(),
+                hub_name: "Hub".into(),
+                suppress_links: false,
+                fingerprint,
+            },
+        );
+        let mut payload = prism::PrismStreamPayload {
+            payload: serde_json::json!({
+                "username": "Alice | BadServer",
+                "content": "hello world"
+            })
+            .to_string(),
+            targets: vec![prism::PrismTarget {
+                guild_id: Some("server-1".into()),
+                overrides: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = ContentPolicyPlan::Hub(HubPolicyPlan {
+            global: ResolvedScopeDecision {
+                scope: PolicyScope::global(),
+                matched_rules: Vec::new(),
+                delivery: DeliveryEffects::default(),
+                side_effects: Vec::new(),
+            },
+            hub: ResolvedScopeDecision {
+                scope: PolicyScope::hub("hub-1"),
+                matched_rules: Vec::new(),
+                delivery: DeliveryEffects::default(),
+                side_effects: Vec::new(),
+            },
+            destinations: vec![DestinationDecision {
+                target_index: 0,
+                server_id: "server-1".into(),
+                policy_id: None,
+                policy_version: None,
+                matched_rule_ids: Vec::new(),
+                blocked_by: Vec::new(),
+                variant_fingerprint: Some(fingerprint),
+            }],
+            variants,
+            side_effects: Vec::new(),
+            sender_feedback: None,
+            evaluated_server_profiles: 0,
+        });
+
+        apply_content_policy_plan(&action, &mut payload, &plan).expect("hub plan applies");
+
+        let overrides: serde_json::Value = serde_json::from_str(
+            payload.targets[0]
+                .overrides
+                .as_deref()
+                .expect("target overrides"),
+        )
+        .unwrap();
+        assert_eq!(overrides["username"], "Alice | B#dServer");
+    }
+
+    #[test]
+    fn call_variants_do_not_replace_username_with_server_name_in_1v1_calls() {
+        let mut action = action();
+        action.action_type = "lobby.message.created".into();
+        action.scope = Scope {
+            scope_type: ScopeType::Lobby,
+            id: "lobby-1".into(),
+            product: Some(Product::Lobby),
+        };
+        action.attributes = serde_json::json!({
+            "content": "hello",
+            "display_name": "Alice",
+            "username": "alice",
+            "server_name": "BadServer",
+            "content_prefix": ""
+        });
+
+        let fingerprint = [9; 32];
+        let mut variants = std::collections::BTreeMap::new();
+        variants.insert(
+            fingerprint,
+            DeliveryVariant {
+                message_content: "hello".into(),
+                display_name: "Alice".into(),
+                username: "alice".into(),
+                server_name: "B#dServer".into(),
+                hub_name: "".into(),
+                suppress_links: false,
+                fingerprint,
+            },
+        );
+        let mut payload = prism::PrismStreamPayload {
+            payload: "{}".into(),
+            targets: vec![prism::PrismTarget {
+                guild_id: Some("server-1".into()),
+                overrides: Some(
+                    serde_json::json!({
+                        "username": "Alice"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = ContentPolicyPlan::Call(CallPolicyPlan {
+            global: ResolvedScopeDecision {
+                scope: PolicyScope::global(),
+                matched_rules: Vec::new(),
+                delivery: DeliveryEffects::default(),
+                side_effects: Vec::new(),
+            },
+            variant: None,
+            destinations: vec![DestinationDecision {
+                target_index: 0,
+                server_id: "server-1".into(),
+                policy_id: None,
+                policy_version: None,
+                matched_rule_ids: Vec::new(),
+                blocked_by: Vec::new(),
+                variant_fingerprint: Some(fingerprint),
+            }],
+            variants,
+            side_effects: Vec::new(),
+            sender_feedback: None,
+            evaluated_server_profiles: 0,
+        });
+
+        apply_content_policy_plan(&action, &mut payload, &plan).expect("call plan applies");
+
+        let overrides: serde_json::Value = serde_json::from_str(
+            payload.targets[0]
+                .overrides
+                .as_deref()
+                .expect("target overrides"),
+        )
+        .unwrap();
+        assert_eq!(overrides["username"], "Alice");
+    }
+
+    #[test]
+    fn call_variants_replace_censored_server_name_in_group_calls() {
+        let mut action = action();
+        action.action_type = "lobby.message.created".into();
+        action.scope = Scope {
+            scope_type: ScopeType::Lobby,
+            id: "lobby-1".into(),
+            product: Some(Product::Lobby),
+        };
+        action.attributes = serde_json::json!({
+            "content": "hello",
+            "display_name": "Alice",
+            "username": "alice",
+            "server_name": "BadServer",
+            "content_prefix": ""
+        });
+
+        let fingerprint = [10; 32];
+        let mut variants = std::collections::BTreeMap::new();
+        variants.insert(
+            fingerprint,
+            DeliveryVariant {
+                message_content: "hello".into(),
+                display_name: "Alice".into(),
+                username: "alice".into(),
+                server_name: "B#dServer".into(),
+                hub_name: "".into(),
+                suppress_links: false,
+                fingerprint,
+            },
+        );
+        let mut payload = prism::PrismStreamPayload {
+            payload: "{}".into(),
+            targets: vec![prism::PrismTarget {
+                guild_id: Some("server-1".into()),
+                overrides: Some(
+                    serde_json::json!({
+                        "username": "Alice (BadServer)"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = ContentPolicyPlan::Call(CallPolicyPlan {
+            global: ResolvedScopeDecision {
+                scope: PolicyScope::global(),
+                matched_rules: Vec::new(),
+                delivery: DeliveryEffects::default(),
+                side_effects: Vec::new(),
+            },
+            variant: None,
+            destinations: vec![DestinationDecision {
+                target_index: 0,
+                server_id: "server-1".into(),
+                policy_id: None,
+                policy_version: None,
+                matched_rule_ids: Vec::new(),
+                blocked_by: Vec::new(),
+                variant_fingerprint: Some(fingerprint),
+            }],
+            variants,
+            side_effects: Vec::new(),
+            sender_feedback: None,
+            evaluated_server_profiles: 0,
+        });
+
+        apply_content_policy_plan(&action, &mut payload, &plan).expect("call plan applies");
+
+        let overrides: serde_json::Value = serde_json::from_str(
+            payload.targets[0]
+                .overrides
+                .as_deref()
+                .expect("target overrides"),
+        )
+        .unwrap();
+        assert_eq!(overrides["username"], "Alice (B#dServer)");
     }
 
     #[test]
