@@ -2191,14 +2191,14 @@ fn apply_call_delivery_variant(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
 
-    let (user_part, orig_user_part) = if variant.display_name.as_ref() != orig_display_name {
-        (variant.display_name.as_ref(), orig_display_name)
+    let user_part = if variant.display_name.as_ref() != orig_display_name {
+        variant.display_name.as_ref()
     } else if variant.username.as_ref() != orig_username {
-        (variant.username.as_ref(), orig_username)
+        variant.username.as_ref()
     } else if !orig_display_name.is_empty() || !variant.display_name.is_empty() {
-        (variant.display_name.as_ref(), orig_display_name)
+        variant.display_name.as_ref()
     } else {
-        (variant.username.as_ref(), orig_username)
+        variant.username.as_ref()
     };
 
     let user_changed = (variant.display_name.as_ref() != orig_display_name)
@@ -3624,7 +3624,7 @@ mod tests {
     };
     use crate::content_policy::{
         CallPolicyPlan, ContentPolicyPlan, DeliveryEffects, DeliveryVariant, DestinationDecision,
-        PolicyScope, ResolvedScopeDecision,
+        HubPolicyPlan, PolicyScope, ResolvedScopeDecision,
     };
     use crate::contract::prism;
     use crate::policy::features::{
