@@ -3624,7 +3624,7 @@ mod tests {
     };
     use crate::content_policy::{
         CallPolicyPlan, ContentPolicyPlan, DeliveryEffects, DeliveryVariant, DestinationDecision,
-        PolicyScope, ResolvedScopeDecision,
+        HubPolicyPlan, PolicyScope, ResolvedScopeDecision,
     };
     use crate::contract::prism;
     use crate::policy::features::{

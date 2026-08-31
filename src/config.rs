@@ -7,6 +7,76 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use rdkafka::ClientConfig;
+
+#[derive(Clone)]
+pub struct KafkaSecurityConfig {
+    pub tls_ca_path: PathBuf,
+    pub sasl_username: String,
+    pub sasl_password: String,
+    pub sasl_mechanism: String,
+}
+
+impl std::fmt::Debug for KafkaSecurityConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("KafkaSecurityConfig")
+            .field("tls_ca_path", &self.tls_ca_path)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &"[redacted]")
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .finish()
+    }
+}
+
+impl KafkaSecurityConfig {
+    pub fn from_env() -> Result<Self> {
+        Self::from_getter(|name| env::var(name).ok())
+    }
+
+    fn from_getter<F>(get: F) -> Result<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let required = |name: &str| -> Result<String> {
+            get(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("{name} is required"))
+        };
+        let mechanism = get("KAFKA_SASL_MECHANISM")
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "SCRAM-SHA-512".to_owned());
+        if mechanism != "SCRAM-SHA-512" {
+            bail!("KAFKA_SASL_MECHANISM must be SCRAM-SHA-512");
+        }
+
+        Ok(Self {
+            tls_ca_path: PathBuf::from(required("KAFKA_TLS_CA")?),
+            sasl_username: required("KAFKA_SASL_USERNAME")?,
+            sasl_password: required("KAFKA_SASL_PASSWORD")?,
+            sasl_mechanism: mechanism,
+        })
+    }
+
+    pub fn client_config(&self, brokers: &str) -> ClientConfig {
+        let mut client = ClientConfig::new();
+        client
+            .set("bootstrap.servers", brokers)
+            .set("security.protocol", "SASL_SSL")
+            .set(
+                "ssl.ca.location",
+                self.tls_ca_path.to_string_lossy().as_ref(),
+            )
+            .set("enable.ssl.certificate.verification", "true")
+            .set("allow.auto.create.topics", "false")
+            .set("sasl.mechanisms", &self.sasl_mechanism)
+            .set("sasl.username", &self.sasl_username)
+            .set("sasl.password", &self.sasl_password);
+        client
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct MigrationConfig {
@@ -59,6 +129,7 @@ pub struct AppConfig {
     pub auto_migrate: bool,
     pub migration_timeout: Duration,
     pub kafka_brokers: String,
+    pub kafka_security: KafkaSecurityConfig,
     pub action_topic: String,
     pub decision_topic: String,
     pub command_topic: String,
@@ -156,7 +227,8 @@ impl AppConfig {
             database_max_connections: migration.database_max_connections,
             auto_migrate: parse("POLARIZER_AUTO_MIGRATE", "true")?,
             migration_timeout: migration.timeout,
-            kafka_brokers: optional("KAFKA_BROKERS", "localhost:9092"),
+            kafka_brokers: required("KAFKA_BROKERS")?,
+            kafka_security: KafkaSecurityConfig::from_env()?,
             action_topic: optional(
                 "KAFKA_ACTION_TOPIC",
                 "events.trust-safety.action.requested.v2",
@@ -278,6 +350,10 @@ impl AppConfig {
     }
 }
 
+pub fn kafka_client_config(config: &AppConfig) -> ClientConfig {
+    config.kafka_security.client_config(&config.kafka_brokers)
+}
+
 fn required(name: &str) -> Result<String> {
     env::var(name).with_context(|| format!("{name} is required"))
 }
@@ -380,5 +456,38 @@ mod tests {
             BTreeMap::from([("winter".to_owned(), BTreeSet::from([fingerprint()]))]);
 
         assert!(validate_service_principals(&allowlist, &mut certificates).is_err());
+    }
+
+    #[test]
+    fn kafka_security_requires_explicit_credentials() {
+        assert!(KafkaSecurityConfig::from_getter(|_| None).is_err());
+    }
+
+    #[test]
+    fn kafka_security_accepts_scram_tls_settings() {
+        let values = BTreeMap::from([
+            ("KAFKA_TLS_CA", "/etc/kafka/ca.crt"),
+            ("KAFKA_SASL_USERNAME", "polarizer"),
+            ("KAFKA_SASL_PASSWORD", "secret"),
+        ]);
+        let config =
+            KafkaSecurityConfig::from_getter(|name| values.get(name).map(ToString::to_string))
+                .expect("valid Kafka security configuration");
+        assert_eq!(config.sasl_mechanism, "SCRAM-SHA-512");
+        assert_eq!(config.tls_ca_path, PathBuf::from("/etc/kafka/ca.crt"));
+    }
+
+    #[test]
+    fn kafka_security_rejects_other_mechanisms() {
+        let values = BTreeMap::from([
+            ("KAFKA_TLS_CA", "/etc/kafka/ca.crt"),
+            ("KAFKA_SASL_USERNAME", "polarizer"),
+            ("KAFKA_SASL_PASSWORD", "secret"),
+            ("KAFKA_SASL_MECHANISM", "PLAIN"),
+        ]);
+        assert!(
+            KafkaSecurityConfig::from_getter(|name| { values.get(name).map(ToString::to_string) })
+                .is_err()
+        );
     }
 }

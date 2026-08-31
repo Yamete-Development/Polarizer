@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use prost::Message as ProstMessage;
 use rdkafka::{
-    ClientConfig, Message,
+    Message,
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::{Header, Headers, OwnedHeaders},
     producer::{FutureProducer, FutureRecord},
@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, kafka_client_config},
     contract::v2::{self, ActionRequested, PrismDeliveryCallback},
     grpc::action_from_proto,
     health::HealthState,
@@ -55,8 +55,7 @@ pub struct StaffAuthorizationChangeConsumer {
 
 impl StaffAuthorizationChangeConsumer {
     pub fn new(config: &AppConfig, db: PgPool, cancel: CancellationToken) -> anyhow::Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let consumer: StreamConsumer = kafka_client_config(config)
             .set(
                 "group.id",
                 format!("{}-staff-authz-changes", config.kafka_group_id),
@@ -133,8 +132,7 @@ impl DeliveryCallbackConsumer {
         repository: Arc<PostgresPolicyRepository>,
         cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let consumer: StreamConsumer = kafka_client_config(config)
             .set(
                 "group.id",
                 format!("{}-prism-delivery", config.kafka_group_id),
@@ -145,8 +143,7 @@ impl DeliveryCallbackConsumer {
             .set("isolation.level", "read_committed")
             .create()?;
         consumer.subscribe(&[&config.delivery_callback_topic])?;
-        let dlq_producer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let dlq_producer = kafka_client_config(config)
             .set("message.timeout.ms", "10000")
             .set("enable.idempotence", "true")
             .set("acks", "all")
@@ -253,8 +250,7 @@ impl ActionConsumer {
         health: Arc<HealthState>,
         cancel: CancellationToken,
     ) -> anyhow::Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let consumer: StreamConsumer = kafka_client_config(config)
             .set("group.id", &config.kafka_group_id)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
@@ -263,8 +259,7 @@ impl ActionConsumer {
             .set("max.poll.interval.ms", "300000")
             .create()?;
         consumer.subscribe(&[&config.action_topic])?;
-        let dlq_producer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let dlq_producer = kafka_client_config(config)
             .set("message.timeout.ms", "10000")
             .set("enable.idempotence", "true")
             .set("acks", "all")
@@ -423,8 +418,7 @@ pub struct OutboxRelay {
 
 impl OutboxRelay {
     pub fn new(db: PgPool, config: &AppConfig, cancel: CancellationToken) -> anyhow::Result<Self> {
-        let producer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let producer = kafka_client_config(config)
             .set("enable.idempotence", "true")
             .set("acks", "all")
             .set("message.timeout.ms", "10000")

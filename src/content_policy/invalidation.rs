@@ -3,14 +3,14 @@ use std::{process, sync::Arc, time::Duration};
 use anyhow::{Context, ensure};
 use prost::Message;
 use rdkafka::{
-    ClientConfig, Message as KafkaMessage,
+    Message as KafkaMessage,
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::Headers,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, kafka_client_config};
 
 use super::{Authority, PolicyScope, ReloadError, service::ContentPolicyRuntime};
 
@@ -165,8 +165,7 @@ impl ContentPolicyInvalidationConsumer {
     ) -> anyhow::Result<Self> {
         let group_id =
             content_policy_consumer_group(&config.kafka_group_id, &local_hostname(), process::id());
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &config.kafka_brokers)
+        let consumer: StreamConsumer = kafka_client_config(config)
             .set("group.id", &group_id)
             .set("enable.auto.commit", "false")
             .set("enable.auto.offset.store", "false")
